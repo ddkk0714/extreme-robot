@@ -25,6 +25,23 @@ teleop_core 로 보낸다. 시리얼/모터 로직은 전혀 없다 — 순수 �
 
 ⚠️ 벤치 전용 — 이 경로(teleop_core → /dynamixel/goal_position → position_node)는
    파워트레인 계약상 "direct dynamixel goal publisher" 라 production 금지다.
+
+--- 2026-07-16 실물 DualSense(USB, Linux joydev) 실측 수정 ---
+기존 기본값(deadman=button[4], axis_ids=[0,1,4,3,-1])은 실물 패드에서 안 맞았다:
+  - L1 은 button[4] 가 아니라 **button[9]** 였음(`/joy` 10초 캡처, L1을 누르고 있던
+    동안 계속 1이었던 버튼이 9뿐이었음 확인) — button[4] 기준이면 데드맨이 항상
+    "안 눌림"으로 판정돼 스틱을 움직여도 팔이 전혀 안 움직였다.
+  - axis[4] 는 오른스틱Y 가 아니라 **L2 트리거**였다. 이 패드는 트리거 미조작 시
+    axis 기본값이 0 이 아니라 **1.0** 이라서, joint_3(팔꿈치)이 스틱과 무관하게
+    계속 상한(π)까지 밀려 올라가는 문제가 있었다(트리거 쉬는 값을 계속 velocity로
+    해석). 이 조합에서 실측 axis 순서는 스틱(0~3) 다음 트리거(4,5) 였다:
+    0=왼스틱X, 1=왼스틱Y, 2=오른스틱X, 3=오른스틱Y, 4=L2, 5=R2.
+  - 아래 기본값을 이 실측값으로 갱신. joint_1/2(axis 0/1)는 실제 스틱 조작으로
+    관절이 정상 추종함을 확인(RViz). joint_3/4(axis 3/2 재배정)는 트리거 폭주가
+    멈추는 것까지는 확인했으나, 오른스틱 상하/좌우가 각각 joint_3/joint_4 방향과
+    의도대로 대응하는지는 재확인 필요 — 다음 실기 세션에서 검증할 것.
+  - 이 매핑은 이 특정 개체/드라이버 조합(hid-playstation, USB 유선) 기준이다.
+    다른 패드나 Bluetooth 연결에서는 다시 `/joy` 로 확인 필요(위 경고 참고).
 """
 
 import rclpy
@@ -37,8 +54,10 @@ from control_msgs.msg import JointJog
 DEFAULT_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5']
 
 #: 관절별 축 인덱스. -1 = 축 없음(버튼으로 조작).
-#: DualSense: 0=왼스틱X, 1=왼스틱Y, 2=L2, 3=오른스틱X, 4=오른스틱Y, 5=R2
-DEFAULT_AXIS_IDS = [0, 1, 4, 3, -1]
+#: DualSense(USB, joydev, 2026-07-16 실측): 0=왼스틱X, 1=왼스틱Y, 2=오른스틱X,
+#: 3=오른스틱Y, 4=L2, 5=R2 — 트리거(4,5)는 미조작 시 값이 1.0 이라 관절 축으로
+#: 쓰면 안 됨(위 실측 수정 기록 참고).
+DEFAULT_AXIS_IDS = [0, 1, 3, 2, -1]
 
 #: 풀 스틱일 때의 속도 [rad/s]. teleop_core 가 velocities 를 rad/s 로 해석한다.
 DEFAULT_AXIS_SCALES = [0.6, 0.4, 0.4, 0.6, 0.8]
@@ -59,7 +78,7 @@ class JoystickTeleop(Node):
         self.declare_parameter('deadzone', 0.15)
 
         # ── 버튼 ──────────────────────────────────
-        self.declare_parameter('deadman_button', 4)      # L1 — 누르고 있어야 움직임
+        self.declare_parameter('deadman_button', 9)      # L1(2026-07-16 실측) — 누르고 있어야 움직임
         self.declare_parameter('turbo_button', 5)        # R1
         self.declare_parameter('turbo_scale', 2.5)
         self.declare_parameter('joint5_minus_button', 11)   # L3
