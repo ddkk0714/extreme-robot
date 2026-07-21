@@ -116,10 +116,44 @@ Profile Velocity도 해당 EEPROM 값 이하인지 확인한다.
 
 ## 5. 실행 예시
 
+아래 코드는 PR #22가 merge된 뒤 `extreme-robot`을 갱신한 상태를 기준으로 한다. merge 전에는
+운영 중인 dirty Jetson 저장소에서 branch를 바꾸지 말고 별도 clean clone에서만 검증한다.
+
+Jetson에서 빌드한다.
+
+```bash
+# Jetson 호스트, SSH 직후 홈 ~ 기준
+cd ~/extreme-robot
+git pull --ff-only
+docker compose up -d ros2
+docker exec ros2_humble bash -lc '
+  source /opt/ros/humble/setup.bash
+  cd /root/ros2_ws
+  colcon build --packages-select robot_arm_msgs dynamixel_control
+'
+```
+
+PC에는 ROS 2가 없어도 된다. PC 저장소에서 전용 venv를 한 번 준비한다.
+
+```bash
+# PC, extreme-robot 저장소 루트
+python3 -m venv .venv
+.venv/bin/pip install 'dynamixel-sdk==4.0.5'
+groups | grep dialout
+ls -l /dev/serial/by-id/
+```
+
+`dialout`이 출력되지 않으면 `sudo usermod -aG dialout "$USER"` 후 로그아웃·로그인을 한 번 한다.
+양쪽에서 기존 `position_node`, `moveit_dynamixel_bridge`, `arm_fsm` 또는 다른 진단 스크립트가
+같은 U2D2를 점유하지 않는지 먼저 확인한다.
+
 Jetson의 `ros2_humble` 컨테이너에서 슬레이브 서버를 먼저 실행한다.
 
 ```bash
-ros2 run dynamixel_control master_slave_slave \
+docker exec -it ros2_humble bash -lc '
+source /opt/ros/humble/setup.bash
+source /root/ros2_ws/install/setup.bash
+exec ros2 run dynamixel_control master_slave_slave \
   --confirm-bench \
   --slave-id 2 \
   --allowed-client 192.168.50.128 \
@@ -130,12 +164,14 @@ ros2 run dynamixel_control master_slave_slave \
   --goal-pwm 100 \
   --load-limit-raw 180 \
   --stale-ms 200
+'
 ```
 
 PC에서 마스터 client를 실행한다.
 
 ```bash
-ros2 run dynamixel_control master_slave_master \
+PYTHONPATH=ros2_ws/src/dynamixel_control \
+.venv/bin/python -m dynamixel_control.master_slave_master_client \
   --server 192.168.50.98 \
   --master-id 5 \
   --device /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAO4U2V-if00-port0 \
