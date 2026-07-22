@@ -1,2 +1,3 @@
 #!/bin/bash
-ros2 run robot_arm_perception perception_node --ros-args -p model_path:=/root/ros2_ws/yolov8n-seg.pt -p camera_mode:=realsense -p pick_classes:=bottle -p pick_min_conf:=0.5 -p require_depth:=true
+# 구간2 여름_구호물자운반 (박스 파지). 다른 구간용은 run_perception_traffic_light.sh 참고.
+ros2 run robot_arm_perception perception_node --ros-args -p model_name:=box -p camera_mode:=realsense -p pick_min_conf:=0.5 -p require_depth:=true
