@@ -95,20 +95,26 @@
          남아 mock 플래닝이 홈(all-zero) 자세부터 막혔음(RRTConnect: "Motion planning start
          tree could not be initialized" / "Start state appears to be in collision") — 실측
          확인 완료. 정식 MoveIt Setup Assistant GUI("Regenerate Default Collision Matrix")
-         대신, `/check_state_validity` 서비스로 arm_joint_1~5 리밋 안쪽 무작위 자세 40개를
+         대신, `/check_state_validity` 서비스로 arm_joint_1~5 리밋 안쪽 무작위 자세를
          샘플링해 매 자세 100% 항상 충돌하는 쌍만 아래에 "Default"로 등록(Setup Assistant가
-         내부적으로 하는 것과 동일한 원리, 샘플 수만 적음 — 디스플레이 없는 환경이라 GUI
-         재실행은 불가했음). 아래 쌍들은 관절각과 무관하게 항상 접촉 → 기어 치합/메쉬 중첩
-         등 기하 아티팩트로 판단, 안전하게 disable.
-         ⚠️ 같은 샘플링에서 자세에 따라 충돌하다 안하다 한 쌍(진짜 self-collision 위험, 절대
-         disable 금지)도 발견됨 — link_002/link_026(39/40), link_034/link_037(36/40),
-         link_041/link_052(36/40), link_045/link_047(33/40), link_034/link_040(31/40),
-         link_044/link_046(14/40), link_043/link_045(10/40), link_041/link_049(3/40).
-         이 쌍들은 그대로 collision-checked 상태로 둠 — 플래닝 중 이 쌍이 원인으로 실패하면
-         실제 충돌 회피가 필요한 자세라는 뜻이니 URDF/메쉬를 먼저 의심할 것.
-         샘플 수(40)가 Setup Assistant 기본값(수천)보다 훨씬 적어 근거가 약함 — 디스플레이
-         있는 환경에서 기회가 되면 GUI로 "Regenerate Default Collision Matrix" 재실행해서
-         이 블록을 정식 결과로 덮어쓸 것. -->
+         내부적으로 하는 것과 동일한 원리 — 디스플레이 없는 환경이라 GUI 재실행은 여전히
+         불가). 아래 쌍들은 관절각과 무관하게 항상 접촉 → 기어 치합/메쉬 중첩 등 기하
+         아티팩트로 판단, 안전하게 disable.
+
+         2026-07-24 재검증(스크립트 `scripts/sample_collision_matrix.py`): 애초 40샘플
+         근거가 약하다는 지적에 따라, 아래 18쌍을 SRDF에서 잠깐 빼고 move_group을 다시
+         띄운 뒤 3000샘플로 재검사 — **18쌍 전부 3000/3000(100%) 재확인**, 새로 걸린
+         "항상 충돌" 쌍은 0개. 아래 목록 그대로 유지.
+
+         ⚠️ 같은 3000샘플 재검사에서 자세에 따라 충돌하다 안하다 한 쌍(진짜 self-collision
+         위험, 절대 disable 금지)도 재확인됨 — link_034/link_037(2907/3000, 96.9%),
+         link_041/link_052(2888/3000, 96.3%), link_002/link_026(2839/3000, 94.6%),
+         link_045/link_047(2675/3000, 89.2%), link_034/link_040(2430/3000, 81.0%),
+         link_044/link_046(1303/3000, 43.4%), link_043/link_045(824/3000, 27.5%),
+         link_041/link_049(107/3000, 3.6%). 표본이 커지며 1% 미만의 희귀 충돌쌍도 57개
+         추가로 관측됨(대부분 base_link/link_031과 극단 관절각에서, 전체 목록은
+         `project_docs/WORK_STATUS.md` 2026-07-24 절 참고) — 전부 마찬가지로 disable
+         금지, 플래닝 실패 원인으로 나오면 URDF/메쉬부터 의심할 것. -->
     <disable_collisions link1="link_001" link2="link_013" reason="Default"/>
     <disable_collisions link1="link_001" link2="link_015" reason="Default"/>
     <disable_collisions link1="link_004" link2="link_017" reason="Default"/>
