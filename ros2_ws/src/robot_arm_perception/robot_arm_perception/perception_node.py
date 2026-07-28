@@ -30,6 +30,13 @@ YOLO 추론과 무관하게 발행한다(`stream_node`가 SRT :5002로 송출). 
 시퀀스 번호로 소비(지연 큐 누적 없음). 같은 세션에서 RealSense 멀티 디바이스 오인식 방지용
 `D435_SERIAL` 하드코딩과, depth_frame은 있는데 depth_img가 없을 때 deproject를 호출하던
 버그도 수정.
+
+2026-07-18: 대회 5개 구간이 하나의 연속 주행 안에서 순차 진행되지만 비전(카메라+YOLO)은
+이 노드 하나로 통합돼 있어, 구간이 바뀔 때마다 재시작하며 `model_name` 파라미터로
+`model_presets.MODEL_PRESETS`의 model_path/classes/pick_classes 세트를 한 번에 갈아
+끼운다(그리퍼 preset과 동일 패턴). seg 모델(box)은 markerless pose 전체가, detect 전용
+모델(traffic_light)은 bbox 중심 depth translation만 활성화되는 기존 `_get_binmask` 폴백
+구조가 그대로 이 다중 모델 전환을 뒷받침한다.
 """
 import math
 import os
@@ -47,6 +54,7 @@ from geometry_msgs.msg import Pose, Point, Quaternion
 from sensor_msgs.msg import RegionOfInterest, Image as ImageMsg
 from cv_bridge import CvBridge
 from robot_arm_msgs.msg import DetectedObject, DetectedObjectArray
+from robot_arm_perception.model_presets import DEFAULT_MODEL, get_preset
 from .perception_quality import is_usable_bbox, robust_depth_m
 
 D435_SERIAL = "250222071245"
@@ -193,10 +201,17 @@ class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
 
-        self.declare_parameter('model_path', 'src/robot_arm_perception/models/best.pt')  # Roboflow 커스텀 학습 모델 (2026-07-08)
+        # model_name 이 model_presets.MODEL_PRESETS 의 기본값을 고르고,
+        # 이후 개별 파라미터는 여전히 CLI/launch로 override 가능(gripper_type과 동일 패턴).
+        self.declare_parameter('model_name', DEFAULT_MODEL)  # 'box' | 'traffic_light' | ...
+        self._model_name = self.get_parameter('model_name').value
+        preset = get_preset(self._model_name, self.get_logger())
+
+        self.declare_parameter('model_path', preset['model_path'])
+        self.declare_parameter('task', preset['task'])    # 'segment' | 'detect'
         self.declare_parameter('backend', 'pt')          # 'pt' | 'trt'
         self.declare_parameter('conf_threshold', 0.55)
-        self.declare_parameter('classes', '')            # 쉼표구분 필터, 빈값=전체
+        self.declare_parameter('classes', preset['classes'])  # 쉼표구분 필터, 빈값=전체
         self.declare_parameter('width', 848)
         self.declare_parameter('height', 480)
         self.declare_parameter('fps', 30)
@@ -205,7 +220,7 @@ class PerceptionNode(Node):
         self.declare_parameter('test_image_path', '')
 
         # 픽 대상 선별 (Phase 2 Step 3)
-        self.declare_parameter('pick_classes', '')      # 쉼표구분 화이트리스트(필수). 빈값=후보없음
+        self.declare_parameter('pick_classes', preset['pick_classes'])  # 쉼표구분 화이트리스트. 빈값=후보없음(관찰 전용 구간)
         self.declare_parameter('pick_min_conf', 0.5)    # 픽 후보 최소 confidence
         self.declare_parameter('require_depth', True)   # True=depth pose(z!=0) 필수, False=conf만(test용)
         self._warned_no_pick_classes = False
@@ -218,10 +233,15 @@ class PerceptionNode(Node):
         self._camera_mode = self.get_parameter('camera_mode').value
 
         # YOLO 모델 로드 (segmentation)
+        # task를 명시적으로 넘긴다 — TensorRT .engine은 task 메타데이터를 보존하지 않아
+        # ultralytics가 자동 추정 시 seg 모델도 'detect'로 오판하고 r0.masks가 조용히
+        # None이 되는 문제가 있었다(2026-07-22 실측, model_presets.py 모듈 docstring 참고).
         from ultralytics import YOLO
         resolved = _resolve_model(model_path, backend, self._h, self._w)
-        self.model = YOLO(resolved)
-        self.get_logger().info(f'YOLO(seg) loaded: {resolved}')
+        task = self.get_parameter('task').value
+        self.model = YOLO(resolved, task=task)
+        self.get_logger().info(
+            f"YOLO loaded: model_name={self._model_name} path={resolved} task={self.model.task}")
 
         # 카메라 초기화 (realsense 모드면 DepthCal 생성)
         self._rs = None
