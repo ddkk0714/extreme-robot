@@ -29,7 +29,7 @@ from cv_bridge import CvBridge
 
 
 def _build_gst_cmd(port: int, width: int, height: int, fps: int,
-                   latency_ms: int = 60, bitrate_kbps: int = 3000,
+                   latency_ms: int = 60, bitrate_kbps: int = 4500,
                    encoder_threads: int = 4) -> list:
     return [
         "gst-launch-1.0",
@@ -56,7 +56,7 @@ class StreamNode(Node):
 
         self.declare_parameter('port', 5002)
         self.declare_parameter('fps', 30)
-        self.declare_parameter('bitrate_kbps', 3000)
+        self.declare_parameter('bitrate_kbps', 4500)
         self.declare_parameter('latency_ms', 60)
         self.declare_parameter('image_topic', '/perception/raw_image')
         self.declare_parameter('encoder_threads', 4)  # Orin Nano 6코어 기준 — 나머지는 perception_node 추론용

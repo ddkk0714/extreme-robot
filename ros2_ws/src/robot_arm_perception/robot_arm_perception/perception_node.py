@@ -55,6 +55,7 @@ from sensor_msgs.msg import RegionOfInterest, Image as ImageMsg
 from cv_bridge import CvBridge
 from robot_arm_msgs.msg import DetectedObject, DetectedObjectArray
 from robot_arm_perception.model_presets import DEFAULT_MODEL, get_preset
+from .perception_quality import is_usable_bbox, robust_depth_m
 
 D435_SERIAL = "250222071245"
 
@@ -111,26 +112,63 @@ class DepthCal:
         self.dmin, self.dmax = dmin, dmax
 
 
-def _deproject_centroid(rs, depth_frame, depth_img: np.ndarray,
-                        cu: float, cv_: float, r: int,
-                        cal: DepthCal):
-    """color 픽셀 (cu,cv) → depth 픽셀 투영 → 패치 median depth → color (X,Y,Z)[m].
+def _deproject_mask(rs, depth_frame, depth_img: np.ndarray,
+                    binmask: np.ndarray | None,
+                    cu: float, cv_: float, cal: DepthCal,
+                    *, minimum_pixels: int = 20):
+    """마스크 픽셀 여러 점을 투영해 robust median depth로 (X,Y,Z)[m] 산출.
 
-    정렬 없이 동작. depth 측정 불가(투영 화면밖/유효픽셀 부족) 시 None.
+    정렬(align) 없는 검출별 투영 구조는 유지하되, 이전의 단일 centroid 패치
+    방식은 letterboxed 마스크 좌표가 depth와 어긋나면 배경 depth를 섞어
+    측정하는 문제가 있었다(2026-07-28 D435 근접 타겟 오측정 수정). 마스크
+    전역에서 다수 점을 샘플링하고 MAD 기반 이상치 제거를 거친다.
     """
-    dpx = rs.rs2_project_color_pixel_to_depth_pixel(
-        depth_frame.get_data(), cal.scale, cal.dmin, cal.dmax,
-        cal.di, cal.ci, cal.c2d, cal.d2c, [cu, cv_])
-    dx, dy = int(round(dpx[0])), int(round(dpx[1]))
     h, w = depth_img.shape
-    if not (0 <= dx < w and 0 <= dy < h):
+    color_points = [(cu, cv_)]
+    if binmask is not None and binmask.any():
+        eroded = cv2.erode(
+            binmask.astype(np.uint8), np.ones((5, 5), np.uint8),
+            iterations=1,
+        )
+        ys, xs = np.nonzero(eroded)
+        if xs.size:
+            indexes = np.linspace(
+                0, xs.size - 1, num=min(25, xs.size), dtype=np.int64,
+            )
+            color_points = [
+                (float(xs[index]), float(ys[index])) for index in indexes
+            ]
+
+    projected: list[tuple[int, int]] = []
+    raw_values: list[np.ndarray] = []
+    for color_x, color_y in color_points:
+        dpx = rs.rs2_project_color_pixel_to_depth_pixel(
+            depth_frame.get_data(), cal.scale, cal.dmin, cal.dmax,
+            cal.di, cal.ci, cal.c2d, cal.d2c, [color_x, color_y],
+        )
+        dx, dy = int(round(dpx[0])), int(round(dpx[1]))
+        if not (0 <= dx < w and 0 <= dy < h):
+            continue
+        patch = depth_img[
+            max(dy - 1, 0):min(dy + 2, h),
+            max(dx - 1, 0):min(dx + 2, w),
+        ]
+        raw_values.append(patch.reshape(-1))
+        projected.append((dx, dy))
+    if not raw_values:
         return None
-    patch = depth_img[max(dy - r, 0):dy + r, max(dx - r, 0):dx + r]
-    valid = patch[patch > 0]
-    if valid.size < 5:
+    z = robust_depth_m(
+        np.concatenate(raw_values),
+        depth_scale=cal.scale,
+        minimum_pixels=minimum_pixels,
+        minimum_m=cal.dmin,
+        maximum_m=cal.dmax,
+    )
+    if z is None:
         return None
-    z = float(np.median(valid)) * cal.scale
-    pt_d = rs.rs2_deproject_pixel_to_point(cal.di, [float(dx), float(dy)], z)
+    dx = float(np.median([point[0] for point in projected]))
+    dy = float(np.median([point[1] for point in projected]))
+    pt_d = rs.rs2_deproject_pixel_to_point(cal.di, [dx, dy], z)
     return tuple(rs.rs2_transform_point_to_point(cal.d2c, pt_d))
 
 
@@ -174,7 +212,7 @@ class PerceptionNode(Node):
         self.declare_parameter('model_path', preset['model_path'])
         self.declare_parameter('task', preset['task'])    # 'segment' | 'detect'
         self.declare_parameter('backend', 'pt')          # 'pt' | 'trt'
-        self.declare_parameter('conf_threshold', 0.4)
+        self.declare_parameter('conf_threshold', 0.55)
         self.declare_parameter('classes', preset['classes'])  # 쉼표구분 필터, 빈값=전체
         self.declare_parameter('width', 848)
         self.declare_parameter('height', 480)
@@ -345,7 +383,11 @@ class PerceptionNode(Node):
         results = self.model.predict(
             color_img, conf=conf, classes=cls_filter, verbose=False)
         r0 = results[0]
-        masks = None if r0.masks is None else r0.masks.data.cpu().numpy()
+        # ``masks.data``는 모델/letterbox 래스터 좌표라 848x480 리사이즈 시
+        # 패딩이 있으면 depth 샘플이 어긋난다. ``masks.xy``는 이미 원본
+        # color-frame 좌표로 de-letterbox된 폴리곤이라 이쪽을 사용한다
+        # (2026-07-28 D435 근접 타겟 오측정 수정).
+        mask_polygons = None if r0.masks is None else r0.masks.xy
 
         array_msg = DetectedObjectArray()
         array_msg.header.stamp = stamp
@@ -353,6 +395,12 @@ class PerceptionNode(Node):
 
         for i, box in enumerate(r0.boxes):
             x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+            if not is_usable_bbox(
+                (x1, y1, x2, y2),
+                frame_width=self._w,
+                frame_height=self._h,
+            ):
+                continue
 
             obj = DetectedObject()
             obj.class_id = int(box.cls[0])
@@ -369,7 +417,9 @@ class PerceptionNode(Node):
             obj.bbox = roi
 
             # ② markerless pose: 마스크 기반 translation(depth) + orientation(2D PCA)
-            binmask = self._get_binmask(masks, i, color_img, (x1, y1, x2, y2))
+            binmask = self._get_binmask(
+                mask_polygons, i, color_img, (x1, y1, x2, y2),
+            )
             self._fill_markerless_pose(
                 obj, binmask, (x1, y1, x2, y2), depth_frame, depth_img)
 
@@ -384,7 +434,9 @@ class PerceptionNode(Node):
 
         # ④ debug 이미지 발행
         if self.pub_debug.get_subscription_count() > 0:
-            debug_img = self._draw_debug(color_img.copy(), array_msg.objects, masks, pick)
+            debug_img = self._draw_debug(
+                color_img.copy(), array_msg.objects, mask_polygons, pick,
+            )
             self.pub_debug.publish(
                 self._bridge.cv2_to_imgmsg(debug_img, encoding='bgr8'))
 
@@ -418,18 +470,26 @@ class PerceptionNode(Node):
                 best = obj
         return best
 
-    def _get_binmask(self, masks, i, color_img=None, box=None):
+    def _get_binmask(self, mask_polygons, i, color_img=None, box=None):
         """i번째 객체의 이진 마스크(원본 해상도).
 
-        seg 모델이면 YOLO 마스크 그대로 사용. detect 전용 모델(마스크 없음)이면
+        seg 모델이면 YOLO 마스크(``masks.xy``, 이미 원본 좌표로 de-letterbox된
+        폴리곤)를 fillPoly로 래스터화해 사용. detect 전용 모델(마스크 없음)이면
         bbox 안 red/blue HSV 색상 마스크로 대체(대회 타겟 클래스 'red and blue box'
         전용 근사) — PCA 주축 계산엔 정확한 세그멘테이션과 동일하게 넘길 수 있다.
         """
-        if masks is not None and i < len(masks):
-            m = masks[i]
-            if m.shape != (self._h, self._w):
-                m = cv2.resize(m, (self._w, self._h), interpolation=cv2.INTER_NEAREST)
-            return m > 0.5
+        if mask_polygons is not None and i < len(mask_polygons):
+            polygon = np.asarray(mask_polygons[i], dtype=np.float32)
+            if polygon.ndim == 2 and polygon.shape[0] >= 3:
+                polygon[:, 0] = np.clip(polygon[:, 0], 0, self._w - 1)
+                polygon[:, 1] = np.clip(polygon[:, 1], 0, self._h - 1)
+                original_mask = np.zeros((self._h, self._w), dtype=np.uint8)
+                cv2.fillPoly(
+                    original_mask,
+                    [np.rint(polygon).astype(np.int32)],
+                    1,
+                )
+                return original_mask.astype(bool)
         if color_img is not None and box is not None:
             return self._color_mask_in_box(color_img, box)
         return None
@@ -472,13 +532,14 @@ class PerceptionNode(Node):
         # translation: realsense 모드에서만 (depth 필요)
         if depth_frame is None or depth_img is None or self._depth_cal is None:
             return
-        r = max(4, min(x2 - x1, y2 - y1) // 6)
-        xyz = _deproject_centroid(
-            self._rs, depth_frame, depth_img, cu, cv_, r, self._depth_cal)
+        xyz = _deproject_mask(
+            self._rs, depth_frame, depth_img, binmask, cu, cv_,
+            self._depth_cal,
+        )
         if xyz is not None:
             obj.pose.position = Point(x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2]))
 
-    def _draw_debug(self, img, objects, masks, pick):
+    def _draw_debug(self, img, objects, mask_polygons, pick):
         """감지 결과를 img에 그려 반환. pick 타겟은 초록, 나머지는 파란색."""
         overlay = img.copy()
         for i, obj in enumerate(objects):
@@ -492,7 +553,9 @@ class PerceptionNode(Node):
             y2 = y1 + obj.bbox.height
 
             # 마스크 반투명 오버레이
-            binmask = self._get_binmask(masks, i, img, (x1, y1, x2, y2))
+            binmask = self._get_binmask(
+                mask_polygons, i, img, (x1, y1, x2, y2),
+            )
             if binmask is not None:
                 overlay[binmask] = (
                     overlay[binmask] * 0.5 + np.array(color, dtype=np.float32) * 0.5
