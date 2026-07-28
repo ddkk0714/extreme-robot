@@ -81,7 +81,7 @@ def generate_launch_description():
             package='joy', executable='joy_node', name='joy_node', output='screen',
             parameters=[{
                 'device_id': joy_device,
-                'autorepeat_rate': 20.0,
+                'autorepeat_rate': 50.0,
                 'deadzone': 0.0,     # 데드존은 joystick_teleop 에서 관절별로 적용
             }],
             condition=IfCondition(joy_node),
