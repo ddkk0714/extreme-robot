@@ -35,13 +35,22 @@ TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 DXL_MIN_TICK = 0
 DXL_MAX_TICK = 4095
 
-DEFAULT_JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
-DEFAULT_MOTOR_IDS = [0, 1, 2, 3, 4]
-DEFAULT_CENTERS = [2048, 2048, 2048, 2048, 2048]
-DEFAULT_DIRECTIONS = [1, 1, 1, 1, 1]
-DEFAULT_LIMIT_ENABLED = [True, True, True, True, True]
-DEFAULT_MIN_RADS = [-math.pi, -math.pi, 0.0, -math.pi / 2.0, -math.pi]
-DEFAULT_MAX_RADS = [math.pi, 0.0, math.pi, math.pi / 2.0, math.pi]
+DEFAULT_JOINT_NAMES = [
+    "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
+    "gripper_drive_joint",
+]
+
+# 실기 버스 스캔값 (2026-07-29). ID→관절 대응은 **ID 오름차순 가정**이며 미검증.
+DEFAULT_MOTOR_IDS = [21, 22, 23, 24, 2, 15]
+DEFAULT_CENTERS = [2048] * 6
+DEFAULT_DIRECTIONS = [1] * 6
+
+# 소프트리밋 기본 OFF — 모터가 아직 본체에 장착되지 않았다(통신 파이프라인 점검용).
+# 장착 후에는 URDF(robot_arm.urdf)의 관절 리밋에 맞춰 반드시 다시 켤 것.
+# 리밋을 꺼도 tick 은 0~4095 로 clamp 되므로 서보 자체 범위는 넘지 않는다.
+DEFAULT_LIMIT_ENABLED = [False] * 6
+DEFAULT_MIN_RADS = [-math.pi] * 6
+DEFAULT_MAX_RADS = [math.pi] * 6
 
 
 class TeleopCore(Node):
@@ -62,7 +71,9 @@ class TeleopCore(Node):
         self.declare_parameter("joint_min_rads", DEFAULT_MIN_RADS)
         self.declare_parameter("joint_max_rads", DEFAULT_MAX_RADS)
         self.declare_parameter("deadman_timeout_s", 0.5)  # 이 시간 넘게 입력 없으면 velocity 적분 정지
-        self.declare_parameter("publish_rate_hz", 20.0)
+        # velocity 적분 주기 = 목표 갱신 주기. 낮으면 한 번에 크게 뛰어 서보가
+        # 매번 프로파일을 새로 그리며 틱틱 끊긴다 — 잘게 자주 보내는 편이 매끄럽다.
+        self.declare_parameter("publish_rate_hz", 50.0)
         # JointJog.velocities 의 안전 상한 [rad/s]. 프론트엔드 버그로 큰 값이 들어와도
         # 팔이 튀지 않도록 on_jog 에서 clamp 한다.
         self.declare_parameter("max_vel_rad_s", 1.0)
