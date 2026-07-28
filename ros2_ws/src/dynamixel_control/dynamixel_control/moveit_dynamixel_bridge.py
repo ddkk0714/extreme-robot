@@ -78,15 +78,15 @@ class MoveItDynamixelBridge(Node):
 
         self.declare_parameter("gripper_joints", preset["gripper_joints"])
         self.declare_parameter("gripper_ids", preset["gripper_ids"])  # 빈 배열이면 그리퍼 비활성
-        self.declare_parameter("gripper_open_m", preset["gripper_open_m"])
-        self.declare_parameter("gripper_close_m", preset["gripper_close_m"])
+        self.declare_parameter("gripper_open_rad", preset["gripper_open_rad"])
+        self.declare_parameter("gripper_close_rad", preset["gripper_close_rad"])
         self.declare_parameter("gripper_open_tick", preset["gripper_open_tick"])
         self.declare_parameter("gripper_close_tick", preset["gripper_close_tick"])
 
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
-        self.gripper_open_m = float(self.get_parameter("gripper_open_m").value)
-        self.gripper_close_m = float(self.get_parameter("gripper_close_m").value)
+        self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
+        self.gripper_close_rad = float(self.get_parameter("gripper_close_rad").value)
         self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
         self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
 
@@ -203,19 +203,19 @@ class MoveItDynamixelBridge(Node):
         config = JOINT_CONFIG[joint_name]
         return (tick - config["center"]) / (config["direction"] * TICKS_PER_RAD)
 
-    def gripper_m_to_tick(self, meters):
+    def gripper_pos_to_tick(self, rad):
         span = self.gripper_open_tick - self.gripper_close_tick
-        denom = self.gripper_open_m - self.gripper_close_m
-        frac = 0.0 if denom == 0.0 else (meters - self.gripper_close_m) / denom
+        denom = self.gripper_open_rad - self.gripper_close_rad
+        frac = 0.0 if denom == 0.0 else (rad - self.gripper_close_rad) / denom
         tick = int(round(self.gripper_close_tick + frac * span))
         return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
 
-    def gripper_tick_to_m(self, tick):
+    def gripper_tick_to_pos(self, tick):
         span = self.gripper_open_tick - self.gripper_close_tick
         if span == 0:
-            return self.gripper_close_m
+            return self.gripper_close_rad
         frac = (tick - self.gripper_close_tick) / span
-        return self.gripper_close_m + frac * (self.gripper_open_m - self.gripper_close_m)
+        return self.gripper_close_rad + frac * (self.gripper_open_rad - self.gripper_close_rad)
 
     def int_to_little_endian_4bytes(self, value):
         return [
@@ -300,14 +300,15 @@ class MoveItDynamixelBridge(Node):
         if trajectory.points:
             point = trajectory.points[-1]
             name_to_pos = dict(zip(trajectory.joint_names, point.positions))
-            # 단일 구동 조인트(gripper_drive_joint)만 사용 — 나머지 8개는 URDF mimic으로 종속
-            target_m = None
+            # 단일 구동 조인트(gripper_left_pinion_joint)만 사용 — 나머지 3개(우 피니언·좌우 랙)는
+            # URDF <mimic> 으로 종속된다. 두 서보(id 3,4)에는 같은 goal_tick 을 보낸다.
+            target_rad = None
             for jn in self.gripper_joints:
                 if jn in name_to_pos:
-                    target_m = name_to_pos[jn]
+                    target_rad = name_to_pos[jn]
                     break
-            if target_m is not None:
-                self._write_gripper(target_m)
+            if target_rad is not None:
+                self._write_gripper(target_rad)
             else:
                 self.get_logger().warn(
                     f"Gripper goal has no known finger joint {self.gripper_joints}"
@@ -318,8 +319,8 @@ class MoveItDynamixelBridge(Node):
         result.error_string = "Gripper command sent to Dynamixel"
         return result
 
-    def _write_gripper(self, meters):
-        goal_tick = self.gripper_m_to_tick(meters)
+    def _write_gripper(self, rad):
+        goal_tick = self.gripper_pos_to_tick(rad)
         for gid in self.gripper_ids:
             result, error = self.packet_handler.write4ByteTxRx(
                 self.port_handler, gid, ADDR_GOAL_POSITION, goal_tick
@@ -328,7 +329,7 @@ class MoveItDynamixelBridge(Node):
                 self.get_logger().warn(
                     f"Gripper write failed: id={gid}, result={result}, error={error}"
                 )
-        self.get_logger().info(f"gripper -> {meters:.4f} m -> tick {goal_tick} (ids {self.gripper_ids})")
+        self.get_logger().info(f"gripper -> {rad:.4f} rad -> tick {goal_tick} (ids {self.gripper_ids})")
 
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
@@ -360,8 +361,8 @@ class MoveItDynamixelBridge(Node):
             msg.position.append(self.tick_to_rad(joint_name, tick))
             msg.effort.append(float(current_raw))
 
-        # 그리퍼 핑거 관절: 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 gripper_drive_joint
-        # 로 보고한다. position(m)=대표(첫 응답) 모터 tick, effort=두 모터 전류의 max-abs
+        # 그리퍼 구동 관절: 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 gripper_left_pinion_joint
+        # 로 보고한다. position(rad)=대표(첫 응답) 모터 tick, effort=두 모터 전류의 max-abs
         # (부호 유지) — FSM 이 이 effort 로 파지/DROP 판정. 한 모터라도 부하가 크면 파지로
         # 보는 보수적(안전 측) 집계. 활성 그리퍼 ID 중 하나라도 무응답/HW 에러면 fault.
         active_gids = [gid for gid in self.gripper_ids if gid in self.active_ids]
@@ -383,10 +384,10 @@ class MoveItDynamixelBridge(Node):
                 if abs(current_raw) >= abs(effort_max_abs):
                     effort_max_abs = float(current_raw)
             if got_sample:
-                finger_m = self.gripper_tick_to_m(rep_tick)
+                finger_rad = self.gripper_tick_to_pos(rep_tick)
                 for jn in self.gripper_joints:
                     msg.name.append(jn)
-                    msg.position.append(finger_m)
+                    msg.position.append(finger_rad)
                     msg.effort.append(effort_max_abs)
 
         self.joint_state_pub.publish(msg)

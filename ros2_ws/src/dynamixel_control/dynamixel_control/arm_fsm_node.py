@@ -199,10 +199,10 @@ class ArmFsmNode(Node):
         # ── 파라미터 ──────────────────────────────
         # MoveIt
         self.declare_parameter('planning_group', 'arm')          # SRDF group
-        # tip_link: arm_joint_5 이후 고정 조인트 체인의 마지막 링크(link_051) — 여기서
-        # gripper_drive_joint(구동)와 gripper_linkage_base_fixed(그리퍼 고정 베이스)가 갈라짐.
-        # 2026-07-15 Isaac Sim 재export(robotarm_urdf_20260711.urdf) 기준.
-        self.declare_parameter('tip_link', 'link_051')            # 그리퍼 부모 링크
+        # tip_link: arm_joint_5 이후 고정 조인트 체인에서 팔과 그리퍼가 갈라지는 링크(link_039,
+        # = 5축 모듈 연결부). 2026-07-16 랙피니언 그리퍼 export 를 여기에 이식했다.
+        # (이전 값 link_051 은 옛 평행4절 그리퍼의 링크로, 지금 URDF 에는 존재하지 않는다.)
+        self.declare_parameter('tip_link', 'link_039')            # 그리퍼 부모 링크
         self.declare_parameter('base_frame', 'base_link')        # planning frame (리프트 기준)
         self.declare_parameter('lift_height', 0.10)              # LIFT 시 base_link +Z [m]
         self.declare_parameter('pick_frame_id', 'camera_color_optical_frame')
@@ -224,8 +224,8 @@ class ArmFsmNode(Node):
         gpreset = get_preset(gripper_type, self.get_logger())
 
         self.declare_parameter('gripper_joints', gpreset['gripper_joints'])
-        self.declare_parameter('gripper_open', gpreset['gripper_open_m'])
-        self.declare_parameter('gripper_close', gpreset['gripper_close_m'])
+        self.declare_parameter('gripper_open', gpreset['gripper_open_rad'])
+        self.declare_parameter('gripper_close', gpreset['gripper_close_rad'])
         # 전류(effort) 임계 — moveit_dynamixel_bridge 가 /joint_states.effort 에
         # raw signed PRESENT_CURRENT(XL430 기준 1단위≈2.69mA)를 발행. preset 값은 placeholder,
         # 실측 캘리브 필요(TODO): 무부하 파지 전류/낙하 시 전류를 측정해 임계값 설정.
@@ -1063,7 +1063,7 @@ class ArmFsmNode(Node):
         self._grip.send_goal_async(goal)
 
     def _gripper_effort(self):
-        """그리퍼 effort(전류) 절댓값 — /joint_states 의 gripper_drive_joint effort.
+        """그리퍼 effort(전류) 절댓값 — /joint_states 의 gripper_left_pinion_joint effort.
 
         랙피니언 2모터(ID 3,4)는 브릿지가 두 전류의 max-abs 를 이 관절 effort 로 이미
         집계해 보고하므로, 여기서는 대표 관절 하나만 읽으면 된다.
