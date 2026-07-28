@@ -41,7 +41,7 @@ PROFILE_ACCELERATION = 25
 PROFILE_VELOCITY = 80
 MAX_RATIO_STEP = 0.01
 MIN_STEP_INTERVAL = 0.05
-INITIAL_RATIO_LIMIT = 0.95
+INITIAL_RATIO_LIMIT = 1.10
 OPEN = {3: 1180, 4: 2510}
 CLOSE_UNWRAPPED = {3: -164, 4: 1212}
 SPAN = {3: 1344, 4: 1298}
@@ -83,12 +83,14 @@ def nearest_continuous(raw, references):
 
 
 def goals_for_ratio(ratio):
-    """Return distinct raw position goals for the logical close ratio."""
-    if not 0.0 <= ratio <= 1.0:
-        raise ValueError("ratio must be in [0, 1]")
-    unwrapped3 = OPEN[3] - SPAN[3] * ratio
-    goal4 = OPEN[4] - SPAN[4] * ratio
-    return {3: round(unwrapped3) % 4096, 4: round(goal4) % 4096}
+    """Return continuous position goals for the logical close ratio."""
+    if ratio < 0.0:
+        raise ValueError("ratio must be non-negative")
+
+    goal3 = round(OPEN[3] - SPAN[3] * ratio)
+    goal4 = round(OPEN[4] - SPAN[4] * ratio)
+
+    return {3: goal3, 4: goal4}
 
 
 def ratio_for_position(dxl_id, position):
@@ -205,13 +207,12 @@ class DynamixelBus:
                 f"SyncRead: {self.packet.getTxRxResult(result)}")
         states = {}
         for dxl_id in DXL_IDS:
-            raw32 = self._data(dxl_id, ADDR_PRESENT_POSITION, 4, "position")
-            raw = raw32 % 4096
-            if dxl_id not in self.last_unwrapped:
-                references = (OPEN[dxl_id], CLOSE_UNWRAPPED[dxl_id])
-                continuous = nearest_continuous(raw, references)
-            else:
-                continuous = unwrap_position(self.last_unwrapped[dxl_id], raw)
+            position32 = signed(
+                self._data(dxl_id, ADDR_PRESENT_POSITION, 4, "position"),
+                32,
+            )
+            raw = position32 % 4096
+            continuous = position32
             self.last_unwrapped[dxl_id] = continuous
             states[dxl_id] = {
                 "torque": self._data(
@@ -308,6 +309,7 @@ class CalibrationSession:
                     raise CalibrationError(
                         f"ID {dxl_id}: path ratio error {error:.3f} exceeds "
                         f"{self.args.path_ratio_tolerance:.3f}")
+
     def make_sample(self, states, phase="status", trial=0):
         return Sample(
             time.time(), phase, trial,
@@ -361,7 +363,10 @@ class CalibrationSession:
         if any(state["torque"] for state in states.values()):
             raise CalibrationError("torque already enabled unexpectedly")
         print("Hold goals use current positions:")
-        hold = {i: states[i]["position_raw"] for i in DXL_IDS}
+        hold = {
+            i: states[i]["position_unwrapped"]
+            for i in DXL_IDS
+        }
         print(f"ID3={hold[3]}, ID4={hold[4]}")
         answer = input(
             "Type HOLD to write current goals and enable torque: ")
@@ -422,6 +427,21 @@ class CalibrationSession:
             if max(changes) < self.args.min_motion_ticks:
                 stalled_since = stalled_since or time.monotonic()
                 if time.monotonic() - stalled_since > self.args.stall_seconds:
+                    contact_loads = [
+                        abs(states[i]["load"]) for i in DXL_IDS
+                    ]
+                    if (
+                        direction > 0.0
+                        and min(contact_loads) >=
+                            self.args.contact_load_threshold
+                    ):
+                        print(
+                            "Object contact detected during closing: "
+                            f"loads ID3={states[3]['load']}, "
+                            f"ID4={states[4]['load']}. "
+                            "Holding the current goal with torque enabled."
+                        )
+                        return
                     raise CalibrationError(
                         "goal changes but both positions are stalled")
             else:
@@ -429,6 +449,43 @@ class CalibrationSession:
             self.samples.append(self.make_sample(states, "move"))
             self.print_states(states)
             current = states
+
+        # Wait until both motors actually reach the requested ratio.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            states = self.bus.read_states()
+            self.validate_state(states)
+            errors = [
+                abs(states[i]["ratio"] - target)
+                for i in DXL_IDS
+            ]
+            self.samples.append(self.make_sample(states, "settle"))
+            self.print_states(states)
+            if max(errors) <= 0.015 and not any(
+                    states[i]["moving"] for i in DXL_IDS):
+                return
+            time.sleep(0.1)
+
+        final_states = self.bus.read_states()
+        self.validate_state(final_states)
+        contact_loads = [
+            abs(final_states[i]["load"]) for i in DXL_IDS
+        ]
+        if (
+            direction > 0.0
+            and not any(final_states[i]["moving"] for i in DXL_IDS)
+            and min(contact_loads) >= self.args.contact_load_threshold
+        ):
+            print(
+                f"Target {target:.3f} was not reached because object contact "
+                "was detected. "
+                f"Loads: ID3={final_states[3]['load']}, "
+                f"ID4={final_states[4]['load']}. "
+                "Torque remains enabled."
+            )
+            return
+        raise CalibrationError(
+            f"target {target:.3f} was commanded but not reached")
 
     def collect_trial(self, phase, trial):
         if phase not in {"empty", "grasp", "drop"}:
@@ -599,6 +656,12 @@ def build_parser():
         "--step-interval", type=float, default=MIN_STEP_INTERVAL)
     parser.add_argument("--stall-seconds", type=float, default=0.5)
     parser.add_argument(
+        "--contact-load-threshold",
+        type=int,
+        default=30,
+        help="minimum abs(Present Load) on both motors to treat a closing stall "
+             "as object contact")
+    parser.add_argument(
         "--min-motion-ticks", type=int, default=3,
         help="per-sample meaningful-motion threshold; 1-2 ticks ignored")
     parser.add_argument(
@@ -613,8 +676,8 @@ def build_parser():
 def validate_arguments(args):
     if args.max_ratio > INITIAL_RATIO_LIMIT:
         raise CalibrationError(
-            "this build refuses --max-ratio above 0.70; range extension "
-            "needs review")
+            f"this build refuses --max-ratio above "
+            f"{INITIAL_RATIO_LIMIT:.2f}; range extension needs review")
     validate_target_ratio(0.0, args.max_ratio)
     if args.step_interval < MIN_STEP_INTERVAL:
         raise CalibrationError("step interval must be at least 0.05 seconds")
@@ -627,6 +690,9 @@ def validate_arguments(args):
     if args.read_only and args.armed:
         raise CalibrationError(
             "--read-only and --armed are mutually exclusive")
+    if args.contact_load_threshold <= 0:
+        raise CalibrationError(
+            "contact load threshold must be positive")
 
 
 def main():

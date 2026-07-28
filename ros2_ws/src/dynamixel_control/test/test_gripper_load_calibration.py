@@ -18,7 +18,7 @@ from dynamixel_control.gripper_load_calibration import (
 def test_endpoint_mapping_and_distinct_goals():
     assert goals_for_ratio(0.0) == {3: 1180, 4: 2510}
     assert goals_for_ratio(0.5) == {3: 508, 4: 1861}
-    assert goals_for_ratio(1.0) == {3: 3932, 4: 1212}
+    assert goals_for_ratio(1.0) == {3: -164, 4: 1212}
     assert all(goals_for_ratio(r)[3] != goals_for_ratio(r)[4]
                for r in (0.0, 0.5, 0.7, 1.0))
 
@@ -32,8 +32,9 @@ def test_wrap_and_unwrap_are_continuous():
 def test_ratio_range_guard():
     validate_target_ratio(0.0)
     validate_target_ratio(0.70)
+    validate_target_ratio(1.10)
     with pytest.raises(CalibrationError):
-        validate_target_ratio(0.701)
+        validate_target_ratio(1.101)
     with pytest.raises(ValueError):
         goals_for_ratio(-0.1)
 
