@@ -1,10 +1,43 @@
 # 작업 인수인계 지시서
 
 > **대상**: 다음 Claude Code 세션  
-> **최종 업데이트**: 2026-07-24 (SRDF Default 충돌행렬 40→3000샘플 재검증. 아래 최상단 섹션 참고)  
+> **최종 업데이트**: 2026-07-29 (그리퍼 파지력 실측(2026-07-28) 코드/문서 반영. 아래 최상단 섹션 참고)  
 > **기준 문서**: `/home/jo/ros2_ws/CLAUDE.md` (전체 통합 계획)  
 > **레포 경로**: `/home/jo/ros2_ws/extreme-robot/`  
 > **ROS2 소스**: `extreme-robot/ros2_ws/src/`
+
+---
+
+## 그리퍼 파지력(Ratio) 실측 반영 (2026-07-28 실측 → 2026-07-29 코드 반영)
+
+### 배경
+Notion "그리퍼 파지/낙하 감지(effort threshold) 실측·캘리브레이션 절차" 문서 최하단에
+`Gripper Load Calibration (2026-07-28)` 실측 표가 추가됨 — 실리콘 테스트 물체 기준으로
+`gripper_load_calibration.py`의 `goto R` 명령이 쓰는 **closing ratio**(1.0=기존 계산상
+완전 닫힘, 1.10까지 승인된 overtravel 범위)를 0.01~0.02 단위로 올려가며 ID3/ID4 load를
+반복 측정한 결과.
+
+| Ratio | ID3 Load | ID4 Load | 결과 |
+|---|---|---|---|
+| 1.00 | -119 | -50 | 파지력 부족 |
+| 1.02 | -130 | -77 | 파지 가능 (약간 미끄러짐) |
+| 1.04 | -192 | -131 | 안정적으로 파지 |
+| 1.05 | -266 | -175 | 가장 안정적으로 파지 (hwerr=0x00) |
+
+### 한 것
+- `gripper_load_calibration.py`에 `RECOMMENDED_GRASP_RATIO = 1.05` 상수 추가 + 실측
+  근거 주석. 다음 실기 세션에서 `goto 1.05`로 바로 재현 가능.
+- `gripper_presets.py`의 `grasp_effort_thresh`/`drop_effort_thresh` placeholder 주석에
+  이번 실측 결과와 잔여 과제(empty/grasp/drop 3그룹 반복측정 필요)를 명시.
+- **주의**: 이번 실측은 ratio(닫히는 정도)만 확정한 것이고, `grasp_effort_thresh`/
+  `drop_effort_thresh`(전류 임계값) 자체는 Notion 문서 원문에도 "반복 측정을 통해
+  추후 최종 결정할 예정"이라고 명시되어 있어 **아직 미확정** — `80.0`/`20.0` 값은
+  그대로 두었다. 아래 §547(구 TODO) 참고.
+
+### 남은 것
+- [ ] `gripper_load_calibration.py`의 `measure empty/grasp/drop <trial>` × 5회 이상씩
+  실행 후 `thresholds` 커맨드로 `grasp_effort_thresh`/`drop_effort_thresh` 최종 확정.
+- [ ] 확정되면 `gripper_presets.py`의 `80.0`/`20.0`을 실측값으로 교체.
 
 ---
 
@@ -544,7 +577,7 @@ airplane(화이트리스트 제외)·person 0.46(min_conf 미달) 정상 탈락.
 
 - [x] **브릿지 effort(전류) 발행** *(2026-06-29 완료)* — `moveit_dynamixel_bridge`가 PRESENT_CURRENT(126,2 signed)~PRESENT_POSITION(132,4)을 연속 10바이트 SyncRead 블록으로 한 번에 읽어 `/joint_states`에 position+effort(**raw signed current**) 동시 발행. FSM이 effort로 파지/DROP 판정.
 - [x] **브릿지에 그리퍼 실행 경로 추가** *(2026-06-29 완료)* — 같은 브릿지 노드에 `/gripper_controller/follow_joint_trajectory` 액션 서버 추가(단일 서보 양 핑거 미러링). 그리퍼 ID·미터↔틱 매핑·열림/닫힘 전부 파라미터화(`gripper_ids` 기본 [5], `gripper_open/close_tick` placeholder).
-  - [ ] **남은 캘리브**: `gripper_open_tick`/`gripper_close_tick` 실측, 전류 임계값(`grasp_effort_thresh`=80·`drop_effort_thresh`=20 raw placeholder) 실측, `gripper_ids` 실제 ID 확정.
+  - [ ] **남은 캘리브**: `gripper_open_tick`/`gripper_close_tick` 실측 (2모터 랙피니언 전환 후 미검증, 상단 §8/CLAUDE.md 참고). `gripper_ids`는 [3, 4]로 확정됨(완료). 전류 임계값(`grasp_effort_thresh`=80·`drop_effort_thresh`=20 raw placeholder)은 2026-07-28 ratio 실측(최상단 섹션 참고)으로 진전됐으나 여전히 미확정 — empty/grasp/drop 3그룹 반복측정 필요.
 - [x] **TF** 카메라(`camera_color_optical_frame`)→`base_link` 연결 *(2026-06-29 완료)* — `robot_arm_description/launch/camera_tf.launch.py` 추가. 뎁스 카메라(베이스 고정) static TF 2단: `base_link→camera_link`(장착 오프셋, launch arg `cam_x/y/z·cam_roll/pitch/yaw`, placeholder=0) + `camera_link→camera_color_optical_frame`(REP-103 optical 회전 고정). tf2_echo로 체인·회전 검증 완료.
   - [ ] **남은 캘리브**: 장착 오프셋 실측값을 launch arg로 지정. **RGB 카메라(eye-in-hand)는 URDF 관절 통합 후속 과제.**
 - [x] `_carry_pose()` 구현 *(2026-06-29 완료)* — TF(`base_frame`←`tip_link`)로 현재 TCP 자세 조회 → z+`lift_height`(기본 0.10m), orientation 유지. base_link(planning frame) 기준이라 MoveIt 바로 계획. TF 미가용 시 None→LIFT 스킵(graceful). 파라미터 `base_frame`/`lift_height` 추가, `tf2_ros` 의존 추가. 가짜 TF 스모크테스트 통과.
