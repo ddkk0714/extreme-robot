@@ -85,14 +85,15 @@ def _signed(value, byte_count):
 DEFAULT_MOTOR_IDS = [21, 22, 23, 24, 2, 15]
 
 # URDF(robot_arm.urdf)의 구동 관절 이름과 모터 ID 순서를 맞춤.
-# gripper_drive_joint 를 뺀 나머지 그리퍼 관절은 전부 mimic 이라 여기 없다.
+# 구동 조인트는 gripper_left_pinion_joint 하나뿐 — 나머지 그리퍼 관절(우 피니언·좌우 랙)은
+# 전부 mimic 이라 여기 없다. 서보는 2개(id 3,4)지만 항상 같은 값으로 구동한다.
 DEFAULT_JOINT_NAMES = [
     "arm_joint_1",
     "arm_joint_2",
     "arm_joint_3",
     "arm_joint_4",
     "arm_joint_5",
-    "gripper_drive_joint",
+    "gripper_left_pinion_joint",
 ]
 
 # 프로파일 가감속 기본값. **0(=최고속 즉시 이동)으로 두지 말 것** — 명령마다

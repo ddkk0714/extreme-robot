@@ -37,7 +37,7 @@ DXL_MAX_TICK = 4095
 
 DEFAULT_JOINT_NAMES = [
     "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
-    "gripper_drive_joint",
+    "gripper_left_pinion_joint",
 ]
 
 # 실기 버스 스캔값 (2026-07-29). ID→관절 대응은 **ID 오름차순 가정**이며 미검증.
