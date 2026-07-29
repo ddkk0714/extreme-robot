@@ -29,3 +29,6 @@ docs/
 # 실행 로그/디버그 캡처 (세션 산출물 — 중요한 건 예외적으로 git add로 개별 커밋됨)
 ros2_ws/*.log
 ros2_ws/debug_capture.png
+
+# 분석 스크립트가 뱉는 중간 데이터 (stow_eval.py sweep 등 — 스크립트로 재생성 가능)
+ros2_ws/*.npy
