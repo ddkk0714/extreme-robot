@@ -174,6 +174,17 @@ ros2 launch dynamixel_control bench.launch.py use_hardware:=true rviz:=true
 
 > ⚠️ **이 경로는 파워트레인 계약상 production 금지입니다.** `teleop_core → /dynamixel/goal_position → position_node`는 계약이 금지하는 *"direct dynamixel goal publisher"*입니다. 벤치/개발 전용이며 대회 launch 에 넣지 않습니다.
 
+#### XL430 마스터–슬레이브 TCP 벤치 (1축)
+
+PC의 torque-free XL430을 손으로 움직이면 같은 Wi-Fi의 Jetson에 연결된 XL430이
+시작 자세 기준 상대 위치를 30 Hz로 추종하는 단축 HIL 도구입니다. ROS/DDS 계약 및
+MoveIt을 우회하므로 **벤치 전용**이며, 기존 `position_node`,
+`moveit_dynamixel_bridge`, `arm_fsm`과 동시에 실행하면 안 됩니다.
+
+실측 구성, 모터별 속도·PWM·추정 부하 단위, 안전 제한과 실행 명령은
+[`dynamixel_control/MASTER_SLAVE_BENCH.md`](ros2_ws/src/dynamixel_control/MASTER_SLAVE_BENCH.md)를
+따릅니다.
+
 #### 키맵 (DualSense)
 
 | 입력 | 동작 |
