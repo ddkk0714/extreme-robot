@@ -23,6 +23,19 @@
         <joint name="arm_joint_4" value="0"/>
         <joint name="arm_joint_5" value="0"/>
     </group_state>
+    <!-- 주행 중 접힘 자세. 팀이 주행 안정성(CG 160mm — 도달 가능한 자세 중 최저) 기준으로
+         all-zero 를 선택했다(2026-07-29). 즉 위 home 과 값이 같다 — 의도된 중복이고,
+         "여기가 stow 다"를 명시하려고 따로 둔다.
+         점유 bbox 224×606mm / 높이 285mm / 중력토크 13.13N·m / 자기충돌 0.
+         ⚠️ 파워트레인 문서 §6 은 all-zero home 을 production 에서 금지한다 — 양 팀 합의 전까지
+         실차 연동 금지. 근거·회피책은 arm_fsm_node.py 의 stow_joint_positions 주석 참고. -->
+    <group_state name="stow" group="arm">
+        <joint name="arm_joint_1" value="0"/>
+        <joint name="arm_joint_2" value="0"/>
+        <joint name="arm_joint_3" value="0"/>
+        <joint name="arm_joint_4" value="0"/>
+        <joint name="arm_joint_5" value="0"/>
+    </group_state>
     <!-- URDF 리미트 기준: 0 = 완전 닫힘, 1.9444 = 완전 열림.
          실제 파지 폭은 서보 tick 캘리브레이션(gripper_presets.py) 후 재조정 필요. -->
     <group_state name="gripper_open" group="gripper">

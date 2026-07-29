@@ -59,10 +59,10 @@
     "멈춰있나" 검증에 불과했음). 이제 `stow_joint_positions` 파라미터가 정의하는 목표
     관절각으로 `/arm_controller/joint_trajectory`에 직접 궤적을 발행 → 완료 후 `_is_settled()`
     게이트를 거쳐 `STOWED_LOCKED`.
-    ⚠️ **`stow_joint_positions` 기본값은 CAD 미검증 placeholder다.** 계약상 all-zero
-    home을 접힘 자세로 쓰는 것은 금지(PR #17 회신) — 그래서 0이 아닌 임의값을 넣어뒀지만
-    실제 팔이 안전하게 접히는 각도인지는 실기 검증 전까지 모른다. **실기 테스트 없이
-    이 기본값으로 실제 서보를 구동하지 말 것.**
+    `stow_joint_positions` 기본값은 2026-07-29 팀 결정으로 **all-zero**다(주행 안정성 —
+    도달 가능한 자세 중 CG가 가장 낮음). 아래 파라미터 선언부의 근거 주석 참고.
+    ⚠️ **파워트레인 문서 §6의 all-zero home 금지와 정면 충돌한다 — 양 팀 합의 전까지
+    실차 연동 금지.** 또한 URDF 상으로만 검증됐고 실기 검증은 아직이다.
 
 2026-07-15 — 파워트레인 §5.1 잔여 합의 2건 해결(`project_docs/파워트레인_계약_충돌점검.md`
 항목 1·2 대응):
@@ -246,10 +246,30 @@ class ArmFsmNode(Node):
         self.declare_parameter('locked_pos_tol', 0.005)   # [m] tip 위치 흔들림 허용치
         self.declare_parameter('locked_vel_tol', 0.05)    # [rad/s] 관절 속도(유한차분) 허용치
         self.declare_parameter('locked_dwell', 0.5)       # [s] 안정 유지 시간
-        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서) — ⚠️ CAD 미검증 placeholder. all-zero
-        # home은 계약상 접힘 자세로 금지(구조상 충돌·역구동 위험) — 실기 검증 전까지 이
-        # 기본값으로 실제 서보를 구동하지 말 것. 실측 후 이 파라미터로 덮어쓸 것.
-        self.declare_parameter('stow_joint_positions', [0.0, -0.6, 1.2])
+        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 = j1, j2, j3).
+        # **팀이 주행 안정성 기준으로 all-zero 를 접힘 자세로 확정**(사용자 지시, 2026-07-29).
+        # 2026-07-29 랙피니언 그리퍼 URDF 실측 지표:
+        #   점유 bbox x 224mm × y 606mm   높이 285mm   최저점 +50mm
+        #   CG 높이 160mm (도달 가능한 자세 중 최저)   j2+j3 중력토크 13.13N·m   자기충돌 0
+        # 근거: j2·j3 하한이 0이라 팔은 [수평 → 수직 → 반대쪽 수평]만 훑고 아래로는 못 내려간다.
+        # 그래서 도달 가능한 자세 중 CG 가 가장 낮은 것이 all-zero 이고, 경사·요철에서 전복
+        # 여유가 가장 크다. (대안이던 '수직 마스트' [0, 1.40, 2.85] 는 bbox 213×235mm 로
+        # 발자국은 훨씬 작고 중력토크도 0.79N·m 로 20배 낮지만, 높이 978mm·CG 400mm 라
+        # 전복 여유가 나쁘다. 차체가 짧아 y 606mm 가 안 들어가면 그쪽으로 되돌릴 것.)
+        #
+        # ⚠️ **파워트레인 계약 위반 상태다 — 양 팀 합의 전까지 실차 연동 금지.**
+        # 파워트레인 문서 §6 "all-zero home 과 direct dynamixel goal publisher 는 production
+        # 에서 금지한다" (project_docs/파워트레인_계약_충돌점검.md:110).
+        # 실질 위험: `_near_stow_posture()` 가 무력화된다 — 전원만 들어오고 초기화 안 된 팔도
+        # 관절각이 ~0 이라 이 검사를 그냥 통과해서, 실제로 접히지 않았는데 STOWED_LOCKED 를
+        # 발행 → 파워트레인이 주행 허가로 받는다. 금지 조항의 이유가 정확히 이것이다.
+        # 회피책: 물리적으로 거의 같으면서 0 과 구분되는 값(예: [0.0, 0.15, 0.15] — bbox
+        # 224×606mm 로 all-zero 와 동일, 높이 328mm, 토크 12.61N·m)을 쓰면 stow_pos_tol_rad
+        # (0.1) 밖이라 위 검사가 되살아난다. 주행 안정성은 사실상 그대로다.
+        #
+        # 이전 기본값 [0.0, -0.6, 1.2]은 j2=-0.6이 URDF 하한(0) 밖이라 애초에 도달 불가였다.
+        # ⚠️ URDF 검증만 끝났고 실기 검증은 아직 — 실물 구동 전 서보 tick 대응 확인 필요.
+        self.declare_parameter('stow_joint_positions', [0.0, 0.0, 0.0])
         # STOWED_LOCKED 발행 전 "실제로 접힌 자세인지" 확인용 관절각 허용오차 — §5.1 잔여
         # 합의 ②(정지 안정성만 검사하고 접힘 자세 근접은 미확인) 대응. LOCKED 경유(지형/주행
         # 이벤트로 작업 중단)로 도달한 임의 자세를 STOWED_LOCKED로 착칭하지 않기 위함.
@@ -291,8 +311,8 @@ class ArmFsmNode(Node):
             self.stow_joint_positions = None
         else:
             self.get_logger().warn(
-                'stow_joint_positions는 CAD 미검증 placeholder다 — 실기 검증 없이 '
-                '이 기본값으로 실제 서보를 구동하지 말 것.')
+                f'stow_joint_positions={self.stow_joint_positions} — URDF 상으로만 검증된 '
+                '값이다(실기 미검증). 실물 구동 전 서보 tick 대응을 확인할 것.')
 
         # ── 토픽/액션 I/O ─────────────────────────
         # QoS 는 계약(contract.py/qos_profiles.py) 기준. heartbeat 계열을 depth 10 으로
