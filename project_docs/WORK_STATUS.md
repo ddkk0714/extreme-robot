@@ -1,10 +1,196 @@
 # 작업 인수인계 지시서
 
 > **대상**: 다음 Claude Code 세션  
-> **최종 업데이트**: 2026-07-16 (`feat/contract-v2-arm-fsm` — origin/main 재합류 2차: PR #20 `feat/gripper-fsm-modular`(URDF Isaac Sim 전면 교체 + `gripper_presets.py`) 병합, 조인트명/tip_link/그리퍼 파라미터 재적용. 아래 최상단 섹션 참고. `main`엔 아직 미병합)  
+> **최종 업데이트**: 2026-07-24 (SRDF Default 충돌행렬 40→3000샘플 재검증. 아래 최상단 섹션 참고)  
 > **기준 문서**: `/home/jo/ros2_ws/CLAUDE.md` (전체 통합 계획)  
 > **레포 경로**: `/home/jo/ros2_ws/extreme-robot/`  
 > **ROS2 소스**: `extreme-robot/ros2_ws/src/`
+
+---
+
+## SRDF Default 충돌행렬 재검증 — 40샘플→3000샘플 (2026-07-24, 젯슨 로컬)
+
+### 배경
+2026-07-16(`24f4c4c`)에 등록한 18개 "Default" collision 쌍의 근거가 무작위 자세
+40개뿐이라 약하다는 지적(SRDF 파일 내 자체 경고 주석)이 있었음. 실물 하드웨어
+없이 이 젯슨에서 바로 진행 가능한 작업이라 우선순위 2번으로 착수.
+
+### 한 것
+- **`scripts/sample_collision_matrix.py` 신규 작성** — `/check_state_validity`
+  서비스로 `arm_joint_1~5` 리밋 안쪽 무작위 자세를 N개 샘플링해, SRDF에 이미
+  등록된 쌍은 제외하고 새로 걸리는 충돌쌍을 "항상 충돌(Default 후보)" vs
+  "가끔 충돌(진짜 self-collision, disable 금지)"로 자동 분류하는 재사용 가능한
+  스크립트(원래 40샘플 작업은 스크립트 없이 즉석으로 했던 것을 재현 가능한 형태로
+  남김). `--samples`/`--seed`/`--srdf` 인자 지원.
+- **1차 실행(3000샘플, 원본 SRDF 그대로)**: 기존 미등록 충돌쌍 65개 재확인, 새로
+  "항상 충돌"인 쌍은 0개 — 기존 18개 Default 외에 추가로 disable할 쌍 없음.
+- **2차 실행(3000샘플, 기존 18개 Default를 SRDF에서 잠깐 제거)**: MoveIt ACM은
+  disable된 쌍을 아예 검사하지 않으므로, 기존 18개가 "진짜 항상 충돌"인지
+  재검증하려면 SRDF에서 빼고 move_group을 재기동해 다시 검사해야 함. **18개 전부
+  3000/3000(100%) 재확인** — 40샘플 근거가 75배 강화됨. 이후 원본 SRDF로 정확히
+  복원(`disable_collisions` 18줄 diff 0 확인) + move_group 재기동으로 정상 동작
+  재확인(`You can start planning now!`).
+- **SRDF 주석 갱신**(`robot_arm_moveit_config/config/robot_arm.srdf` L94-111) —
+  3000샘플 재검증 사실 + 갱신된 애매쌍 비율 반영.
+
+### 결과 — 애매한 충돌쌍(disable 절대 금지, 3000샘플 기준)
+기존 8쌍(2026-07-16 40샘플 기준 링크 그대로, 비율만 갱신):
+```
+link_034/link_037   2907/3000 (96.9%)
+link_041/link_052   2888/3000 (96.3%)
+link_002/link_026   2839/3000 (94.6%)
+link_045/link_047   2675/3000 (89.2%)
+link_034/link_040   2430/3000 (81.0%)
+link_044/link_046   1303/3000 (43.4%)
+link_043/link_045    824/3000 (27.5%)
+link_041/link_049    107/3000 (3.6%)
+```
+표본이 커지며 새로 관측된 희귀 충돌쌍 57개(대부분 <2%, base_link/link_031이
+극단 관절각에서 걸림 — 예: `link_006/link_031` 1.5%, `base_link/link_039` 1.0%
+등). 전체 목록은 `project_docs/collision_matrix_3000samples_2026-07-24.txt`(1차
+실행 원본 출력) 참고. 전부 disable 금지 원칙 동일.
+
+### 부가 발견 (이번 작업 범위 밖, 손대지 않음)
+`/check_state_validity`로 홈 자세(`arm_joint_1~5` 전부 0)를 직접 검사하면
+`valid=False` — 위 애매쌍 중 5개(link_002/026, link_034/037, link_034/040,
+link_041/052, link_043/045)가 정확히 이 자세에서 충돌 판정됨. 이 5개는 disable
+대상이 아니므로 SRDF로 해결할 문제가 아니고, `24f4c4c` 커밋에서 이미 "RViz로
+실제 겹침 여부 확인 필요"로 열어둔 이슈와 동일선상 — **stow 자세 작업(우선순위
+1번) 착수 시 홈 자세 자체가 기하학적으로 유효한지도 같이 RViz 육안으로 확인할
+것.**
+
+### 검증 범위의 한계
+- 여전히 디스플레이 없는 환경이라 정식 MoveIt Setup Assistant GUI
+  "Regenerate Default Collision Matrix"(샘플 수천~수만 단위, 이번 3000샘플도
+  근사치)는 못 돌림 — 기회 되면 GUI로 재생성해 이 결과를 덮어쓸 것.
+- 홈 자세 self-collision 5쌍의 실제 기하 겹침 여부는 육안(RViz) 미확인 상태.
+
+---
+
+## TensorRT 백엔드 도입 + task 오판 버그 수정 + model_presets 5구간 전체 확장 (2026-07-22, 젯슨 실기)
+
+### 이번 세션에서 한 것
+- **TensorRT 백엔드 실측 도입**: 호스트 JetPack에 이미 있는 TensorRT 10.3.0을
+  컨테이너에 apt로 재설치하는 대신 curated 디렉터리(`~/.tensorrt-libs`,
+  `~/.tensorrt-python`)로 만들어 `docker-compose.gpu.yml`에 마운트(cudnn-libs와 동일
+  패턴). `perception_node`의 `backend:=trt`로 box(seg) 모델 실제 엔진 빌드(~8분,
+  최초 1회) + 실행 성공. **`/detected_objects` 실측: CUDA(pt) 17.1Hz → TensorRT FP16
+  25.1~25.5Hz** — 30Hz 목표에 상당히 근접.
+- **🐛 발견·수정: TensorRT 엔진의 task 오판으로 마스크가 조용히 사라지는 버그**.
+  `.engine` 파일은 task 메타데이터를 보존하지 않아 `YOLO(engine_path)`가 자동으로
+  `task='detect'`로 추정 — seg 모델(box)인데도 `r0.masks`가 **에러 없이 None**이 돼
+  markerless pose(translation/PCA orientation)가 조용히 깨짐. `model_presets.py`에
+  `task` 필드를 추가하고 `perception_node.py`가 `YOLO(resolved, task=preset['task'])`로
+  명시 전달하도록 수정 — 수정 후 `box`+`backend:=trt` 조합에서 `/pick_target`
+  orientation이 정상 발행됨을 재검증(quaternion z=0.663/w=0.748, 이전 pt 백엔드
+  결과와 일치).
+- **`model_presets.py`에 구간4/5 placeholder 추가**: `winter_terrain`(구간4
+  겨울_경로확보 — 이 구간이 실제 YOLO 인식이 필요한지 자체가 파워트레인과 미확정)과
+  `lead_robot`(구간5 정찰동행_추종 — 선도봇 PID 추종용). 둘 다 모델 파일(.pt) 아직
+  없음 — `model_path`/`classes` TODO 상태, 도착하면 `models/`에 배치 + `classes`만
+  채우면 바로 동작하는 구조(5구간 전체가 이제 `model_name` 파라미터 하나로 커버됨).
+- **`*.onnx`를 `.gitignore`에 추가**: TensorRT 엔진 빌드의 중간 산출물(`.engine`은
+  이미 gitignore돼 있었음) — 커밋 방지.
+
+### 검증 범위의 한계
+- TensorRT 벤치는 정지 테스트 이미지 1장 기준(`camera_mode=test`) — 실카메라 연속
+  프레임 조건에서 25Hz가 유지되는지는 미검증. `winter_terrain`/`lead_robot`은 모델
+  파일이 없어 preset 딕셔너리 구조만 검증(실제 로드는 못 함).
+- 스트리밍 파이프라인 전체(카메라→추론→인코딩→SRT) e2e FPS 재측정은 여전히 실카메라
+  없어 미완료(이전 섹션과 동일 블로커).
+
+---
+
+## CUDA 드라이버 정합 재빌드 검증 + model_presets 4종 실기 검증 (2026-07-22, 젯슨 실기)
+
+### 이번 세션에서 한 것
+- **CUDA 픽스 재빌드·실측 확인**: Dockerfile의 Jetson wheel-index torch 교체(직전 세션
+  변경, 미빌드 상태였음)를 실제로 `docker compose build` + `up -d`로 반영 후
+  `torch.cuda.is_available()` 재확인 — **`True`, `device_name='Orin'`**(주석의 실측
+  claim이 실제로 재현됨). GPU 추론 벤치(box seg 모델, 848×480, 30프레임 평균):
+  **23.7 fps**(42ms/frame) — 이전 CPU 폴백 상태의 스트리밍 실측(~11~13Hz, 파이프라인
+  전체 기준이라 직접 비교는 아니지만 병목이었던 추론 자체는 확실히 풀림)과 비교하면
+  큰 개선. **다만 스트리밍 파이프라인 전체(카메라→추론→인코딩→SRT) 재측정은 실제
+  카메라가 없어 미완료** — RealSense/Dynamixel 모두 지금 세션엔 호스트에 물리적으로
+  연결 안 돼 있었음(`lsusb`로 확인). 다음 하드웨어 세션에서 `run_stream.sh` 등으로
+  end-to-end FPS 재측정 필요.
+- **`model_presets.py` 4종 전체 실기 검증**(컨테이너 내 `perception_node` 실행,
+  `camera_mode=test` + `debug_frame.png`): `box`/`traffic_light`/`iff`/`vision_marker`
+  전부 `ros2 run`으로 기동해 (1) preset별 올바른 모델 파일 로드, (2) `model.names`가
+  `model_presets.py`의 `classes`와 일치, (3) `/detected_objects` 정상 발행, (4)
+  `box`(유일한 pick 대상 preset)는 `/pick_target`까지 정상 발행(box-segmentation,
+  conf 0.93) — 관찰 전용 3종은 의도대로 `/pick_target` 미발행 확인. `colcon build`
+  (전체 6개 패키지) 회귀 없음.
+- **검증 범위의 한계**: 실제 RealSense 카메라 프레임으로는 아직 미검증(정지 테스트
+  이미지 1장 기준) — depth 경로(markerless pose translation)는 `require_depth:=false`
+  로 우회했으므로 실카메라+깊이 조건까지 포함한 end-to-end는 다음 하드웨어 세션 과제.
+
+### 다음 작업 우선순위 갱신
+- 위 "CUDA 드라이버 정합"(구 5번 항목)은 **코드/빌드 레벨은 완료** — 남은 건 실카메라
+  연결 후 스트리밍 FPS 재측정 하나뿐. 아래 목록에서 제거하고 이 항목으로 대체.
+
+---
+
+## 비전마커 YOLO 모델 추가 + 스트리밍 FPS 튜닝 + 문서 정합성 점검 (2026-07-22)
+
+### 이번 세션에서 한 것
+- **구간3(가을_장애물식별) YOLO 모델 추가**: `vision_marker_best.pt`(detect, 8클래스
+  `E/K/M/O/R/Y/a/heart`)를 `models/`에 배치, `model_presets.py`에 `"vision_marker"`
+  preset 추가(관찰 전용, `pick_classes` 비움), `run_perception_vision_marker.sh` 신규.
+- **GStreamer 스트리밍**: `stream_node.py`에 `encoder_threads` 파라미터 +
+  `sliced-threads=true` 추가(Orin 6코어 활용). `run_stream.sh`(raw, :5002)·
+  `run_stream_debug.sh`(오버레이, :5004) 신규. 실측 FPS ~11~13Hz(목표 30Hz 미달) —
+  원인은 gstreamer 설정이 아니라 **컨테이너 CUDA 드라이버 불일치**(호스트 12.6 vs
+  torch cu130 빌드) — YOLO가 CPU 폴백돼 6코어를 다 잡아먹음. Dockerfile의 torch
+  휠 버전을 Jetson JetPack에 맞는 것으로 교체해야 근본 해결(미착수, 범위 큼).
+- **CLAUDE.md 정합성 수정**: DRIVING 언락 안전 결함/`STOWED_LOCKED`·`CARRYING_LOCKED`
+  미발행 경고 둘 다 **이미 커밋 `581a83d`(2026-07-16)로 해결돼 있었음**을 코드로
+  확인 후 문구 정정(이전 경고는 stale).
+- **launch/moveit_config 배선 재확인**: `gripper_a.xacro`를 launch에서 골라 붙이는
+  방식은 **2026-07-15에 이미 폐기**되고 Isaac Sim 통합 재export(`robot_arm.urdf`,
+  `link_001~057`, `arm_joint_1~5`+`gripper_drive_joint`+mimic)로 대체됨 —
+  `display.launch.py`/`robot_arm_moveit_config`가 이미 이 트리로 배선돼 있고
+  `demo.launch.py` mock 플래닝까지 실제 기동 검증("You can start planning now!").
+  **CLAUDE.md의 robot_arm_description/robot_arm_moveit_config 절이 이 교체 이전
+  내용으로 낡아 있음 — 다음 세션에서 전면 재작성 필요** (아직 미착수).
+- **Notion 신규 문서 2건**(실측 절차 없던 gap 채움):
+  [wrist_camera_link 동적 TF 통합 절차](https://app.notion.com/p/3a42d27b08d38139948bf7f74a426ec8),
+  [stow_joint_positions 결정 절차](https://app.notion.com/p/3a42d27b08d381cba25ecee33cb1536c).
+- **`power-train-sw` 직접 대조**(코드 레벨): `contract.py`/QoS/`robot_arm_msgs` 전부
+  일치 확인(드리프트 0). `파워트레인_계약_충돌점검.md`의 1·2·3번 항목이 커밋
+  `581a83d`로 이미 해결됐음을 확인·문서 갱신 — **파워트레인 팀에 통보 필요**
+  (저쪽 정본 문서가 2026-07-15 시점 "arm 팀 대기 중"으로 남아있을 가능성).
+  상세는 `파워트레인_계약_충돌점검.md` 2026-07-22 절 참고.
+
+### 다음 작업 우선순위 (자율주행 통합 + 대회 대비)
+1. **`stow_joint_positions` 실측** — `DRIVE_READY_STATUSES`(`STOWED_LOCKED`/
+   `CARRYING_LOCKED`) 신뢰성의 마지막 코드 외 블로커. Notion 절차 문서 있음.
+2. **팔 4/5축 서보 실물 배선 + ID 확정** → `arm_fsm_node.py`/
+   `moveit_dynamixel_bridge.py`의 `JOINT_CONFIG` 확장 → `ik_mode='moveit'` 정식
+   경로 복귀(현재 analytic 3DOF 우회 중, orientation 미제어).
+3. **그리퍼 effort threshold 실측** — Notion 문서상 실측 예정일 2026-07-18 지남,
+   진행 상태 확인 필요.
+4. **`wrist_camera_link` 동적 TF 통합** — Notion 절차 문서 있음, 대회 시나리오에서
+   손목 카메라 실사용 계획이 있는지에 우선순위가 갈림(현재는 전방 D435i만 사용 중).
+5. ~~CUDA 드라이버 정합~~ **2026-07-22 완료**: Dockerfile torch 휠 교체를 재빌드해
+   `torch.cuda.is_available()=True` 실측 확인(위 최상단 섹션 참고). **남은 건 실카메라
+   연결 후 스트리밍 파이프라인 전체 FPS 재측정**뿐(추론만 벤치 완료, e2e는 미완료).
+6. **CLAUDE.md `robot_arm_description`/`robot_arm_moveit_config` 절 재작성** —
+   2026-07-15 URDF 전면 교체 이후 내용으로 갱신(현재 옛 gripper_a.xacro 모듈화
+   서술이 낡음).
+7. **파워트레인 팀에 통보**: STOW 3건(payload-aware/근접게이트/controller fault)
+   완료 + 하트비트 상수(`HEARTBEAT_RATE_HZ`/`_TIMEOUT_S`) `contract.py` 중앙화 제안.
+8. **대회 요구사항 재확인**: `ARRIVED_PICKUP`/`ARRIVED_DROP`이 현재 파워트레인 쪽
+   오퍼레이터 수동 트리거 구조 — "완전 자율주행"이 대회 채점 기준이면 이 갭이
+   파워트레인 쪽 과제로 명시돼야 함.
+9. ~~비전마커(구간3) 클래스 확정~~ **2026-07-24 확인 완료, 조치 불필요**:
+   `국방로봇_규정.pdf`(파워트레인 워크스페이스 `docs/`에서 원문 확인) §3 원문은
+   "다수의 물체 **5개**(비전마커)를 각각 정확히 식별" — 이는 **한 미션당 트랙에
+   놓이는 마커 개체 수**를 규정한 것이지 심볼 종류의 전체 가짓수가 아님. 붙임2에도
+   실제 심볼 목록은 없음(팀이 실물 마커 보고 직접 라벨링). 즉 모델의 8클래스는
+   "당일 어떤 5개가 나올지 몰라 가능한 심볼을 넓게 학습"한 것으로 의도된 설계이며
+   8 vs 5는 애초에 모순이 아니었음 — `model_presets.py`의 `classes`를 좁힐 필요
+   없음.
 
 ---
 

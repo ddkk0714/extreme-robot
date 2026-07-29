@@ -49,6 +49,10 @@ MODEL_PRESETS = {
         # translation은 bbox 중심 depth 폴백, orientation은 채워지지 않음. 관찰 전용 →
         # pick_classes 비워서 /pick_target 후보에서 자동 제외.
         # 클래스 8종(모델 실측, 2026-07-22): E/K/M/O/R/Y/a/heart.
+        # ⚠️ 규정상 "5개 식별"과 개수가 안 맞아 보이지만 모순 아님(2026-07-24 규정
+        # 원문 확인) — "5개"는 한 미션당 트랙에 놓이는 마커 개체 수고, 심볼 종류
+        # 전체 가짓수가 아님. 당일 어떤 5개가 나올지 몰라 8종을 넓게 학습해둔 것.
+        # classes 좁히지 말 것.
         "model_path": "src/robot_arm_perception/models/vision_marker_best.pt",
         "classes": "E,K,M,O,R,Y,a,heart",
         "pick_classes": "",

@@ -116,10 +116,12 @@ def _deproject_mask(rs, depth_frame, depth_img: np.ndarray,
                     binmask: np.ndarray | None,
                     cu: float, cv_: float, cal: DepthCal,
                     *, minimum_pixels: int = 20):
-    """Project sampled mask pixels and use their robust median depth.
+    """마스크 픽셀 여러 점을 투영해 robust median depth로 (X,Y,Z)[m] 산출.
 
-    This keeps the existing no-full-frame-align performance architecture while
-    avoiding the old single-centroid patch, which could measure background.
+    정렬(align) 없는 검출별 투영 구조는 유지하되, 이전의 단일 centroid 패치
+    방식은 letterboxed 마스크 좌표가 depth와 어긋나면 배경 depth를 섞어
+    측정하는 문제가 있었다(2026-07-28 D435 근접 타겟 오측정 수정). 마스크
+    전역에서 다수 점을 샘플링하고 MAD 기반 이상치 제거를 거친다.
     """
     h, w = depth_img.shape
     color_points = [(cu, cv_)]
@@ -381,10 +383,10 @@ class PerceptionNode(Node):
         results = self.model.predict(
             color_img, conf=conf, classes=cls_filter, verbose=False)
         r0 = results[0]
-        # ``masks.data`` lives on the model/letterbox raster.  Resizing that
-        # raster directly to 848x480 shifts depth samples when padding is
-        # present.  Ultralytics ``masks.xy`` is already de-letterboxed into
-        # the original color-frame coordinates, so use those polygons.
+        # ``masks.data``는 모델/letterbox 래스터 좌표라 848x480 리사이즈 시
+        # 패딩이 있으면 depth 샘플이 어긋난다. ``masks.xy``는 이미 원본
+        # color-frame 좌표로 de-letterbox된 폴리곤이라 이쪽을 사용한다
+        # (2026-07-28 D435 근접 타겟 오측정 수정).
         mask_polygons = None if r0.masks is None else r0.masks.xy
 
         array_msg = DetectedObjectArray()
@@ -471,7 +473,8 @@ class PerceptionNode(Node):
     def _get_binmask(self, mask_polygons, i, color_img=None, box=None):
         """i번째 객체의 이진 마스크(원본 해상도).
 
-        seg 모델이면 YOLO 마스크 그대로 사용. detect 전용 모델(마스크 없음)이면
+        seg 모델이면 YOLO 마스크(``masks.xy``, 이미 원본 좌표로 de-letterbox된
+        폴리곤)를 fillPoly로 래스터화해 사용. detect 전용 모델(마스크 없음)이면
         bbox 안 red/blue HSV 색상 마스크로 대체(대회 타겟 클래스 'red and blue box'
         전용 근사) — PCA 주축 계산엔 정확한 세그멘테이션과 동일하게 넘길 수 있다.
         """

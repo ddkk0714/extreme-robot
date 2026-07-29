@@ -29,7 +29,8 @@ from cv_bridge import CvBridge
 
 
 def _build_gst_cmd(port: int, width: int, height: int, fps: int,
-                   latency_ms: int = 60, bitrate_kbps: int = 4500) -> list:
+                   latency_ms: int = 60, bitrate_kbps: int = 4500,
+                   encoder_threads: int = 4) -> list:
     return [
         "gst-launch-1.0",
         "fdsrc", "fd=0", "do-timestamp=true",
@@ -38,7 +39,8 @@ def _build_gst_cmd(port: int, width: int, height: int, fps: int,
              f"width={width}", f"height={height}",
              f"framerate={fps}/1",
         "!", "videoconvert", "!", "video/x-raw,format=I420",
-        "!", "x264enc", "tune=zerolatency", "speed-preset=ultrafast", "threads=3",
+        "!", "x264enc", "tune=zerolatency", "speed-preset=ultrafast",
+             f"threads={encoder_threads}", "sliced-threads=true",
              f"bitrate={bitrate_kbps}", "key-int-max=30",
         "!", "h264parse", "config-interval=-1",
         "!", "mpegtsmux", "alignment=7",
@@ -57,12 +59,14 @@ class StreamNode(Node):
         self.declare_parameter('bitrate_kbps', 4500)
         self.declare_parameter('latency_ms', 60)
         self.declare_parameter('image_topic', '/perception/raw_image')
+        self.declare_parameter('encoder_threads', 4)  # Orin Nano 6코어 기준 — 나머지는 perception_node 추론용
 
         self._port = self.get_parameter('port').value
         self._fps = self.get_parameter('fps').value
         self._bitrate = self.get_parameter('bitrate_kbps').value
         self._latency = self.get_parameter('latency_ms').value
         self._image_topic = self.get_parameter('image_topic').value
+        self._encoder_threads = self.get_parameter('encoder_threads').value
 
         self._bridge = CvBridge()
         self._proc = None
@@ -83,7 +87,8 @@ class StreamNode(Node):
             return
         self._kill_proc()
         cmd = _build_gst_cmd(self._port, width, height,
-                             self._fps, self._latency, self._bitrate)
+                             self._fps, self._latency, self._bitrate,
+                             self._encoder_threads)
         self.get_logger().info('gst-launch: ' + ' '.join(cmd))
         self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         self._width, self._height = width, height
