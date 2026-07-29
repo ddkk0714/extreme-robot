@@ -12,7 +12,7 @@ teleop_core 로 보낸다. 시리얼/모터 로직은 전혀 없다 — 순수 �
   오른스틱 ↕ (axes 3) arm_joint_3
   오른스틱 ↔ (axes 2) arm_joint_4
   buttons[2] / [0]    arm_joint_5        + / −
-  buttons[3] / [1]    gripper_drive_joint 열기 / 닫기
+  buttons[3] / [1]    gripper_left_pinion_joint 열기 / 닫기
 
   이산 명령(home/stop/estop/mode)은 기본 비활성(-1) — 위 버튼들과 겹친다.
   터보도 비활성.
@@ -38,7 +38,7 @@ from control_msgs.msg import JointJog
 
 DEFAULT_JOINT_NAMES = [
     'arm_joint_1', 'arm_joint_2', 'arm_joint_3', 'arm_joint_4', 'arm_joint_5',
-    'gripper_drive_joint',
+    'gripper_left_pinion_joint',
 ]
 
 #: 관절별 축 인덱스. -1 = 축 없음(버튼으로 조작).

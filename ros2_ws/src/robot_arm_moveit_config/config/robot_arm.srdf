@@ -4,16 +4,17 @@
     A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
 -->
 <robot name="robot_arm">
-    <!-- 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf)로 robot_arm.urdf 전면 교체
-         (RViz에서 joint_2/3 축이 계속 이상해 기존 Fusion360/VerNOmiddle 계열을 폐기 — robot_arm.urdf
-         헤더 주석 참고). base_link -> link_051 체인(arm_joint_1~5). 그리퍼는 실제 구동 조인트
-         gripper_drive_joint 하나만 있고 나머지 8개(크랭크/조 관절)는 URDF <mimic> 태그로 자동
-         종속되는 평행 4절링크 — 예전 gripper_a_joint5/6(두 관절을 동일 값으로 미러링)에서 갈아탐. -->
+    <!-- 팔은 2026-07-15 Isaac Sim 재export 기준(arm_joint_1~5), 그리퍼는 2026-07-16 랙피니언
+         2모터 export 를 link_039(5축 모듈 연결부)에 이식한 것 — robot_arm.urdf 헤더/그리퍼
+         블록 주석 참고. arm 체인은 base_link -> link_039 이고, 그 아래가 전부 그리퍼다.
+         그리퍼 구동 조인트는 gripper_left_pinion_joint 하나뿐이며 나머지 3개(우 피니언,
+         좌우 랙)는 URDF <mimic> 으로 종속된다. 서보는 2개(id 3,4)지만 항상 같은 값으로
+         구동하므로 계획 상으로는 1 DOF. -->
     <group name="arm">
-        <chain base_link="base_link" tip_link="link_051"/>
+        <chain base_link="base_link" tip_link="link_039"/>
     </group>
     <group name="gripper">
-        <joint name="gripper_drive_joint"/>
+        <joint name="gripper_left_pinion_joint"/>
     </group>
     <group_state name="home" group="arm">
         <joint name="arm_joint_1" value="0"/>
@@ -22,31 +23,23 @@
         <joint name="arm_joint_4" value="0"/>
         <joint name="arm_joint_5" value="0"/>
     </group_state>
-    <!-- 캘리브레이션 전이라 우선 0/0 placeholder — 실측 후 open/closed 값 재조정 필요. -->
+    <!-- URDF 리미트 기준: 0 = 완전 닫힘, 1.9444 = 완전 열림.
+         실제 파지 폭은 서보 tick 캘리브레이션(gripper_presets.py) 후 재조정 필요. -->
     <group_state name="gripper_open" group="gripper">
-        <joint name="gripper_drive_joint" value="0"/>
+        <joint name="gripper_left_pinion_joint" value="1.9444444444444444"/>
     </group_state>
     <group_state name="gripper_closed" group="gripper">
-        <joint name="gripper_drive_joint" value="0"/>
+        <joint name="gripper_left_pinion_joint" value="0"/>
     </group_state>
-    <end_effector name="gripper_a" parent_link="link_051" group="gripper" parent_group="arm"/>
+    <end_effector name="gripper_a" parent_link="link_039" group="gripper" parent_group="arm"/>
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_link"/>
-    <!-- 아래 disable_collisions는 새 URDF(58 link)의 모든 joint(fixed 포함)로부터 자동 도출한
-         "Adjacent"(부모-자식) 쌍만 포함 — 프로그램적으로 100% 기계적 도출, 값 조작 없음. -->
+    <!-- 아래 disable_collisions는 현재 URDF(51 link / 50 joint)의 모든 joint(fixed 포함)로부터
+         자동 도출한 "Adjacent"(부모-자식) 쌍만 포함 — 프로그램적으로 100% 기계적 도출, 값 조작 없음. -->
     <disable_collisions link1="link_031" link2="link_028" reason="Adjacent"/>
     <disable_collisions link1="link_013" link2="link_015" reason="Adjacent"/>
     <disable_collisions link1="link_017" link2="link_021" reason="Adjacent"/>
     <disable_collisions link1="link_006" link2="link_038" reason="Adjacent"/>
     <disable_collisions link1="link_040" link2="link_033" reason="Adjacent"/>
-    <disable_collisions link1="link_051" link2="link_055" reason="Adjacent"/>
-    <disable_collisions link1="link_049" link2="link_056" reason="Adjacent"/>
-    <disable_collisions link1="link_056" link2="link_042" reason="Adjacent"/>
-    <disable_collisions link1="link_056" link2="link_046" reason="Adjacent"/>
-    <disable_collisions link1="link_049" link2="link_057" reason="Adjacent"/>
-    <disable_collisions link1="link_057" link2="link_043" reason="Adjacent"/>
-    <disable_collisions link1="link_057" link2="link_047" reason="Adjacent"/>
-    <disable_collisions link1="link_049" link2="link_044" reason="Adjacent"/>
-    <disable_collisions link1="link_049" link2="link_045" reason="Adjacent"/>
     <disable_collisions link1="base_link" link2="link_029" reason="Adjacent"/>
     <disable_collisions link1="base_link" link2="link_031" reason="Adjacent"/>
     <disable_collisions link1="link_031" link2="link_030" reason="Adjacent"/>
@@ -83,13 +76,15 @@
     <disable_collisions link1="link_036" link2="link_040" reason="Adjacent"/>
     <disable_collisions link1="link_033" link2="link_039" reason="Adjacent"/>
     <disable_collisions link1="link_039" link2="link_041" reason="Adjacent"/>
-    <disable_collisions link1="link_041" link2="link_051" reason="Adjacent"/>
-    <disable_collisions link1="link_055" link2="link_052" reason="Adjacent"/>
-    <disable_collisions link1="link_056" link2="link_053" reason="Adjacent"/>
-    <disable_collisions link1="link_057" link2="link_054" reason="Adjacent"/>
+    <disable_collisions link1="link_041" link2="link_042" reason="Adjacent"/>
+    <disable_collisions link1="link_042" link2="link_043" reason="Adjacent"/>
+    <disable_collisions link1="link_042" link2="link_044" reason="Adjacent"/>
+    <disable_collisions link1="link_043" link2="link_045" reason="Adjacent"/>
+    <disable_collisions link1="link_044" link2="link_046" reason="Adjacent"/>
+    <disable_collisions link1="link_045" link2="link_047" reason="Adjacent"/>
     <disable_collisions link1="link_046" link2="link_048" reason="Adjacent"/>
-    <disable_collisions link1="link_047" link2="link_050" reason="Adjacent"/>
-    <disable_collisions link1="link_051" link2="link_049" reason="Adjacent"/>
+    <disable_collisions link1="link_042" link2="link_049" reason="Adjacent"/>
+    <disable_collisions link1="link_042" link2="link_050" reason="Adjacent"/>
 
     <!-- 2026-07-16: 위 Adjacent만으로는 기어 치합 등 항상-접촉 쌍이 self-collision 오탐으로
          남아 mock 플래닝이 홈(all-zero) 자세부터 막혔음(RRTConnect: "Motion planning start
@@ -102,11 +97,18 @@
          등 기하 아티팩트로 판단, 안전하게 disable.
          ⚠️ 같은 샘플링에서 자세에 따라 충돌하다 안하다 한 쌍(진짜 self-collision 위험, 절대
          disable 금지)도 발견됨 — link_002/link_026(39/40), link_034/link_037(36/40),
-         link_041/link_052(36/40), link_045/link_047(33/40), link_034/link_040(31/40),
-         link_044/link_046(14/40), link_043/link_045(10/40), link_041/link_049(3/40).
-         이 쌍들은 그대로 collision-checked 상태로 둠 — 플래닝 중 이 쌍이 원인으로 실패하면
-         실제 충돌 회피가 필요한 자세라는 뜻이니 URDF/메쉬를 먼저 의심할 것.
-         샘플 수(40)가 Setup Assistant 기본값(수천)보다 훨씬 적어 근거가 약함 — 디스플레이
+         link_034/link_040(31/40). 이 쌍들은 그대로 collision-checked 상태로 둠 — 플래닝 중
+         이 쌍이 원인으로 실패하면 실제 충돌 회피가 필요한 자세라는 뜻이니 URDF/메쉬를 먼저
+         의심할 것.
+         ⚠️⚠️ 2026-07-29 그리퍼 교체로 link_041~link_057 은 **전혀 다른 파트가 됐다**. 이전
+         샘플링에서 나온 그리퍼 쪽 Default 쌍(link_052/054, link_053/054)과 위험 쌍
+         (link_041/052, link_045/047, link_044/046, link_043/045, link_041/049)은 전부
+         무효라 제거하고, 같은 방법으로 **60개 샘플(arm_joint_1~5 + 그리퍼 구동 조인트를
+         리밋 안에서 무작위)** 재실행해 아래 "2026-07-29 재산출" 블록을 새로 등록했다.
+         이번에도 자세에 따라 변하는 쌍은 그대로 두었다 — link_023/027(59/60),
+         link_034/037(58/60), link_002/026(56/60), link_006/023(56/60), link_041/044(29/60),
+         link_042/047(28/60), link_041/043(24/60), link_049/050(11/60), link_012/025(1/60).
+         샘플 수(40~60)가 Setup Assistant 기본값(수천)보다 훨씬 적어 근거가 약함 — 디스플레이
          있는 환경에서 기회가 되면 GUI로 "Regenerate Default Collision Matrix" 재실행해서
          이 블록을 정식 결과로 덮어쓸 것. -->
     <disable_collisions link1="link_001" link2="link_013" reason="Default"/>
@@ -125,6 +127,23 @@
     <disable_collisions link1="link_028" link2="link_030" reason="Default"/>
     <disable_collisions link1="link_034" link2="link_035" reason="Default"/>
     <disable_collisions link1="link_035" link2="link_040" reason="Default"/>
-    <disable_collisions link1="link_052" link2="link_054" reason="Default"/>
-    <disable_collisions link1="link_053" link2="link_054" reason="Default"/>
+
+    <!-- 2026-07-29 재산출 (60/60 항상 충돌). link_042~050 은 새 랙피니언 그리퍼 내부 —
+         피니언(047/048)과 랙(049/050)의 기어 치합, 랙이 본체(042) 안에 들어가 있는 구조라
+         자세와 무관하게 항상 접촉한다.
+         link_029/030(파워트레인 마운트)은 그리퍼 교체 전에도 정점거리 0.03mm 로 붙어 있던
+         기존 쌍인데 이전 40개 샘플에서 안 잡혔던 것뿐이다.
+         ⚠️ link_039/040 은 이번 CAD 의 arm_joint_4 축 이동(7.14mm)으로 두 링크 간격이
+         9.01mm -> 3.46mm 로 좁아지면서 새로 접촉 판정된 쌍이다. 관통은 아니고 3.46mm
+         여유가 있으므로 padding 아티팩트로 보고 disable 하지만, 실기 조립에서 이 부위가
+         실제로 닿는지 확인할 것. -->
+    <disable_collisions link1="link_029" link2="link_030" reason="Default"/>
+    <disable_collisions link1="link_039" link2="link_040" reason="Default"/>
+    <disable_collisions link1="link_042" link2="link_045" reason="Default"/>
+    <disable_collisions link1="link_042" link2="link_046" reason="Default"/>
+    <disable_collisions link1="link_042" link2="link_048" reason="Default"/>
+    <disable_collisions link1="link_047" link2="link_049" reason="Default"/>
+    <disable_collisions link1="link_047" link2="link_050" reason="Default"/>
+    <disable_collisions link1="link_048" link2="link_049" reason="Default"/>
+    <disable_collisions link1="link_048" link2="link_050" reason="Default"/>
 </robot>
