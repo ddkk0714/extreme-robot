@@ -24,6 +24,10 @@ GRIPPER_PRESETS = {
         "gripper_open_rad": 1.9444444444444444,   # URDF 상한(완전 열림)
         "gripper_close_rad": 0.0,                 # URDF 하한(완전 닫힘)
         # effort 임계 — 브릿지가 두 모터 전류의 max-abs 를 구동 조인트 effort 로 보고한다.
+        # 2026-07-28 실리콘 테스트 물체로 ratio별 파지력 실측(gripper_load_calibration.py
+        # RECOMMENDED_GRASP_RATIO=1.05 에서 ID3=-266/ID4=-175, hwerr=0x00 로 가장 안정적)
+        # 은 완료됐으나, empty/grasp/drop 3그룹 반복측정(`thresholds` 커맨드)이 아직이라
+        # 아래 두 값 자체는 여전히 placeholder — 재측정 후 확정 필요.
         "grasp_effort_thresh": 80.0,  # placeholder — 2모터 max-abs 기준 재실측 필요
         "drop_effort_thresh": 20.0,   # placeholder — 2모터 max-abs 기준 재실측 필요
         "gripper_action_time": 1.0,
