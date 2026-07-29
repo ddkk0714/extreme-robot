@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'dynamixel_control'
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,6 +34,9 @@ setup(
             'yolo_bridge = dynamixel_control.yolo_to_dynamixel_bridge:main',
             'yolo_detection = dynamixel_control.yolo_detection_node:main',
             'arm_fsm = dynamixel_control.arm_fsm_node:main',
+            'teleop_core = dynamixel_control.teleop_core_node:main',
+            'keyboard_teleop = dynamixel_control.keyboard_teleop_node:main',
+            'joystick_teleop = dynamixel_control.joystick_teleop_node:main',
         ],
     },
 )

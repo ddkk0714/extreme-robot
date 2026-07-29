@@ -1063,7 +1063,11 @@ class ArmFsmNode(Node):
         self._grip.send_goal_async(goal)
 
     def _gripper_effort(self):
-        """대표 핑거 관절의 effort(전류) 절댓값 — /joint_states effort에서."""
+        """그리퍼 effort(전류) 절댓값 — /joint_states 의 gripper_drive_joint effort.
+
+        랙피니언 2모터(ID 3,4)는 브릿지가 두 전류의 max-abs 를 이 관절 effort 로 이미
+        집계해 보고하므로, 여기서는 대표 관절 하나만 읽으면 된다.
+        """
         return abs(self._joint_effort.get(self.gripper_joints[0], 0.0))
 
     # ── 공통 ───────────────────────────────────

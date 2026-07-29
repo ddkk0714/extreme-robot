@@ -69,7 +69,7 @@ class MoveItDynamixelBridge(Node):
     def __init__(self):
         super().__init__("moveit_dynamixel_bridge")
 
-        # --- 그리퍼 파라미터 (단일 서보 양 핑거 미러링) ---
+        # --- 그리퍼 파라미터 (랙피니언 2모터 동일방향 구동, ID 3/4) ---
         # gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
         # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
         self.declare_parameter("gripper_type", DEFAULT_GRIPPER)
@@ -360,21 +360,34 @@ class MoveItDynamixelBridge(Node):
             msg.position.append(self.tick_to_rad(joint_name, tick))
             msg.effort.append(float(current_raw))
 
-        # 그리퍼 핑거 관절: 단일 서보(gripper_ids[0]) 값을 양 핑거에 동일 보고.
-        # position(m) + effort(raw current) — FSM 이 effort 로 파지/DROP 판정.
-        if self.gripper_ids and self.gripper_ids[0] in self.active_ids:
-            sample = self._read_sample(self.gripper_ids[0])
-            if sample is None:
-                fault = True
-            else:
+        # 그리퍼 핑거 관절: 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 gripper_drive_joint
+        # 로 보고한다. position(m)=대표(첫 응답) 모터 tick, effort=두 모터 전류의 max-abs
+        # (부호 유지) — FSM 이 이 effort 로 파지/DROP 판정. 한 모터라도 부하가 크면 파지로
+        # 보는 보수적(안전 측) 집계. 활성 그리퍼 ID 중 하나라도 무응답/HW 에러면 fault.
+        active_gids = [gid for gid in self.gripper_ids if gid in self.active_ids]
+        if active_gids:
+            rep_tick = None
+            effort_max_abs = 0.0
+            got_sample = False
+            for gid in active_gids:
+                sample = self._read_sample(gid)
+                if sample is None:
+                    fault = True
+                    continue
                 current_raw, tick, hw_error = sample
                 if hw_error != 0:
                     fault = True
-                finger_m = self.gripper_tick_to_m(tick)
+                got_sample = True
+                if rep_tick is None:
+                    rep_tick = tick
+                if abs(current_raw) >= abs(effort_max_abs):
+                    effort_max_abs = float(current_raw)
+            if got_sample:
+                finger_m = self.gripper_tick_to_m(rep_tick)
                 for jn in self.gripper_joints:
                     msg.name.append(jn)
                     msg.position.append(finger_m)
-                    msg.effort.append(float(current_raw))
+                    msg.effort.append(effort_max_abs)
 
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=fault))

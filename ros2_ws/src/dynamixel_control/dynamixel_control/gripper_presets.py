@@ -8,18 +8,22 @@ robot_arm_description의 urdf/grippers/<gripper>.xacro 모듈화(xacro:arg gripp
 
 GRIPPER_PRESETS = {
     "gripper_a": {
-        # 2026-07-15 Isaac Sim 재export(robotarm_urdf_20260711.urdf) 기준 — 그리퍼가
-        # gripper_drive_joint 하나만 실제 구동되고 나머지 8개(크랭크/조 관절)는 URDF의
-        # <mimic> 태그로 자동 종속(평행 4절링크 구속을 URDF 레벨에서 정식 표현).
-        # 기존 gripper_a_joint5/6(두 관절을 동일 값으로 미러링하던 방식)에서 갈아탐.
+        # 랙피니언 그리퍼: XL430 2개(ID 3,4)가 **같은 랙을 공유**해 같은 방향으로 구동한다.
+        # 랙이 하나뿐이라 두 모터는 항상 동일 goal_tick 을 쓰면 되고(단일 tick 확정),
+        # 모터별 오프셋/direction 부호는 불필요하다. URDF 측은 여전히 gripper_drive_joint
+        # 하나만 실제 구동, 나머지 조 관절은 <mimic> 으로 종속(2026-07-15 Isaac Sim export).
+        # 기존 단일 서보(ID 5)에서 2모터 랙피니언으로 전환.
         "gripper_joints": ["gripper_drive_joint"],
-        "gripper_ids": [5],
-        "gripper_open_tick": 2446,    # HW-8 실측 (215도, 2026-07-08)
-        "gripper_close_tick": 3186,   # HW-8 실측 (280도, 2026-07-08)
+        "gripper_ids": [3, 4],
+        # 아래 tick 은 HW-8 단일서보 실측(215도/280도) 유산값 — 랙이 같아 tick 체계는
+        # 동일하나, 새 조립체에서 open/close 각도가 그대로인지는 재확인 권장.
+        "gripper_open_tick": 2446,
+        "gripper_close_tick": 3186,
         "gripper_open_m": 0.02,       # 선형보간 기준점 placeholder — 실측 캘리브 필요
         "gripper_close_m": 0.0,
-        "grasp_effort_thresh": 80.0,  # ≈215mA, placeholder
-        "drop_effort_thresh": 20.0,   # ≈54mA, placeholder
+        # effort 임계 — 브릿지가 두 모터 전류의 max-abs 를 gripper_drive_joint effort 로 보고한다.
+        "grasp_effort_thresh": 80.0,  # placeholder — 2모터 max-abs 기준 재실측 필요
+        "drop_effort_thresh": 20.0,   # placeholder — 2모터 max-abs 기준 재실측 필요
         "gripper_action_time": 1.0,
     },
 }

@@ -62,6 +62,21 @@ System dependencies go in the **`Dockerfile`**, not ad-hoc `apt install`, so the
 
 > Note: the Dynamixel libraries are pulled via apt (`ros-humble-dynamixel-sdk`, `ros-humble-dynamixel-workbench`) — **not** git submodules. An earlier broken submodule/gitlink for these was removed.
 
+## 벤치 텔레옵 (파워트레인 없이 팔만 구동)
+
+`bench.launch.py` — `joy_node` → `joystick_teleop` → `teleop_core` → `position_node`. 키보드 프론트엔드(`keyboard_teleop`)도 같은 토픽을 쓰므로 대체 가능하다.
+
+- **격리는 launch 파일이 전부다.** `arm_fsm`을 안 띄우므로 계약 토픽(`/arm_status`·`/chassis_mode`·`/arrival_status`)이 **아예 생기지 않는다.** 노드 코드에 "테스트 모드면 건너뛰기" 분기는 **넣지 않았고, 넣지 말 것** — 안전 게이트에 스킵 분기가 있으면 실기에서 켜진 채 도는 사고가 난다(파워트레인도 같은 원칙: *"production source에 simulator 이름 분기를 넣지 않는다"*).
+- ⚠️ **이 경로는 계약상 production 금지다.** `/dynamixel/goal_position` 직접 발행은 계약이 금지하는 *"direct dynamixel goal publisher"*이고, `home`(전 관절 0)은 금지된 *"all-zero home"*이다. **파워트레인과 "팔 단독 벤치 profile 허용"을 합의해야 한다**(그쪽은 자기 쪽에 `arm_gate_mode=arm_absent_field`라는 대칭 장치를 이미 뒀다).
+- `JointJog.velocities`는 **rad/s**다(표준). `displacements`는 `jog_step_rad` 배수(키보드용). 예전엔 velocity가 "초당 jog_step 개수"로 해석돼 풀스틱이 0.05 rad/s밖에 안 나왔다 — 고쳤다.
+- **velocity 프론트엔드는 매 발행마다 전 관절을 실어야 한다.** `teleop_core.on_jog`는 메시지에 없는 관절의 velocity를 0으로 만들지 않아, 움직이는 관절만 골라 보내면 **놓은 관절이 마지막 속도로 계속 돈다.**
+
+### 그리퍼는 아직 이 경로에 배선되지 않았다
+
+`moveit_dynamixel_bridge`가 이미 같은 서보(id 5)를 구동하므로, `position_node`에도 그리퍼를 넣으면 **같은 버스의 같은 서보를 두 노드가 만지게 된다**(계약이 금지하는 owner 중복). 게다가 표현이 세 갈래로 갈라져 있다 — URDF(`gripper_a_joint5~23`, continuous) / 브릿지(`left_finger_joint`, prismatic 미터 — **URDF에 없는 조인트**) / HW-8 스크립트(id 5, degree). **먼저 한 곳으로 정리한 뒤 배선할 것.**
+
+> ⚠️ **배선할 때 반드시**: Dynamixel **Profile Acceleration(주소 108) / Velocity(112)를 25/80으로 설정**할 것. 기본값 `0`(=최고속 즉시 이동)이면 그리퍼가 움직일 때마다 순간 과전류로 **토크가 풀린다**(HW-8 실기 검증, 재현율 100%, 명령 후 0.3초 내 트립). Hardware Error Status는 트립 해소 후 0으로 복귀해 관찰 시점엔 안 보인다 — 이걸 모르면 원인을 못 찾는다.
+
 ## 파워트레인 계약 (중요)
 
 파워트레인 팀([power-train-sw](https://github.com/lightminn/power-train-sw))과 **같은 Jetson의 별도 컨테이너**에서 각자 ROS 2 노드를 돌리고 **DDS로만** 통신한다. 워크스페이스를 서로 오버레이하지 않으며, 공유하는 것은 메시지 계약뿐이다. 파워트레인은 `robot_arm_msgs`의 `.msg`만 벤더링해 자기들이 직접 빌드한다(ROS 2는 wire에서 **패키지명 + 구조 해시**로 매칭하므로 동일한 `.msg`로 각자 빌드하면 붙는다).

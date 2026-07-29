@@ -160,7 +160,63 @@ RViz **MotionPlanning** 패널에서 목표 자세를 정하고 **Plan & Execute
 - 목표 지정: 말단 마커 드래그 / Joints 탭 슬라이더 / Goal State 드롭다운(`home`, `<random valid>`)
 - 마커가 빨간색 = IK 해 없음 또는 충돌 → 도달 가능 범위로 이동
 
-### 4-3. YOLO 카메라-Dynamixel 추적 파이프라인
+### 4-3. 조이스틱 벤치 텔레옵 (5축)
+
+게임패드로 로봇팔 5축을 직접 조작합니다. **파워트레인 없이 팔만 돌리는 벤치 경로**입니다.
+
+```bash
+# 하드웨어 없이 RViz 로 확인
+ros2 launch dynamixel_control bench.launch.py rviz:=true
+
+# 실서보까지 (U2D2 + Dynamixel 연결 필요)
+ros2 launch dynamixel_control bench.launch.py use_hardware:=true rviz:=true
+```
+
+> ⚠️ **이 경로는 파워트레인 계약상 production 금지입니다.** `teleop_core → /dynamixel/goal_position → position_node`는 계약이 금지하는 *"direct dynamixel goal publisher"*입니다. 벤치/개발 전용이며 대회 launch 에 넣지 않습니다.
+
+#### 키맵 (DualSense)
+
+| 입력 | 동작 |
+| --- | --- |
+| **L1 (누르고 있기)** | **데드맨 — 누르고 있는 동안만 움직입니다. 떼면 즉시 정지.** |
+| 왼쪽 스틱 ↔ | `joint_1` (베이스 회전) |
+| 왼쪽 스틱 ↕ | `joint_2` (어깨) |
+| 오른쪽 스틱 ↕ | `joint_3` (팔꿈치) |
+| 오른쪽 스틱 ↔ | `joint_4` (손목 pitch) |
+| L3 / R3 | `joint_5` (손목 roll) − / + |
+| R1 | 터보 (속도 배율) |
+| △ | home — 전 관절 0 복귀 |
+| ○ | stop — 현재 위치 고정 / 비상정지 해제 |
+| ✕ | **비상정지** (latched — ○ 로 해제) |
+| PS | DRIVE/ARM 전환 (미구현 스텁) |
+| L2 / R2 | *[예약] 그리퍼 — 아직 배선하지 않음* |
+
+#### 실물 패드가 오면 — 축 번호부터 확인
+
+PS 패드의 축·버튼 인덱스는 **커널 드라이버(`hid-sony` vs `hid-playstation`)에 따라 다릅니다.** 위 기본값이 안 맞으면 코드가 아니라 **파라미터만** 바꾸면 됩니다.
+
+```bash
+ros2 topic echo /joy          # 스틱·버튼을 하나씩 움직이며 인덱스 확인
+ros2 run dynamixel_control joystick_teleop --ros-args \
+  -p axis_ids:="[0,1,4,3,-1]" -p deadman_button:=4
+```
+
+#### 패드 없이 검증하기
+
+가짜 `/joy`를 쏘면 실물 패드 없이 전 경로를 확인할 수 있습니다. 축 순서는 `[LX, LY, L2, RX, RY, R2, dpadX, dpadY]`입니다.
+
+```bash
+# joy_node 를 끄고 띄운 뒤
+ros2 launch dynamixel_control bench.launch.py joy_node:=false rviz:=true
+
+# 왼쪽 스틱을 오른쪽 끝까지 민 상태 + L1(데드맨) 누름 → joint_1 이 0.6 rad/s 로 회전
+ros2 topic pub -r 20 /joy sensor_msgs/msg/Joy \
+  '{axes: [1.0,0,1,0,0,1,0,0], buttons: [0,0,0,0,1,0,0,0,0,0,0,0,0]}'
+```
+
+L1(`buttons[4]`)을 `0`으로 바꾸면 팔이 즉시 멈춥니다.
+
+### 4-4. YOLO 카메라-Dynamixel 추적 파이프라인
 
 USB 카메라로 스마트폰을 감지하고 Dynamixel 모터가 카메라를 추적하는 파이프라인입니다.
 

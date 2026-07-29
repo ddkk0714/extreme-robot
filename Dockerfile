@@ -59,6 +59,12 @@ RUN apt-get update && apt-get install -y \
     ros-humble-ros2-controllers \
     && rm -rf /var/lib/apt/lists/*
 
+# 게임패드 드라이버 (joystick_teleop 의 /joy 소스).
+# ros-humble-desktop 에 딸려 들어오지만, 의존성 정책상 명시적으로 설치한다.
+RUN apt-get update && apt-get install -y \
+    ros-humble-joy \
+    && rm -rf /var/lib/apt/lists/*
+
 # ROS 2 환경 자동 소싱
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
 
