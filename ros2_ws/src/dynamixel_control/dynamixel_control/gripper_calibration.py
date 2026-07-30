@@ -28,6 +28,8 @@ ADDR_PRESENT_POSITION = 132
 TORQUE_OFF = 0
 TORQUE_ON = 1
 POSITION_MODE = 3
+EXTENDED_POSITION_MODE = 4
+SUPPORTED_POSITION_MODES = {POSITION_MODE, EXTENDED_POSITION_MODE}
 ENDPOINT_FILE = Path("/tmp/gripper_endpoints.json")
 RESULT_FILE = Path("/tmp/gripper_grasp_result.json")
 
@@ -46,12 +48,18 @@ def le32(value):
     return [(value >> shift) & 0xFF for shift in (0, 8, 16, 24)]
 
 
+def goal_for_mode(goal, operating_mode):
+    """Convert a continuous tick goal only when Mode 3 requires wrapping."""
+    return goal % 4096 if operating_mode == POSITION_MODE else goal
+
+
 class Bus:
     def __init__(self):
         self.port = PortHandler(DEVICE)
         self.packet = PacketHandler(PROTOCOL_VERSION)
         self.sync_goal = GroupSyncWrite(
             self.port, self.packet, ADDR_GOAL_POSITION, 4)
+        self.operating_modes = {}
 
     def open(self):
         if not self.port.openPort():
@@ -127,7 +135,9 @@ class Bus:
     def write_goals(self, goals):
         self.sync_goal.clearParam()
         for dxl_id in DXL_IDS:
-            if not self.sync_goal.addParam(dxl_id, le32(goals[dxl_id])):
+            goal = goal_for_mode(
+                goals[dxl_id], self.operating_modes.get(dxl_id))
+            if not self.sync_goal.addParam(dxl_id, le32(goal)):
                 raise CalibrationError(f"cannot queue goal for ID {dxl_id}")
         result = self.sync_goal.txPacket()
         self.sync_goal.clearParam()
@@ -138,6 +148,11 @@ class Bus:
 
 def require_safe_read_state(bus, require_position_mode=False):
     snapshots = {dxl_id: bus.snapshot(dxl_id) for dxl_id in DXL_IDS}
+    modes = {dxl_id: state["operating_mode"]
+             for dxl_id, state in snapshots.items()}
+    bus.operating_modes = modes
+    print("Operating Mode: " + ", ".join(
+        f"ID {dxl_id}={modes[dxl_id]}" for dxl_id in DXL_IDS))
     for dxl_id, state in snapshots.items():
         if state["model"] != EXPECTED_MODEL:
             raise CalibrationError(
@@ -148,9 +163,15 @@ def require_safe_read_state(bus, require_position_mode=False):
         if state["torque"] != TORQUE_OFF:
             raise CalibrationError(
                 f"ID {dxl_id}: torque is enabled; disable it before calibration")
-        if require_position_mode and state["operating_mode"] != POSITION_MODE:
+        if (require_position_mode and
+                state["operating_mode"] not in SUPPORTED_POSITION_MODES):
             raise CalibrationError(
-                f"ID {dxl_id}: operating mode {state['operating_mode']} != 3")
+                f"ID {dxl_id}: operating mode {state['operating_mode']} is "
+                "not Position (3) or Extended Position (4)")
+    if require_position_mode and len(set(modes.values())) != 1:
+        raise CalibrationError(
+            "ID 3 and ID 4 must use the same operating mode; no EEPROM "
+            "register was changed")
     return snapshots
 
 
@@ -158,7 +179,7 @@ def capture_endpoint(bus, label, sample_count):
     input(f"Move the torque-free gripper fully {label}, then press Enter: ")
     positions = {dxl_id: [] for dxl_id in DXL_IDS}
     for _ in range(sample_count):
-        states = require_safe_read_state(bus)
+        states = require_safe_read_state(bus, require_position_mode=True)
         for dxl_id in DXL_IDS:
             positions[dxl_id].append(states[dxl_id]["position"])
         time.sleep(0.1)
@@ -171,10 +192,14 @@ def capture_endpoint(bus, label, sample_count):
 
 
 def stage_endpoints(args):
+    if args.samples < 1:
+        raise CalibrationError("endpoint sample count must be positive")
+    if args.min_span_ticks < 1:
+        raise CalibrationError("minimum endpoint span must be positive")
     bus = Bus()
     bus.open()
     try:
-        require_safe_read_state(bus)
+        require_safe_read_state(bus, require_position_mode=True)
         opened = capture_endpoint(bus, "open", args.samples)
         closed = capture_endpoint(bus, "closed", args.samples)
         for dxl_id in DXL_IDS:
@@ -186,6 +211,10 @@ def stage_endpoints(args):
             "baud_rate": BAUD_RATE,
             "protocol": PROTOCOL_VERSION,
             "model": EXPECTED_MODEL,
+            "operating_modes": {
+                str(dxl_id): bus.operating_modes[dxl_id]
+                for dxl_id in DXL_IDS
+            },
             "id3_open_tick": opened[3],
             "id3_close_tick": closed[3],
             "id4_open_tick": opened[4],
@@ -195,6 +224,46 @@ def stage_endpoints(args):
         args.output.write_text(json.dumps(data, indent=2) + "\n")
         print(json.dumps(data, indent=2))
         print(f"Saved unapproved endpoints to {args.output}")
+    finally:
+        bus.close()
+
+
+def stage_configure_profile(args):
+    """Explicitly configure and verify volatile motion-profile registers."""
+    if not 1 <= args.profile_acceleration <= 32767:
+        raise CalibrationError("profile acceleration must be in [1, 32767]")
+    if not 1 <= args.profile_velocity <= 32767:
+        raise CalibrationError("profile velocity must be in [1, 32767]")
+    bus = Bus()
+    bus.open()
+    try:
+        require_safe_read_state(bus, require_position_mode=True)
+        for dxl_id in DXL_IDS:
+            bus.set_profile(
+                dxl_id, args.profile_acceleration, args.profile_velocity)
+        verified = {}
+        for dxl_id in DXL_IDS:
+            verified[dxl_id] = {
+                "profile_acceleration": bus.read4(
+                    dxl_id, ADDR_PROFILE_ACCELERATION,
+                    "profile acceleration"),
+                "profile_velocity": bus.read4(
+                    dxl_id, ADDR_PROFILE_VELOCITY, "profile velocity"),
+            }
+        print("RAM profile verification:")
+        for dxl_id in DXL_IDS:
+            values = verified[dxl_id]
+            print(
+                f"ID {dxl_id}: acceleration="
+                f"{values['profile_acceleration']}, "
+                f"velocity={values['profile_velocity']}")
+            if values != {
+                    "profile_acceleration": args.profile_acceleration,
+                    "profile_velocity": args.profile_velocity}:
+                raise CalibrationError(
+                    f"ID {dxl_id}: RAM profile verification failed")
+        print("Only volatile Profile Acceleration/Velocity were written; "
+              "EEPROM was not changed.")
     finally:
         bus.close()
 
@@ -277,6 +346,16 @@ def stage_grasp(args):
     bus.open()
     try:
         initial = require_safe_read_state(bus, require_position_mode=True)
+        recorded_modes = endpoints.get("operating_modes")
+        if recorded_modes is not None:
+            expected_modes = {
+                dxl_id: int(recorded_modes[str(dxl_id)])
+                for dxl_id in DXL_IDS
+            }
+            if bus.operating_modes != expected_modes:
+                raise CalibrationError(
+                    f"live operating modes {bus.operating_modes} differ "
+                    f"from endpoint capture modes {expected_modes}")
         for dxl_id in DXL_IDS:
             open_tick = endpoints[f"id{dxl_id}_open_tick"]
             if abs(initial[dxl_id]["position"] - open_tick) > args.open_tolerance:
@@ -383,6 +462,13 @@ def parser():
     endpoints.add_argument("--min-span-ticks", type=int, default=50)
     endpoints.add_argument("--output", type=Path, default=ENDPOINT_FILE)
     endpoints.set_defaults(func=stage_endpoints)
+
+    profile = sub.add_parser(
+        "configure-profile",
+        help="explicitly write volatile profile registers with torque off")
+    profile.add_argument("--profile-acceleration", type=int, default=25)
+    profile.add_argument("--profile-velocity", type=int, default=80)
+    profile.set_defaults(func=stage_configure_profile)
 
     grasp = sub.add_parser("grasp", help="approved powered gradual grasp")
     grasp.add_argument("--endpoints", type=Path, default=ENDPOINT_FILE)
