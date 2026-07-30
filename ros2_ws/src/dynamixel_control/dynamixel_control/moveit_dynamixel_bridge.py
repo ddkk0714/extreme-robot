@@ -18,12 +18,20 @@ ADDR_TORQUE_ENABLE = 64
 ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_GOAL_POSITION = 116
 ADDR_PRESENT_LOAD = 126
+ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_POSITION = 132
 
 LEN_GOAL_POSITION = 4
 LEN_HARDWARE_ERROR_STATUS = 1
 LEN_PRESENT_LOAD = 2
+LEN_PRESENT_VELOCITY = 4
 LEN_PRESENT_POSITION = 4
+
+# X-시리즈(XL430/XC430/XM 공통) Present Velocity 데이터시트 고정값: signed, 1 LSB = 0.229 rev/min.
+# PRESENT_VELOCITY 는 이미 아래 SyncRead 범위(70~135) 안에 있어 버스 트랜잭션 추가 없이
+# 파싱만 하면 된다 — 그동안 버려지던 바이트를 꺼내 쓰는 것뿐(Notion "그리퍼 tick/
+# wrist_to_gripper/PRESENT_VELOCITY 실측·검증 절차" §2-3).
+VELOCITY_LSB_TO_RAD_S = 0.229 * 2.0 * math.pi / 60.0
 
 # HARDWARE_ERROR_STATUS(70,1) ~ PRESENT_POSITION(132,4) 은 X-시리즈 컨트롤 테이블에서
 # 연속 주소 범위라, 70부터 66바이트를 한 번의 SyncRead 로 받아 fault/load/position 을
@@ -45,6 +53,7 @@ DXL_MAXIMUM_POSITION_VALUE = 4095
 DXL_CENTER_POSITION = 2048
 
 TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
+DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Present Velocity 환산용
 
 
 # 팔 관절 ↔ 다이나믹셀 ID 매핑. (현재 3개만 — 팔 DOF 확정 시 arm_joint_4~ 추가, CLAUDE.md §8)
@@ -226,6 +235,21 @@ class MoveItDynamixelBridge(Node):
         frac = (tick - self.gripper_close_tick) / span
         return self.gripper_close_rad + frac * (self.gripper_open_rad - self.gripper_close_rad)
 
+    def gripper_velocity_to_rad_s(self, velocity_raw):
+        """Present Velocity(raw, 0.229rev/min 단위) → gripper_tick_to_pos 와 같은 논리 rad/s.
+
+        Present Velocity 는 서보축 물리 회전속도(4096tick/rev 고정, 데이터시트 상수)이고
+        gripper_tick_to_pos 의 tick→rad 기울기는 open/close 캘리브 span 기반의 별도 계수라
+        두 스케일을 직접 연결해야 한다: raw → 물리 tick/s(4096tick/rev 경유) → 캘리브
+        기울기(rad/tick)로 환산. 부호/스케일은 실기 검증 전까지 확정 아님(Notion 절차 §2-3).
+        """
+        span = self.gripper_open_tick - self.gripper_close_tick
+        if span == 0:
+            return 0.0
+        ticks_per_s = velocity_raw * (0.229 / 60.0) * DXL_TICKS_PER_REV
+        rad_per_tick = (self.gripper_open_rad - self.gripper_close_rad) / span
+        return ticks_per_s * rad_per_tick
+
     def int_to_little_endian_4bytes(self, value):
         return [
             value & 0xFF,
@@ -376,11 +400,12 @@ class MoveItDynamixelBridge(Node):
             if sample is None:
                 fault = True
                 continue
-            feedback_raw, tick, hw_error = sample
+            feedback_raw, tick, hw_error, velocity_raw = sample
             if hw_error != 0:
                 fault = True
             msg.name.append(joint_name)
             msg.position.append(self.tick_to_rad(joint_name, tick))
+            msg.velocity.append(velocity_raw * VELOCITY_LSB_TO_RAD_S / config["direction"])
             msg.effort.append(float(feedback_raw))
 
         # XL430-W250 그리퍼: 주소 126은 signed Present Load(0.1% 추정 부하)다.
@@ -397,33 +422,40 @@ class MoveItDynamixelBridge(Node):
             if sample is None:
                 fault = True
                 continue
-            load_raw, tick, hw_error = sample
+            load_raw, tick, hw_error, velocity_raw = sample
             if hw_error != 0:
                 fault = True
-            gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION)))
+            gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
 
         if gripper_samples:
             representative_tick = gripper_samples[0][1]
+            representative_velocity_raw = gripper_samples[0][2]
             max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
             finger_rad = self.gripper_tick_to_pos(representative_tick)
+            finger_vel = self.gripper_velocity_to_rad_s(representative_velocity_raw)
             for jn in self.gripper_joints:
                 msg.name.append(jn)
                 msg.position.append(finger_rad)
+                msg.velocity.append(finger_vel)
                 msg.effort.append(float(max_abs_load))
 
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=fault))
 
     def _read_sample(self, dxl_id):
-        """SyncRead 블록에서 (signed address-126 feedback, position, hw error) 추출.
+        """SyncRead 블록에서 (signed address-126 feedback, position, hw error, velocity) 추출.
 
-        미수신 시 None.
+        PRESENT_VELOCITY(128,4)는 SyncRead 범위(70~135) 안에 이미 포함돼 있어 별도 버스
+        요청 없이 같은 블록에서 꺼낸다. 미수신 시 None.
         """
         if not self.group_sync_read.isAvailable(
                 dxl_id, ADDR_HARDWARE_ERROR_STATUS, LEN_HARDWARE_ERROR_STATUS):
             return None
         if not self.group_sync_read.isAvailable(
                 dxl_id, ADDR_PRESENT_LOAD, LEN_PRESENT_LOAD):
+            return None
+        if not self.group_sync_read.isAvailable(
+                dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY):
             return None
         if not self.group_sync_read.isAvailable(
                 dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION):
@@ -434,8 +466,12 @@ class MoveItDynamixelBridge(Node):
             self.group_sync_read.getData(dxl_id, ADDR_PRESENT_LOAD, LEN_PRESENT_LOAD),
             LEN_PRESENT_LOAD,
         )
+        velocity_raw = to_signed(
+            self.group_sync_read.getData(dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY),
+            LEN_PRESENT_VELOCITY,
+        )
         tick = self.group_sync_read.getData(dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION)
-        return feedback_raw, tick, hw_error
+        return feedback_raw, tick, hw_error, velocity_raw
 
     def destroy_node(self):
         if not self.read_only:
