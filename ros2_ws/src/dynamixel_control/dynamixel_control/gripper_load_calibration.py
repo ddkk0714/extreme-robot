@@ -24,8 +24,12 @@ BAUD_RATE = 1_000_000
 PROTOCOL_VERSION = 2.0
 DXL_IDS = (3, 4)
 MODEL_NUMBER = 1060
+POSITION_MODE = 3
+EXTENDED_POSITION_MODE = 4
+SUPPORTED_POSITION_MODES = {POSITION_MODE, EXTENDED_POSITION_MODE}
 
 ADDR_MODEL_NUMBER = 0
+ADDR_OPERATING_MODE = 11
 ADDR_TORQUE_ENABLE = 64
 ADDR_HARDWARE_ERROR = 70
 ADDR_PROFILE_ACCELERATION = 108
@@ -42,9 +46,7 @@ PROFILE_VELOCITY = 80
 MAX_RATIO_STEP = 0.01
 MIN_STEP_INTERVAL = 0.05
 INITIAL_RATIO_LIMIT = 1.10
-OPEN = {3: 1180, 4: 2510}
-CLOSE_UNWRAPPED = {3: -164, 4: 1212}
-SPAN = {3: 1344, 4: 1298}
+ENDPOINT_FILE = Path("/tmp/gripper_endpoints.json")
 OUTPUT_DIR = Path("/tmp/gripper_load_calibration")
 
 # 2026-07-28 실측(실리콘 테스트 물체, `measure`/`thresholds` 커맨드로 그룹별 반복측정):
@@ -60,6 +62,14 @@ class CalibrationError(RuntimeError):
     """A condition requiring an immediate safe stop."""
 
 
+class EndpointMap(dict):
+    """Motor endpoint mapping with optional capture-mode metadata."""
+
+    def __init__(self, *args, operating_modes=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.operating_modes = operating_modes
+
+
 def signed(value, bits):
     """Interpret an unsigned value as two's-complement."""
     sign = 1 << (bits - 1)
@@ -70,6 +80,11 @@ def le32(value):
     """Encode a 32-bit register value for GroupSyncWrite."""
     value &= 0xFFFFFFFF
     return [(value >> shift) & 0xFF for shift in (0, 8, 16, 24)]
+
+
+def goal_for_mode(goal, operating_mode):
+    """Convert a continuous tick goal only when Mode 3 requires wrapping."""
+    return goal % 4096 if operating_mode == POSITION_MODE else goal
 
 
 def unwrap_position(previous_unwrapped, current_raw):
@@ -90,20 +105,69 @@ def nearest_continuous(raw, references):
         abs(value - reference) for reference in references))
 
 
-def goals_for_ratio(ratio):
+def load_endpoints(path):
+    """Load and validate endpoints captured by gripper_calibration."""
+    if not path.is_file():
+        raise CalibrationError(
+            f"endpoint file {path} not found; "
+            "run gripper_calibration endpoints first")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CalibrationError(f"cannot read endpoint file {path}: {exc}")
+    required = (
+        "id3_open_tick", "id3_close_tick",
+        "id4_open_tick", "id4_close_tick",
+    )
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise CalibrationError(
+            f"endpoint file {path} is incomplete; missing "
+            f"{', '.join(missing)}; run gripper_calibration endpoints first")
+    endpoints = EndpointMap()
+    for dxl_id in DXL_IDS:
+        try:
+            opened = int(data[f"id{dxl_id}_open_tick"])
+            closed = int(data[f"id{dxl_id}_close_tick"])
+        except (TypeError, ValueError) as exc:
+            raise CalibrationError(
+                f"ID {dxl_id}: endpoint ticks must be integers") from exc
+        if opened == closed:
+            raise CalibrationError(
+                f"ID {dxl_id}: open and close endpoints are both {opened}; "
+                "run gripper_calibration endpoints first")
+        endpoints[dxl_id] = {"open": opened, "close": closed}
+    recorded_modes = data.get("operating_modes")
+    if recorded_modes is not None:
+        try:
+            endpoints.operating_modes = {
+                dxl_id: int(recorded_modes[str(dxl_id)])
+                for dxl_id in DXL_IDS
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CalibrationError(
+                "endpoint operating_modes must contain integer modes for "
+                "IDs 3 and 4") from exc
+    return endpoints
+
+
+def goals_for_ratio(ratio, endpoints):
     """Return continuous position goals for the logical close ratio."""
     if ratio < 0.0:
         raise ValueError("ratio must be non-negative")
 
-    goal3 = round(OPEN[3] - SPAN[3] * ratio)
-    goal4 = round(OPEN[4] - SPAN[4] * ratio)
+    return {
+        dxl_id: round(values["open"] + ratio * (
+            values["close"] - values["open"]))
+        for dxl_id, values in endpoints.items()
+    }
 
-    return {3: goal3, 4: goal4}
 
-
-def ratio_for_position(dxl_id, position):
+def ratio_for_position(dxl_id, position, endpoints):
     """Convert a continuous measured position to logical close ratio."""
-    return (OPEN[dxl_id] - position) / SPAN[dxl_id]
+    values = endpoints[dxl_id]
+    return ((position - values["open"]) /
+            (values["close"] - values["open"]))
 
 
 def validate_target_ratio(ratio, limit=INITIAL_RATIO_LIMIT):
@@ -152,7 +216,7 @@ class Sample:
 class DynamixelBus:
     """Protocol 2.0 transport restricted to XL430 IDs 3 and 4."""
 
-    def __init__(self, device=DEVICE):
+    def __init__(self, device=DEVICE, endpoints=None):
         self.device = device
         self.port = PortHandler(device)
         self.packet = PacketHandler(PROTOCOL_VERSION)
@@ -162,6 +226,8 @@ class DynamixelBus:
             self.port, self.packet, ADDR_GOAL_POSITION, 4)
         self.opened = False
         self.last_unwrapped = {}
+        self.endpoints = endpoints
+        self.operating_modes = {}
 
     def open(self):
         if not self.port.openPort():
@@ -170,11 +236,9 @@ class DynamixelBus:
                 "first")
         self.opened = True
         if not self.port.setBaudRate(BAUD_RATE):
-            self.close()
             raise CalibrationError(f"cannot set baud rate {BAUD_RATE}")
         for dxl_id in DXL_IDS:
             if not self.reader.addParam(dxl_id):
-                self.close()
                 raise CalibrationError(f"cannot register SyncRead ID {dxl_id}")
 
     def close(self):
@@ -188,6 +252,12 @@ class DynamixelBus:
         self._check_result(dxl_id, label, result, error)
         return value
 
+    def _read1(self, dxl_id, address, label):
+        value, result, error = self.packet.read1ByteTxRx(
+            self.port, dxl_id, address)
+        self._check_result(dxl_id, label, result, error)
+        return value
+
     def _check_result(self, dxl_id, label, result, error):
         if result != COMM_SUCCESS:
             raise CalibrationError(
@@ -197,11 +267,36 @@ class DynamixelBus:
                 f"ID {dxl_id} {label}: {self.packet.getRxPacketError(error)}")
 
     def verify_models(self):
+        models = {}
+        modes = {}
         for dxl_id in DXL_IDS:
-            model = self._read2(dxl_id, ADDR_MODEL_NUMBER, "model")
-            if model != MODEL_NUMBER:
+            models[dxl_id] = self._read2(
+                dxl_id, ADDR_MODEL_NUMBER, "model")
+            modes[dxl_id] = self._read1(
+                dxl_id, ADDR_OPERATING_MODE, "operating mode")
+        self.operating_modes = modes
+        print("Operating Mode: " + ", ".join(
+            f"ID {dxl_id}={modes[dxl_id]}" for dxl_id in DXL_IDS))
+        for dxl_id in DXL_IDS:
+            if models[dxl_id] != MODEL_NUMBER:
                 raise CalibrationError(
-                    f"ID {dxl_id}: model {model}, expected {MODEL_NUMBER}")
+                    f"ID {dxl_id}: model {models[dxl_id]}, "
+                    f"expected {MODEL_NUMBER}")
+            if modes[dxl_id] not in SUPPORTED_POSITION_MODES:
+                raise CalibrationError(
+                    f"ID {dxl_id}: operating mode {modes[dxl_id]} is not "
+                    "Position (3) or Extended Position (4)")
+        if len(set(modes.values())) != 1:
+            raise CalibrationError(
+                "ID 3 and ID 4 must use the same operating mode; no EEPROM "
+                "register was changed")
+
+        recorded_modes = self.endpoints.operating_modes
+        if recorded_modes is not None:
+            if modes != recorded_modes:
+                raise CalibrationError(
+                    f"live operating modes {modes} differ from endpoint "
+                    f"capture modes {recorded_modes}")
 
     def _data(self, dxl_id, address, length, label):
         if not self.reader.isAvailable(dxl_id, address, length):
@@ -220,7 +315,17 @@ class DynamixelBus:
                 32,
             )
             raw = position32 % 4096
-            continuous = position32
+            if self.operating_modes[dxl_id] == EXTENDED_POSITION_MODE:
+                continuous = position32
+            elif dxl_id not in self.last_unwrapped:
+                references = (
+                    self.endpoints[dxl_id]["open"],
+                    self.endpoints[dxl_id]["close"],
+                )
+                continuous = nearest_continuous(raw, references)
+            else:
+                continuous = unwrap_position(
+                    self.last_unwrapped[dxl_id], raw)
             self.last_unwrapped[dxl_id] = continuous
             states[dxl_id] = {
                 "torque": self._data(
@@ -237,7 +342,8 @@ class DynamixelBus:
                     dxl_id, ADDR_PRESENT_LOAD, 2, "present load"), 16),
                 "position_raw": raw,
                 "position_unwrapped": continuous,
-                "ratio": ratio_for_position(dxl_id, continuous),
+                "ratio": ratio_for_position(
+                    dxl_id, continuous, self.endpoints),
             }
         return states
 
@@ -245,7 +351,9 @@ class DynamixelBus:
         self.writer.clearParam()
         try:
             for dxl_id in DXL_IDS:
-                if not self.writer.addParam(dxl_id, le32(goals[dxl_id])):
+                goal = goal_for_mode(
+                    goals[dxl_id], self.operating_modes[dxl_id])
+                if not self.writer.addParam(dxl_id, le32(goal)):
                     raise CalibrationError(
                         f"cannot queue goal for ID {dxl_id}")
             result = self.writer.txPacket()
@@ -284,6 +392,7 @@ class CalibrationSession:
         self.stop_requested = False
         self.hold_validated = False
         self.output_dir = args.output_dir
+        self.endpoints = bus.endpoints
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def validate_state(self, states, target_ratio=None, previous=None):
@@ -305,11 +414,32 @@ class CalibrationSession:
                     f"ID {dxl_id}: abs(Present Load) {abs(state['load'])} "
                     "exceeds protection limit "
                     f"{self.args.load_stop_threshold}")
+        outside = []
+        for dxl_id in DXL_IDS:
+            endpoint = self.endpoints[dxl_id]
+            low = min(endpoint["open"], endpoint["close"])
+            high = max(endpoint["open"], endpoint["close"])
+            position = states[dxl_id]["position_unwrapped"]
+            if not low <= position <= high:
+                outside.append(
+                    f"ID{dxl_id} actual={position}, "
+                    f"ratio={states[dxl_id]['ratio']:.3f}, "
+                    f"allowed ticks={low}..{high} (ratio=0.000..1.000)")
+        if outside:
+            raise CalibrationError(
+                "position outside calibrated endpoint range: "
+                + "; ".join(outside)
+                + "; verify endpoint capture and gripper assembly direction")
         mismatch = abs(states[3]["ratio"] - states[4]["ratio"])
         if mismatch > self.args.max_ratio_difference:
             raise CalibrationError(
                 f"coupled ratio mismatch {mismatch:.3f} exceeds "
-                f"{self.args.max_ratio_difference:.3f}")
+                f"{self.args.max_ratio_difference:.3f}; "
+                f"ID3 actual={states[3]['position_unwrapped']} "
+                f"ratio={states[3]['ratio']:.3f}, "
+                f"ID4 actual={states[4]['position_unwrapped']} "
+                f"ratio={states[4]['ratio']:.3f}; verify endpoint capture "
+                "and gripper assembly direction")
         if target_ratio is not None:
             for dxl_id in DXL_IDS:
                 error = abs(states[dxl_id]["ratio"] - target_ratio)
@@ -354,7 +484,7 @@ class CalibrationSession:
                 f"{state['profile_acceleration']}/{state['profile_velocity']}")
 
     def confirm_motion(self, ratio):
-        goals = goals_for_ratio(ratio)
+        goals = goals_for_ratio(ratio, self.endpoints)
         print(
             f"target ratio={ratio:.3f}: ID3 raw={goals[3]}, "
             f"ID4 raw={goals[4]}")
@@ -420,7 +550,7 @@ class CalibrationSession:
         asymmetric_observations = 0
         while direction * (target - ratio) > 1e-9:
             ratio += direction * min(MAX_RATIO_STEP, abs(target - ratio))
-            goals = goals_for_ratio(ratio)
+            goals = goals_for_ratio(ratio, self.endpoints)
             self.bus.write_goals(goals)
             self.last_goals = goals
             self.target_ratio = ratio
@@ -576,6 +706,7 @@ class CalibrationSession:
                 "XL430 Present Load raw; 0.1% inferred load per count"),
             "load_stop_threshold": self.args.load_stop_threshold,
             "approved_ratio_limit": self.args.max_ratio,
+            "endpoints": self.endpoints,
             "trials": self.trials,
         }
         (self.output_dir / "session.json").write_text(
@@ -603,9 +734,11 @@ class CalibrationSession:
                     f"hwerr=0x{states[dxl_id]['hardware_error']:02X}")
         except Exception as exc:
             print(f"WARNING: final state unreadable: {exc}")
-        self.save()
-        self.bus.close()
-        print("Goal transmission stopped; port closed.")
+        try:
+            self.save()
+        finally:
+            self.bus.close()
+            print("Goal transmission stopped; port closed.")
 
     def command_loop(self):
         print("Commands: status, torque-on, torque-off, goto R, open, sample, "
@@ -647,6 +780,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Guarded ID3/ID4 XL430 Present Load calibration")
     parser.add_argument("--device", default=DEVICE)
+    parser.add_argument("--endpoints", type=Path, default=ENDPOINT_FILE)
     parser.add_argument("--armed", action="store_true",
                         help="permit confirmed goal writes and torque-on")
     parser.add_argument("--read-only", action="store_true",
@@ -667,8 +801,9 @@ def build_parser():
         "--contact-load-threshold",
         type=int,
         default=30,
-        help="minimum abs(Present Load) on both motors to treat a closing stall "
-             "as object contact")
+        help=(
+            "minimum abs(Present Load) on both motors to treat a closing "
+            "stall as object contact"))
     parser.add_argument(
         "--min-motion-ticks", type=int, default=3,
         help="per-sample meaningful-motion threshold; 1-2 ticks ignored")
@@ -705,16 +840,21 @@ def validate_arguments(args):
 
 def main():
     args = build_parser().parse_args()
-    bus = DynamixelBus(args.device)
-    session = CalibrationSession(bus, args)
+    bus = None
+    session = None
     old_handlers = {}
+    failed = False
 
     def request_stop(signum, _frame):
-        session.stop_requested = True
+        if session is not None:
+            session.stop_requested = True
         raise KeyboardInterrupt(f"signal {signum}")
 
     try:
         validate_arguments(args)
+        endpoints = load_endpoints(args.endpoints)
+        bus = DynamixelBus(args.device, endpoints)
+        session = CalibrationSession(bus, args)
         print(
             "WARNING: stop ROS Dynamixel nodes; this tool requires exclusive "
             "port access.")
@@ -735,11 +875,14 @@ def main():
             session.command_loop()
     except (CalibrationError, KeyboardInterrupt, ValueError) as exc:
         print(f"STOPPED: {exc}")
+        failed = True
     finally:
-        if bus.opened:
+        if bus is not None and bus.opened:
             session.cleanup()
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
