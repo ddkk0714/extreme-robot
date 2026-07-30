@@ -83,8 +83,10 @@
     이면 즉시 미확인 처리 — 이전엔 이 필드 자체가 없어 검사 불가였던 항목(§5.1
     잔여 항목 3).
 
-상태 흐름: IDLE → PERCEIVE → PLAN → DESCEND → GRASP_CHECK → LIFT → CARRY
-  → (ARRIVED_DROP) RELEASE → STOWING → STOWED_LOCKED → IDLE
+상태 흐름: STOWED_LOCKED → PERCEIVE → PLAN → APPROACH → DESCEND → GRASP
+  → GRASP_CHECK → LIFT → CARRY → (ARRIVED_DROP) RELEASE → DONE → STOWING
+  → STOWED_LOCKED(빈손 대기)
+  계획/접근/하강/리프트 또는 파지 판정 실패 → FAILED(래치)
   CARRY 중 DROP 감지 → GRIP_LOST(래치) → (재발행 conjunction) PERCEIVE
   PERCEIVE~LIFT 중 지형/주행 이벤트 → LOCKED(래치, 하트비트 유지) → (재발행 conjunction) PERCEIVE
   LIFT/CARRY(또는 LIFT 중 LOCKED) 중 STOW_REQUEST → LOWER_RELEASE → RELEASE → STOWING
@@ -97,6 +99,7 @@
    확인은 `moveit_dynamixel_bridge`의 `/dynamixel/controller_fault`(Hardware Error
    Status 집계)를 `_is_settled()`에서 게이트로 사용해 구현 완료(2026-07-15).
 """
+from copy import deepcopy
 from enum import Enum, auto
 
 import numpy as np
@@ -142,7 +145,7 @@ ARM_JOINT_NAMES = ['arm_joint_1', 'arm_joint_2', 'arm_joint_3']
 # ──────────────────────────────────────────────
 from dynamixel_control.contract import (       # noqa: E402
     ARRIVED_PICKUP, ARRIVED_DROP,
-    ARM_PERCEIVING, ARM_PLANNING, ARM_EXECUTING, ARM_FAILED,
+    ARM_PERCEIVING, ARM_PLANNING, ARM_EXECUTING, ARM_DONE, ARM_FAILED,
     ARM_WORK_READY, ARM_STOWING, ARM_STOWED_LOCKED, ARM_CARRYING_LOCKED, ARM_GRIP_LOST,
     LOCK_MODES, MODE_MISSION_STOP, MODE_STOW_REQUEST, HEARTBEAT_RATE_HZ,
 )
@@ -162,13 +165,18 @@ class State(Enum):
     IDLE = auto()
     PERCEIVE = auto()
     PLAN = auto()
+    APPROACH = auto()
     DESCEND = auto()
+    GRASP = auto()
     GRASP_CHECK = auto()
     LIFT = auto()
     CARRY = auto()
+    RELEASE = auto()
+    DONE = auto()
+    FAILED = auto()
+    # Supervisor/safety states retained from the existing drivetrain contract.
     GRIP_LOST = auto()
     LOWER_RELEASE = auto()
-    RELEASE = auto()
     STOWING = auto()
     STOWED_LOCKED = auto()
     LOCKED = auto()
@@ -177,13 +185,18 @@ class State(Enum):
 # 지형/주행 이벤트(LOCK_MODES)로 preempt 대상이 되는 상태 — 실제 모션/그리퍼 동작이 진행
 # 중일 수 있는 상태만. CARRY는 이미 정지-유지 상태(그리퍼 effort 감시만)라 preempt
 # 불필요 — 계약 v2 하트비트를 CARRY 자체 루프가 계속 발행해야 하므로 굳이 LOCKED로 빼지 않음.
-PREEMPTIBLE_STATES = (State.PERCEIVE, State.PLAN, State.DESCEND, State.GRASP_CHECK, State.LIFT)
+PREEMPTIBLE_STATES = (
+    State.PERCEIVE, State.PLAN, State.APPROACH, State.DESCEND,
+    State.GRASP, State.GRASP_CHECK, State.LIFT,
+)
 
 # STOW_REQUEST(운영자 포기·재정렬 유도)로 즉시 RELEASE(or LOWER_RELEASE)→STOWING 강제
 # 진입 가능한 상태 — 작업이 진행 중이거나 래치된 모든 상태(2026-07-14 결정: GRIP_LOST
 # 전용이었던 것을 확장). IDLE/LOWER_RELEASE/RELEASE/STOWING/STOWED_LOCKED는 이미
 # 정지/포기 진행 중이라 대상에서 제외.
-STOW_ABORTABLE_STATES = PREEMPTIBLE_STATES + (State.CARRY, State.GRIP_LOST, State.LOCKED)
+STOW_ABORTABLE_STATES = PREEMPTIBLE_STATES + (
+    State.CARRY, State.FAILED, State.GRIP_LOST, State.LOCKED,
+)
 
 # STOW_REQUEST로 중단될 때 화물을 든 채 공중에 있을 수 있는 상태 — 그리퍼를 바로 열면
 # 낙하 위험(파워트레인 §5.1 잔여 합의 ①). 이 상태들에서만 RELEASE 전에 파지 높이까지
@@ -205,6 +218,7 @@ class ArmFsmNode(Node):
         self.declare_parameter('tip_link', 'link_051')            # 그리퍼 부모 링크
         self.declare_parameter('base_frame', 'base_link')        # planning frame (리프트 기준)
         self.declare_parameter('lift_height', 0.10)              # LIFT 시 base_link +Z [m]
+        self.declare_parameter('approach_height', 0.08)          # target 위 접근 오프셋 [m]
         self.declare_parameter('pick_frame_id', 'camera_color_optical_frame')
         self.declare_parameter('pos_tolerance', 0.01)            # [m]
         self.declare_parameter('orient_tolerance', 0.1)          # [rad]
@@ -260,6 +274,7 @@ class ArmFsmNode(Node):
         self.tip_link = g('tip_link').value
         self.base_frame = g('base_frame').value
         self.lift_height = g('lift_height').value
+        self.approach_height = g('approach_height').value
         self.pick_frame_id = g('pick_frame_id').value
         self.pos_tol = g('pos_tolerance').value
         self.orient_tol = g('orient_tolerance').value
@@ -331,18 +346,27 @@ class ArmFsmNode(Node):
         self._arm_move_deadline = None      # analytic 이동 완료 예상 시각
 
         # ── 내부 상태 ─────────────────────────────
-        self.state = State.IDLE
+        # 빈손으로 접혀 잠긴 평상시 상태. 외부 heartbeat의 STOWED_LOCKED와 내부 FSM
+        # 상태를 일치시켜, 시작 직후에도 새 pickup conjunction을 받을 수 있게 한다.
+        self.state = State.STOWED_LOCKED
         self._state_enter_t = self.get_clock().now()
         self._prev_state = None
         self.locked = False
         self.pick_target = None
-        self.mission_id = 0
+        self._planned_grasp_pose = None
+        self._planned_approach_pose = None
+        self._planned_grasp_xyz = None
+        self._planned_approach_xyz = None
+        # 아직 수락한 임무가 없음을 나타내는 sentinel. 새 임무를 수락할 때는 반드시
+        # ArrivalStatus.mission_id로 덮어쓴다.
+        self.mission_id = -1
         self._joint_effort = {}            # joint_name -> effort
         # 브릿지 controller fault 게이트 — 첫 샘플 받기 전엔 알 수 없으니 보수적으로 True
         # (TF 미가용 시 _is_settled()가 False를 리턴하는 것과 같은 안전 측 기본값).
         self._controller_fault = True
         # 계약 v2 — MISSION_STOP + ArrivalStatus conjunction 게이트 (순서 무관)
         self._mission_stop_active = False
+        self._chassis_mode = None
         self._pending_arrival = None        # 아직 소비 안 한 최신 ArrivalStatus
         self._last_arrival_stamp = None
         self._last_chassis_stamp = None
@@ -381,7 +405,8 @@ class ArmFsmNode(Node):
         self._tick_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(period, self._tick, callback_group=self._tick_group)
         self.get_logger().info(
-            f'arm_fsm_node started (MoveIt 경로, state=IDLE, gripper_type={self.gripper_type}, '
+            f'arm_fsm_node started (MoveIt 경로, state=STOWED_LOCKED, '
+            f'gripper_type={self.gripper_type}, '
             f'heartbeat={HEARTBEAT_RATE_HZ}Hz)'
         )
 
@@ -403,6 +428,7 @@ class ArmFsmNode(Node):
             return
         self._last_chassis_stamp = msg.header.stamp
         self._last_chassis_recv_wall = self.get_clock().now()
+        self._chassis_mode = msg.mode
 
         if msg.mode not in RECOGNIZED_MODES:
             # 미인식 mode — default-deny, 상태 변경 없음(락 유지)
@@ -441,7 +467,8 @@ class ArmFsmNode(Node):
     def _try_advance(self):
         """MISSION_STOP + ArrivalStatus conjunction(순서 무관) 충족 시에만 전이.
 
-        픽업 개시: IDLE/GRIP_LOST 에서 ARRIVED_PICKUP 수신 시 PERCEIVE.
+        픽업 개시: IDLE/STOWED_LOCKED/GRIP_LOST/FAILED 에서 ARRIVED_PICKUP 수신 시
+        PERCEIVE.
         지형 중단 복귀: LOCKED(같은 mission_id) 에서도 동일 conjunction으로 PERCEIVE 재진입
         (중단 시점 재개 대신 PERCEIVE부터 다시 — 중단 중 타겟이 변했을 수 있어 더 안전).
         하역: CARRY 에서 ARRIVED_DROP(같은 mission_id) 수신 시 RELEASE.
@@ -451,23 +478,24 @@ class ArmFsmNode(Node):
         if msg is None or not self._mission_stop_active:
             return
 
-        if self.state in (State.IDLE, State.GRIP_LOST) and msg.status == ARRIVED_PICKUP:
+        pickup_states = (State.IDLE, State.STOWED_LOCKED, State.GRIP_LOST, State.FAILED)
+        if self.state in pickup_states and msg.status == ARRIVED_PICKUP:
             if msg.mission_id == self._last_completed_mission_id:
                 return  # 이미 완료된 mission_id 재발행 — 재실행 금지
             self.mission_id = msg.mission_id
-            self._pending_arrival = None
             self._set_status(ARM_WORK_READY)
             self._transition(State.PERCEIVE)
+            self._pending_arrival = None
         elif (self.state == State.LOCKED and msg.status == ARRIVED_PICKUP
                 and msg.mission_id == self.mission_id):
-            self._pending_arrival = None
             self.locked = False
             self._set_status(ARM_WORK_READY)
             self._transition(State.PERCEIVE)
+            self._pending_arrival = None
         elif (self.state == State.CARRY and msg.status == ARRIVED_DROP
                 and msg.mission_id == self.mission_id):
-            self._pending_arrival = None
             self._transition(State.RELEASE)
+            self._pending_arrival = None
 
     def _stamp_is_fresh(self, stamp, prev_stamp):
         """0/미래/동일·역행 stamp 거부 (계약 §5.1 heartbeat freshness 기준)."""
@@ -577,50 +605,77 @@ class ArmFsmNode(Node):
         self._transition(State.PLAN)
 
     def _do_plan(self):
-        """파지 목표로 이동 시작. 디스패치만 하고 DESCEND에서 대기."""
+        """Freeze one detection and derive separate approach and grasp targets."""
         self._set_status(ARM_PLANNING)
         if self.ik_mode == 'moveit':
-            grasp_pose = self._grasp_pose()
-            if grasp_pose is None:
-                self._set_status(ARM_FAILED)
-                self._transition(State.IDLE)
+            self._planned_grasp_pose = self._grasp_pose_in_base()
+            if self._planned_grasp_pose is None:
+                self._fail('target pose transform failed')
                 return
-            self._begin_arm_move(grasp_pose)
-            self._transition(State.DESCEND)
-            return
+            self._planned_approach_pose = self._offset_pose_z(
+                self._planned_grasp_pose, self.approach_height)
+        else:
+            self._planned_grasp_xyz = self._grasp_target_xyz()
+            if self._planned_grasp_xyz is None:
+                self._fail('target position transform failed')
+                return
+            x, y, z = self._planned_grasp_xyz
+            self._planned_approach_xyz = (x, y, z + self.approach_height)
+        self._transition(State.APPROACH)
 
-        target = self._grasp_target_xyz()
-        if target is None or not self._move_to_xyz(target):
-            self._set_status(ARM_FAILED)
-            self._transition(State.IDLE)
-            return
-        self._transition(State.DESCEND)
-
-    def _do_descend(self):
-        """MoveIt 모션 결과 대기 (저속 실행 = 하강 포함). TODO: 접촉 시 arm effort 감시."""
+    def _do_approach(self):
+        """Move to a clearance pose above the planned object pose."""
         self._set_status(ARM_EXECUTING)
         if self._motion_state == 'active':
             return
-        ok = self._motion_ok
-        self._motion_state = 'idle'
-        self._transition(State.GRASP_CHECK if ok else State.IDLE)
-        if not ok:
-            self._set_status(ARM_FAILED)
+        if self._motion_state == 'done':
+            ok = self._motion_ok
+            self._motion_state = 'idle'
+            if ok:
+                self._transition(State.DESCEND)
+            else:
+                self._fail('approach motion failed')
+            return
+        if self.ik_mode == 'moveit':
+            self._begin_arm_move(self._planned_approach_pose)
+        elif not self._move_to_xyz(self._planned_approach_xyz):
+            self._fail('approach IK failed')
 
-    def _do_grasp_check(self):
-        """그리퍼 닫고 effort(전류)로 파지 판정."""
+    def _do_descend(self):
+        """Descend from the clearance pose to the frozen grasp pose."""
+        self._set_status(ARM_EXECUTING)
+        if self._motion_state == 'active':
+            return
+        if self._motion_state == 'done':
+            ok = self._motion_ok
+            self._motion_state = 'idle'
+            if ok:
+                self._transition(State.GRASP)
+            else:
+                self._fail('descend motion failed')
+            return
+        if self.ik_mode == 'moveit':
+            self._begin_arm_move(self._planned_grasp_pose)
+        elif not self._move_to_xyz(self._planned_grasp_xyz):
+            self._fail('descend IK failed')
+
+    def _do_grasp(self):
+        """Close the gripper; success evaluation belongs to GRASP_CHECK."""
         self._set_status(ARM_EXECUTING)
         if not self._grip_sent:
             self._send_gripper(self.gripper_close)
             self._grip_sent = True
             return
-        if self._elapsed() < self.gripper_action_time:
-            return
+        if self._elapsed() >= self.gripper_action_time:
+            self._transition(State.GRASP_CHECK)
+
+    def _do_grasp_check(self):
+        """Determine grasp success from the existing joint_states effort feedback."""
+        self._set_status(ARM_EXECUTING)
         if self._gripper_effort() >= self.grasp_thresh:
             self._transition(State.LIFT)
         else:
-            self.get_logger().warn('파지 실패(effort 미달) → 재계획')
-            self._transition(State.PLAN)
+            self._on_grasp_failure()
 
     def _do_lift(self):
         """수직 리프트 → 운반 자세 (base_link +Z, 현재 tip TF 기준)."""
@@ -628,24 +683,26 @@ class ArmFsmNode(Node):
         if self._motion_state == 'active':
             return
         if self._motion_state == 'done':
+            ok = self._motion_ok
             self._motion_state = 'idle'
-            self._transition(State.CARRY)
+            if ok:
+                self._transition(State.CARRY)
+            else:
+                self._fail('lift motion failed')
             return
 
         # 'idle' — 리프트 모션 시작
         if self.ik_mode == 'moveit':
             lift_pose = self._carry_pose()
             if lift_pose is None:
-                self.get_logger().warn('carry pose 미구현/TF 실패 — 스킵하고 CARRY 진입')
-                self._transition(State.CARRY)
+                self._fail('lift target transform failed')
                 return
             self._begin_arm_move(lift_pose)
             return
 
         target = self._lift_target_xyz()
         if target is None or not self._move_to_xyz(target):
-            self.get_logger().warn('LIFT 목표 계산/이동 실패 — 스킵하고 CARRY 진입')
-            self._transition(State.CARRY)
+            self._fail('lift IK failed')
 
     def _do_carry(self):
         """운반 중 그리퍼 effort 감시 → 급감 시 GRIP_LOST 래치.
@@ -737,7 +794,16 @@ class ArmFsmNode(Node):
             self._grip_sent = True
             return
         if self._elapsed() > self.gripper_action_time:
-            self._transition(State.STOWING)
+            self._transition(State.DONE)
+
+    def _do_done(self):
+        """Mission sequence terminal state; stowing remains the contract finalizer."""
+        self._set_status(ARM_DONE)
+        self._transition(State.STOWING)
+
+    def _do_failed(self):
+        """Latched failure; a fresh pickup handshake may start another attempt."""
+        self._set_status(ARM_FAILED)
 
     def _do_stowing(self):
         """접힘 자세로 이동 → `_is_settled()` 확인 후 `STOWED_LOCKED`.
@@ -767,11 +833,9 @@ class ArmFsmNode(Node):
             self._transition(State.STOWED_LOCKED)
 
     def _do_stowed_locked(self):
-        """하역 완료 최종 권위. ⚠️ 실제 locked-heartbeat 검증(dwell 등)은 TODO."""
+        """빈손으로 접혀 잠긴 평상시 상태이자 하역 완료 최종 권위."""
         self._set_status(ARM_STOWED_LOCKED)
-        self._last_completed_mission_id = self.mission_id
         self.pick_target = None
-        self._transition(State.IDLE)
 
     def _do_locked(self):
         """현재 자세 홀드: MoveIt에 새 goal 안 보냄 → 브릿지가 torque로 마지막 위치 유지.
@@ -892,6 +956,31 @@ class ArmFsmNode(Node):
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose = self.pick_target.pose
         return ps
+
+    def _grasp_pose_in_base(self):
+        """Transform the selected perception pose into the MoveIt planning frame."""
+        source = self._grasp_pose()
+        if source is None:
+            return None
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, source.header.frame_id, Time())
+        except TransformException as e:
+            self.get_logger().warn(f'grasp pose TF lookup failed: {e}')
+            return None
+        result = PoseStamped()
+        result.header.frame_id = self.base_frame
+        result.header.stamp = self.get_clock().now().to_msg()
+        result.pose = do_transform_pose(source.pose, tf)
+        return result
+
+    @staticmethod
+    def _offset_pose_z(pose, offset):
+        # ROS messages are mutable; copy so the approach offset cannot alter the
+        # frozen grasp target used by DESCEND.
+        result = deepcopy(pose)
+        result.pose.position.z += offset
+        return result
 
     def _carry_pose(self):
         """현재 TCP(tip_link)를 base_link 기준 +Z 로 들어올린 운반 자세.
@@ -1075,8 +1164,31 @@ class ArmFsmNode(Node):
     def _elapsed(self):
         return (self.get_clock().now() - self._state_enter_t).nanoseconds * 1e-9
 
+    def _on_grasp_failure(self):
+        """Single extension point for adding a future REGRASP policy/state."""
+        self._fail(
+            f'grasp effort {self._gripper_effort():.1f} below threshold '
+            f'{self.grasp_thresh:.1f}')
+
+    def _fail(self, reason):
+        self.get_logger().error(reason)
+        self._cancel_arm_motion()
+        self._transition(State.FAILED)
+
     def _transition(self, new_state):
-        self.get_logger().info(f'{self.state.name} → {new_state.name}')
+        pending_status = (self._pending_arrival.status
+                          if self._pending_arrival is not None else None)
+        arrival_mission_id = (self._pending_arrival.mission_id
+                              if self._pending_arrival is not None else None)
+        self.get_logger().info(
+            f'{self.state.name} → {new_state.name}; '
+            f'current_state={self.state.name}, chassis_mode={self._chassis_mode!r}, '
+            f'pending_arrival_status={pending_status!r}, '
+            f'arrival_mission_id={arrival_mission_id!r}, '
+            f'current_mission_id={self.mission_id}, '
+            f'last_completed_mission_id={self._last_completed_mission_id!r}')
+        if new_state == State.STOWED_LOCKED and self.state != State.STOWED_LOCKED:
+            self._last_completed_mission_id = self.mission_id
         self.state = new_state
         self._state_enter_t = self.get_clock().now()
         self._grip_sent = False
