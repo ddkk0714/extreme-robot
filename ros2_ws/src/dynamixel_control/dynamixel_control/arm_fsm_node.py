@@ -212,10 +212,12 @@ class ArmFsmNode(Node):
         # ── 파라미터 ──────────────────────────────
         # MoveIt
         self.declare_parameter('planning_group', 'arm')          # SRDF group
-        # tip_link: arm_joint_5 이후 고정 조인트 체인에서 팔과 그리퍼가 갈라지는 링크(link_039,
-        # = 5축 모듈 연결부). 2026-07-16 랙피니언 그리퍼 export 를 여기에 이식했다.
-        # (이전 값 link_051 은 옛 평행4절 그리퍼의 링크로, 지금 URDF 에는 존재하지 않는다.)
-        self.declare_parameter('tip_link', 'link_039')            # 그리퍼 부모 링크
+        # tip_link: 그리퍼가 실제로 물리 부착되는 링크(link_043, 구 "본체22_1" = 그리퍼 하우징).
+        # 2026-07-31 zip 전체(base_link~팔~그리퍼~손목카메라) 재생성으로 URDF 링크 번호가 전부
+        # 바뀌면서 갱신됨 — SRDF(robot_arm.srdf)의 arm 체인 tip_link/end_effector parent_link와
+        # 반드시 동기화 유지할 것. (이전 값 link_039 는 축약된 그리퍼 이식판의 "5축 모듈 연결부"였고,
+        # 그보다 더 옛날 값 link_051 은 이미 폐기된 평행4절 그리퍼 링크였다 — 둘 다 지금 URDF에 없다.)
+        self.declare_parameter('tip_link', 'link_043')            # 그리퍼 부모 링크
         self.declare_parameter('base_frame', 'base_link')        # planning frame (리프트 기준)
         self.declare_parameter('lift_height', 0.10)              # LIFT 시 base_link +Z [m]
         self.declare_parameter('approach_height', 0.08)          # target 위 접근 오프셋 [m]
