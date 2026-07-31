@@ -1,4 +1,4 @@
-"""카메라 static TF 발행 — 전방 RGB-D(RealSense D435i) + 손목 RGB.
+"""카메라 static TF 발행 — 전방 RGB-D(RealSense D435i).
 
 perception_node 는 pyrealsense2 를 직접 쓰므로(realsense-ros 드라이버 미사용) 아무도
 TF 를 내지 않는다. /pick_target 의 frame_id='camera_color_optical_frame' 을 MoveIt 이
@@ -9,8 +9,10 @@ base_link(planning frame)로 변환하려면 이 체인이 TF 트리에 있어�
   camera_link ──(REP-103 optical 회전, 고정)──▶ camera_color_optical_frame
 
 손목 RGB (그리퍼 위, 팔에 장착):
-  base_link ──(CAD 오프셋, 홈 포즈 기준)──▶ wrist_camera_link
-  NOTE: 추후 URDF 관절로 통합 필요 — 현재는 홈 포즈 기준 static placeholder.
+  2026-07-31부로 URDF 관절(robot_arm.urdf의 link_036→link_051/052→wrist_camera_link)로
+  통합됨 — robot_state_publisher가 팔 자세에 따라 동적으로 발행하므로 여기서 static TF를
+  더 이상 내지 않는다(같은 프레임을 두 곳에서 발행하면 TF 트리 충돌). robot_state_publisher가
+  뜬 launch(display.launch.py 등)를 같이 켜야 wrist_camera_link가 TF에 나타난다.
 """
 
 import math
@@ -36,14 +38,6 @@ def generate_launch_description():
         DeclareLaunchArgument('cam_roll',  default_value='0.0'),
         DeclareLaunchArgument('cam_pitch', default_value='-0.26'),
         DeclareLaunchArgument('cam_yaw',   default_value='0.0'),
-
-        # ── 손목 RGB 카메라 (그리퍼 위, CAD 실측값) ──
-        DeclareLaunchArgument('wrist_cam_x',     default_value='0.040'),
-        DeclareLaunchArgument('wrist_cam_y',     default_value='0.0'),
-        DeclareLaunchArgument('wrist_cam_z',     default_value='0.295'),
-        DeclareLaunchArgument('wrist_cam_roll',  default_value='0.0'),
-        DeclareLaunchArgument('wrist_cam_pitch', default_value='0.0'),
-        DeclareLaunchArgument('wrist_cam_yaw',   default_value='0.0'),
     ]
 
     # ── 전방 RGB-D: base_link → camera_link ──
@@ -78,21 +72,4 @@ def generate_launch_description():
         ],
     )
 
-    # ── 손목 RGB: base_link → wrist_camera_link (홈 포즈 기준 static) ──
-    wrist_mount_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='base_to_wrist_camera_link',
-        arguments=[
-            '--x', LaunchConfiguration('wrist_cam_x'),
-            '--y', LaunchConfiguration('wrist_cam_y'),
-            '--z', LaunchConfiguration('wrist_cam_z'),
-            '--roll',  LaunchConfiguration('wrist_cam_roll'),
-            '--pitch', LaunchConfiguration('wrist_cam_pitch'),
-            '--yaw',   LaunchConfiguration('wrist_cam_yaw'),
-            '--frame-id', 'base_link',
-            '--child-frame-id', 'wrist_camera_link',
-        ],
-    )
-
-    return LaunchDescription(args + [front_mount_tf, front_optical_tf, wrist_mount_tf])
+    return LaunchDescription(args + [front_mount_tf, front_optical_tf])
