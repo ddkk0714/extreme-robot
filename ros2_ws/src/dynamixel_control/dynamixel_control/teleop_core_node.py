@@ -43,7 +43,6 @@ DEFAULT_LIMIT_ENABLED = [True, True, True]
 DEFAULT_MIN_RADS = [-math.pi, -math.pi, 0.0]
 DEFAULT_MAX_RADS = [math.pi, 0.0, math.pi]
 
-
 class TeleopCore(Node):
     def __init__(self):
         super().__init__("teleop_core")
@@ -62,7 +61,9 @@ class TeleopCore(Node):
         self.declare_parameter("joint_min_rads", DEFAULT_MIN_RADS)
         self.declare_parameter("joint_max_rads", DEFAULT_MAX_RADS)
         self.declare_parameter("deadman_timeout_s", 0.5)  # 이 시간 넘게 입력 없으면 velocity 적분 정지
-        self.declare_parameter("publish_rate_hz", 20.0)
+        # velocity 적분 주기 = 목표 갱신 주기. 낮으면 한 번에 크게 뛰어 서보가
+        # 매번 프로파일을 새로 그리며 틱틱 끊긴다 — 잘게 자주 보내는 편이 매끄럽다.
+        self.declare_parameter("publish_rate_hz", 50.0)
         # JointJog.velocities 의 안전 상한 [rad/s]. 프론트엔드 버그로 큰 값이 들어와도
         # 팔이 튀지 않도록 on_jog 에서 clamp 한다.
         self.declare_parameter("max_vel_rad_s", 1.0)

@@ -59,10 +59,10 @@
     "멈춰있나" 검증에 불과했음). 이제 `stow_joint_positions` 파라미터가 정의하는 목표
     관절각으로 `/arm_controller/joint_trajectory`에 직접 궤적을 발행 → 완료 후 `_is_settled()`
     게이트를 거쳐 `STOWED_LOCKED`.
-    ⚠️ **`stow_joint_positions` 기본값은 CAD 미검증 placeholder다.** 계약상 all-zero
-    home을 접힘 자세로 쓰는 것은 금지(PR #17 회신) — 그래서 0이 아닌 임의값을 넣어뒀지만
-    실제 팔이 안전하게 접히는 각도인지는 실기 검증 전까지 모른다. **실기 테스트 없이
-    이 기본값으로 실제 서보를 구동하지 말 것.**
+    `stow_joint_positions` 기본값은 2026-07-29 팀 결정으로 **all-zero**다(주행 안정성 —
+    도달 가능한 자세 중 CG가 가장 낮음). 아래 파라미터 선언부의 근거 주석 참고.
+    ⚠️ **파워트레인 문서 §6의 all-zero home 금지와 정면 충돌한다 — 양 팀 합의 전까지
+    실차 연동 금지.** 또한 URDF 상으로만 검증됐고 실기 검증은 아직이다.
 
 2026-07-15 — 파워트레인 §5.1 잔여 합의 2건 해결(`project_docs/파워트레인_계약_충돌점검.md`
 항목 1·2 대응):
@@ -212,10 +212,10 @@ class ArmFsmNode(Node):
         # ── 파라미터 ──────────────────────────────
         # MoveIt
         self.declare_parameter('planning_group', 'arm')          # SRDF group
-        # tip_link: arm_joint_5 이후 고정 조인트 체인의 마지막 링크(link_051) — 여기서
-        # gripper_drive_joint(구동)와 gripper_linkage_base_fixed(그리퍼 고정 베이스)가 갈라짐.
-        # 2026-07-15 Isaac Sim 재export(robotarm_urdf_20260711.urdf) 기준.
-        self.declare_parameter('tip_link', 'link_051')            # 그리퍼 부모 링크
+        # tip_link: arm_joint_5 이후 고정 조인트 체인에서 팔과 그리퍼가 갈라지는 링크(link_039,
+        # = 5축 모듈 연결부). 2026-07-16 랙피니언 그리퍼 export 를 여기에 이식했다.
+        # (이전 값 link_051 은 옛 평행4절 그리퍼의 링크로, 지금 URDF 에는 존재하지 않는다.)
+        self.declare_parameter('tip_link', 'link_039')            # 그리퍼 부모 링크
         self.declare_parameter('base_frame', 'base_link')        # planning frame (리프트 기준)
         self.declare_parameter('lift_height', 0.10)              # LIFT 시 base_link +Z [m]
         self.declare_parameter('approach_height', 0.08)          # target 위 접근 오프셋 [m]
@@ -238,8 +238,8 @@ class ArmFsmNode(Node):
         gpreset = get_preset(gripper_type, self.get_logger())
 
         self.declare_parameter('gripper_joints', gpreset['gripper_joints'])
-        self.declare_parameter('gripper_open', gpreset['gripper_open_m'])
-        self.declare_parameter('gripper_close', gpreset['gripper_close_m'])
+        self.declare_parameter('gripper_open', gpreset['gripper_open_rad'])
+        self.declare_parameter('gripper_close', gpreset['gripper_close_rad'])
         # 전류(effort) 임계 — moveit_dynamixel_bridge 가 /joint_states.effort 에
         # raw signed PRESENT_CURRENT(XL430 기준 1단위≈2.69mA)를 발행. preset 값은 placeholder,
         # 실측 캘리브 필요(TODO): 무부하 파지 전류/낙하 시 전류를 측정해 임계값 설정.
@@ -260,10 +260,30 @@ class ArmFsmNode(Node):
         self.declare_parameter('locked_pos_tol', 0.005)   # [m] tip 위치 흔들림 허용치
         self.declare_parameter('locked_vel_tol', 0.05)    # [rad/s] 관절 속도(유한차분) 허용치
         self.declare_parameter('locked_dwell', 0.5)       # [s] 안정 유지 시간
-        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서) — ⚠️ CAD 미검증 placeholder. all-zero
-        # home은 계약상 접힘 자세로 금지(구조상 충돌·역구동 위험) — 실기 검증 전까지 이
-        # 기본값으로 실제 서보를 구동하지 말 것. 실측 후 이 파라미터로 덮어쓸 것.
-        self.declare_parameter('stow_joint_positions', [0.0, -0.6, 1.2])
+        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 = j1, j2, j3).
+        # **팀이 주행 안정성 기준으로 all-zero 를 접힘 자세로 확정**(사용자 지시, 2026-07-29).
+        # 2026-07-29 랙피니언 그리퍼 URDF 실측 지표:
+        #   점유 bbox x 224mm × y 606mm   높이 285mm   최저점 +50mm
+        #   CG 높이 160mm (도달 가능한 자세 중 최저)   j2+j3 중력토크 13.13N·m   자기충돌 0
+        # 근거: j2·j3 하한이 0이라 팔은 [수평 → 수직 → 반대쪽 수평]만 훑고 아래로는 못 내려간다.
+        # 그래서 도달 가능한 자세 중 CG 가 가장 낮은 것이 all-zero 이고, 경사·요철에서 전복
+        # 여유가 가장 크다. (대안이던 '수직 마스트' [0, 1.40, 2.85] 는 bbox 213×235mm 로
+        # 발자국은 훨씬 작고 중력토크도 0.79N·m 로 20배 낮지만, 높이 978mm·CG 400mm 라
+        # 전복 여유가 나쁘다. 차체가 짧아 y 606mm 가 안 들어가면 그쪽으로 되돌릴 것.)
+        #
+        # ⚠️ **파워트레인 계약 위반 상태다 — 양 팀 합의 전까지 실차 연동 금지.**
+        # 파워트레인 문서 §6 "all-zero home 과 direct dynamixel goal publisher 는 production
+        # 에서 금지한다" (project_docs/파워트레인_계약_충돌점검.md:110).
+        # 실질 위험: `_near_stow_posture()` 가 무력화된다 — 전원만 들어오고 초기화 안 된 팔도
+        # 관절각이 ~0 이라 이 검사를 그냥 통과해서, 실제로 접히지 않았는데 STOWED_LOCKED 를
+        # 발행 → 파워트레인이 주행 허가로 받는다. 금지 조항의 이유가 정확히 이것이다.
+        # 회피책: 물리적으로 거의 같으면서 0 과 구분되는 값(예: [0.0, 0.15, 0.15] — bbox
+        # 224×606mm 로 all-zero 와 동일, 높이 328mm, 토크 12.61N·m)을 쓰면 stow_pos_tol_rad
+        # (0.1) 밖이라 위 검사가 되살아난다. 주행 안정성은 사실상 그대로다.
+        #
+        # 이전 기본값 [0.0, -0.6, 1.2]은 j2=-0.6이 URDF 하한(0) 밖이라 애초에 도달 불가였다.
+        # ⚠️ URDF 검증만 끝났고 실기 검증은 아직 — 실물 구동 전 서보 tick 대응 확인 필요.
+        self.declare_parameter('stow_joint_positions', [0.0, 0.0, 0.0])
         # STOWED_LOCKED 발행 전 "실제로 접힌 자세인지" 확인용 관절각 허용오차 — §5.1 잔여
         # 합의 ②(정지 안정성만 검사하고 접힘 자세 근접은 미확인) 대응. LOCKED 경유(지형/주행
         # 이벤트로 작업 중단)로 도달한 임의 자세를 STOWED_LOCKED로 착칭하지 않기 위함.
@@ -306,8 +326,8 @@ class ArmFsmNode(Node):
             self.stow_joint_positions = None
         else:
             self.get_logger().warn(
-                'stow_joint_positions는 CAD 미검증 placeholder다 — 실기 검증 없이 '
-                '이 기본값으로 실제 서보를 구동하지 말 것.')
+                f'stow_joint_positions={self.stow_joint_positions} — URDF 상으로만 검증된 '
+                '값이다(실기 미검증). 실물 구동 전 서보 tick 대응을 확인할 것.')
 
         # ── 토픽/액션 I/O ─────────────────────────
         # QoS 는 계약(contract.py/qos_profiles.py) 기준. heartbeat 계열을 depth 10 으로
@@ -396,7 +416,13 @@ class ArmFsmNode(Node):
         # 별도 콜백그룹인 이유: _tick 은 analytic IK 의 FK 호출에서 블로킹 대기한다.
         # 같은 그룹이면 IK 도는 동안 heartbeat 가 굶어 stale 판정을 맞는다.
         # → main() 이 MultiThreadedExecutor 로 띄운다.
-        self._status = ARM_STOWED_LOCKED
+        #
+        # ⚠️ 기동 직후엔 실제 접힘 자세를 아직 확인 못 했으므로 STOWED_LOCKED(주행 허가)로
+        # 시작하지 않는다 — 첫 _tick() 이전 짧은 순간(재시작 시 팔이 임의 자세여도) 파워
+        # 트레인이 즉시 주행 허가로 오인할 수 있었다. _do_stowed_locked()가 실제 검증 후
+        # 승격하도록 아래에서 함께 수정 — _do_locked()가 이미 쓰는 것과 같은 안전 측
+        # 기본값(ARM_EXECUTING, 미확인 상태 표시)으로 시작한다.
+        self._status = ARM_EXECUTING
         self._hb_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(1.0 / HEARTBEAT_RATE_HZ, self._publish_heartbeat,
                           callback_group=self._hb_group)
@@ -833,9 +859,19 @@ class ArmFsmNode(Node):
             self._transition(State.STOWED_LOCKED)
 
     def _do_stowed_locked(self):
-        """빈손으로 접혀 잠긴 평상시 상태이자 하역 완료 최종 권위."""
-        self._set_status(ARM_STOWED_LOCKED)
+        """빈손으로 접혀 잠긴 평상시 상태이자 하역 완료 최종 권위.
+
+        ⚠️ 이 상태 진입 경로는 `_do_stowing()`의 settle 확인된 전이뿐 아니라 **기동 시
+        기본값**(__init__의 `self.state = State.STOWED_LOCKED`)도 있다 — 재시작 시 팔이
+        실제로 어떤 자세든 있을 수 있는데 그 경우를 검증 없이 신뢰하면 안 된다. `_do_locked()`
+        와 동일하게 매 tick `_near_stow_posture()`+`_is_settled()`로 실측 확인하고, 통과
+        못 하면 `STOWED_LOCKED`(주행 허가) 대신 `EXECUTING`(미확인)을 발행한다.
+        """
         self.pick_target = None
+        if self._near_stow_posture() and self._is_settled():
+            self._set_status(ARM_STOWED_LOCKED)
+        else:
+            self._set_status(ARM_EXECUTING)
 
     def _do_locked(self):
         """현재 자세 홀드: MoveIt에 새 goal 안 보냄 → 브릿지가 torque로 마지막 위치 유지.
@@ -1152,7 +1188,7 @@ class ArmFsmNode(Node):
         self._grip.send_goal_async(goal)
 
     def _gripper_effort(self):
-        """그리퍼 effort(전류) 절댓값 — /joint_states 의 gripper_drive_joint effort.
+        """그리퍼 effort(전류) 절댓값 — /joint_states 의 gripper_left_pinion_joint effort.
 
         랙피니언 2모터(ID 3,4)는 브릿지가 두 전류의 max-abs 를 이 관절 effort 로 이미
         집계해 보고하므로, 여기서는 대표 관절 하나만 읽으면 된다.

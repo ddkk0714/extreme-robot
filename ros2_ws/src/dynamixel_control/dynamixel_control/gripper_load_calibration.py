@@ -49,6 +49,14 @@ INITIAL_RATIO_LIMIT = 1.10
 ENDPOINT_FILE = Path("/tmp/gripper_endpoints.json")
 OUTPUT_DIR = Path("/tmp/gripper_load_calibration")
 
+# 2026-07-28 실측(실리콘 테스트 물체, `measure`/`thresholds` 커맨드로 그룹별 반복측정):
+# ratio 1.00 파지력 부족 → 1.02 파지 가능(약간 미끄러짐) → 1.04 안정적 → 1.05 가장 안정적
+# (ID3 load=-266, ID4 load=-175, hwerr=0x00). 이 상수는 그 결과를 코드에 남긴 참고값으로,
+# `goto`/그리퍼 닫힘 목표로 이 ratio를 우선 시도해볼 것을 권장한다.
+# grasp_effort_thresh/drop_effort_thresh(gripper_presets.py)는 이 값만으로는 아직 미확정 —
+# empty/grasp/drop 3그룹 5회 이상씩 재측정 후 `thresholds` 커맨드로 별도 확정 필요.
+RECOMMENDED_GRASP_RATIO = 1.05
+
 
 class CalibrationError(RuntimeError):
     """A condition requiring an immediate safe stop."""
