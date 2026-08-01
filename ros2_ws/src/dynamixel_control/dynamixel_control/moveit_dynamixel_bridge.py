@@ -7,7 +7,7 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32MultiArray
 from control_msgs.action import FollowJointTrajectory
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
 
@@ -64,6 +64,7 @@ JOINT_CONFIG = {
     "arm_joint_2": {"id": 1, "center": 2048, "direction": 1},
     "arm_joint_3": {"id": 2, "center": 2048, "direction": 1},
 }
+ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
 
 
 def to_signed(value, byte_len):
@@ -92,6 +93,7 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("gripper_open_tick", preset["gripper_open_tick"])
         self.declare_parameter("gripper_close_tick", preset["gripper_close_tick"])
         self.declare_parameter("read_only", False)
+        self.declare_parameter("gripper_only_mode", False)
 
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
@@ -100,6 +102,8 @@ class MoveItDynamixelBridge(Node):
         self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
         self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
         self.read_only = bool(self.get_parameter("read_only").value)
+        self.gripper_only_mode = bool(
+            self.get_parameter("gripper_only_mode").value)
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -125,28 +129,36 @@ class MoveItDynamixelBridge(Node):
             LEN_SYNC_READ,
         )
 
-        # 토크 ON에 성공해 SyncRead 에 실제로 등록된 ID만 추적 — 이후 매 tick 이 ID들의
-        # 응답 유무/Hardware Error Status 로 controller fault 를 판정한다(등록 안 된 ID는
-        # 애초에 버스에 없거나 비활성화된 것으로 간주해 fault 판정에서 제외).
+        # SyncRead 등록 ID와 이 프로세스가 토크를 켠 ID를 별도로 추적한다.
+        # gripper-only/read-only에서는 register write 없이 그리퍼 ID만 active_ids에 등록된다.
         self.active_ids = set()
+        self.torque_enabled_ids = set()
 
-        if self.read_only:
-            # 진단용: register write 없이 CLI로 지정한 그리퍼 ID만 읽는다.
+        if self.read_only or self.gripper_only_mode:
+            # 진단/read-only 및 gripper-only 모드에서는 register write 없이
+            # 지정한 그리퍼 ID만 SyncRead 대상으로 등록한다.
             for gid in self.gripper_ids:
                 if self.group_sync_read.addParam(gid):
                     self.active_ids.add(gid)
+            if self.gripper_only_mode:
+                self.get_logger().info(
+                    "Gripper-only mode: monitoring gripper IDs only; "
+                    "startup torque/position writes are disabled"
+                )
         else:
             # 팔 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for joint_name, config in JOINT_CONFIG.items():
                 if self._enable_torque(config["id"], joint_name):
                     self.group_sync_read.addParam(config["id"])
                     self.active_ids.add(config["id"])
+                    self.torque_enabled_ids.add(config["id"])
 
             # 그리퍼 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for gid in self.gripper_ids:
                 if self._enable_torque(gid, f"gripper(id {gid})"):
                     self.group_sync_read.addParam(gid)
                     self.active_ids.add(gid)
+                    self.torque_enabled_ids.add(gid)
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -155,12 +167,21 @@ class MoveItDynamixelBridge(Node):
             10,
         )
 
+        # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
+        # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
+        self.teleop_goal_sub = self.create_subscription(
+            Int32MultiArray,
+            "/dynamixel/goal_position",
+            self.teleop_goal_callback,
+            10,
+        )
+
         self.action_server = ActionServer(
             self,
             FollowJointTrajectory,
             "/arm_controller/follow_joint_trajectory",
             execute_callback=self.execute_follow_joint_trajectory,
-            goal_callback=self.goal_callback,
+            goal_callback=self.arm_goal_callback,
             cancel_callback=self.cancel_callback,
         )
 
@@ -194,7 +215,7 @@ class MoveItDynamixelBridge(Node):
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
             f"gripper_type={self.gripper_type}, gripper_ids={self.gripper_ids}, "
-            f"read_only={self.read_only})"
+            f"read_only={self.read_only}, gripper_only_mode={self.gripper_only_mode})"
         )
 
     # ------------------------------------------------------------------ helpers
@@ -265,11 +286,52 @@ class MoveItDynamixelBridge(Node):
         self.get_logger().info("Received FollowJointTrajectory goal")
         return GoalResponse.ACCEPT
 
+    def arm_goal_callback(self, goal_request):
+        if self.gripper_only_mode:
+            self.get_logger().error(
+                "Gripper-only mode: rejecting arm FollowJointTrajectory goal")
+            return GoalResponse.REJECT
+        return self.goal_callback(goal_request)
+
     def cancel_callback(self, goal_handle):
         self.get_logger().info("Cancel requested")
         return CancelResponse.ACCEPT
 
     # ------------------------------------------------------------------ arm
+    def teleop_goal_callback(self, msg):
+        if len(msg.data) != 2:
+            self.get_logger().warn("Teleop goal must be [motor_id, goal_tick]")
+            return
+
+        dxl_id, goal_tick = (int(msg.data[0]), int(msg.data[1]))
+        if dxl_id not in ARM_IDS:
+            self.get_logger().warn(f"Unknown arm motor ID from teleop: {dxl_id}")
+            return
+        if self.gripper_only_mode:
+            self.get_logger().error(
+                f"Gripper-only mode: rejecting arm teleop command id={dxl_id}")
+            return
+        if self.read_only:
+            self.get_logger().warn("Read-only mode: ignoring teleop goal")
+            return
+        if dxl_id not in self.active_ids:
+            self.get_logger().error(f"Inactive arm motor ID from teleop: {dxl_id}")
+            return
+
+        goal_tick = max(DXL_MINIMUM_POSITION_VALUE,
+                        min(DXL_MAXIMUM_POSITION_VALUE, goal_tick))
+        self.group_sync_write.clearParam()
+        if not self.group_sync_write.addParam(
+                dxl_id, self.int_to_little_endian_4bytes(goal_tick)):
+            self.get_logger().warn(f"Failed to add teleop sync write param: id={dxl_id}")
+            return
+        result = self.group_sync_write.txPacket()
+        self.group_sync_write.clearParam()
+        if result != 0:
+            self.get_logger().warn(f"Teleop GroupSyncWrite failed: result={result}")
+            return
+        self.get_logger().info(f"teleop -> id {dxl_id}: tick {goal_tick}")
+
     def execute_follow_joint_trajectory(self, goal_handle):
         trajectory = goal_handle.request.trajectory
 
@@ -287,6 +349,10 @@ class MoveItDynamixelBridge(Node):
         return result
 
     def trajectory_callback(self, msg):
+        if self.gripper_only_mode:
+            self.get_logger().error(
+                "Gripper-only mode: rejecting arm trajectory topic command")
+            return
         if self.read_only:
             self.get_logger().warn("Read-only mode: ignoring arm trajectory")
             return
@@ -300,6 +366,7 @@ class MoveItDynamixelBridge(Node):
             return
 
         self.group_sync_write.clearParam()
+        added_any = False
 
         for joint_name, rad in zip(msg.joint_names, point.positions):
             if joint_name not in JOINT_CONFIG:
@@ -307,16 +374,28 @@ class MoveItDynamixelBridge(Node):
                 continue
 
             dxl_id = JOINT_CONFIG[joint_name]["id"]
+            if dxl_id not in self.active_ids:
+                self.get_logger().error(
+                    f"Inactive arm motor from trajectory: {joint_name}, id={dxl_id}"
+                )
+                continue
             goal_tick = self.rad_to_tick(joint_name, rad)
             param_goal_position = self.int_to_little_endian_4bytes(goal_tick)
 
             ok = self.group_sync_write.addParam(dxl_id, param_goal_position)
             if not ok:
                 self.get_logger().warn(f"Failed to add sync write param: id={dxl_id}")
+                continue
+            added_any = True
 
             self.get_logger().info(
                 f"{joint_name} -> id {dxl_id}: {rad:.3f} rad -> {goal_tick}"
             )
+
+        if not added_any:
+            self.get_logger().error("Trajectory contains no active arm motors")
+            self.group_sync_write.clearParam()
+            return
 
         result = self.group_sync_write.txPacket()
         if result != 0:
@@ -388,25 +467,27 @@ class MoveItDynamixelBridge(Node):
         # Hardware Error Status != 0 이거나 이번 tick 응답이 없으면 fault=True.
         # 응답 없음도 fault 로 보는 이유: 활성 등록된 서보가 갑자기 무응답이면 버스/전원
         # 이상일 수 있어 "정상"으로 오인하면 안 됨(안전 측 기본값).
-        fault = False
+        fault = False if self.gripper_only_mode else not ARM_IDS.issubset(
+            self.active_ids)
 
         # 팔 관절: position(rad) + address-126 feedback(raw signed).
         # 주소 126의 의미는 실제 장착 모터 control table로 확인해야 한다.
-        for joint_name, config in JOINT_CONFIG.items():
-            dxl_id = config["id"]
-            if dxl_id not in self.active_ids:
-                continue
-            sample = self._read_sample(dxl_id)
-            if sample is None:
-                fault = True
-                continue
-            feedback_raw, tick, hw_error, velocity_raw = sample
-            if hw_error != 0:
-                fault = True
-            msg.name.append(joint_name)
-            msg.position.append(self.tick_to_rad(joint_name, tick))
-            msg.velocity.append(velocity_raw * VELOCITY_LSB_TO_RAD_S / config["direction"])
-            msg.effort.append(float(feedback_raw))
+        if not self.gripper_only_mode:
+            for joint_name, config in JOINT_CONFIG.items():
+                dxl_id = config["id"]
+                if dxl_id not in self.active_ids:
+                    continue
+                sample = self._read_sample(dxl_id)
+                if sample is None:
+                    fault = True
+                    continue
+                feedback_raw, tick, hw_error, velocity_raw = sample
+                if hw_error != 0:
+                    fault = True
+                msg.name.append(joint_name)
+                msg.position.append(self.tick_to_rad(joint_name, tick))
+                msg.velocity.append(velocity_raw * VELOCITY_LSB_TO_RAD_S / config["direction"])
+                msg.effort.append(float(feedback_raw))
 
         # XL430-W250 그리퍼: 주소 126은 signed Present Load(0.1% 추정 부하)다.
         # 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 논리 조인트(gripper_left_pinion_joint)로
@@ -427,7 +508,7 @@ class MoveItDynamixelBridge(Node):
                 fault = True
             gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
 
-        if gripper_samples:
+        if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
             representative_tick = gripper_samples[0][1]
             representative_velocity_raw = gripper_samples[0][2]
             max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
@@ -474,15 +555,10 @@ class MoveItDynamixelBridge(Node):
         return feedback_raw, tick, hw_error, velocity_raw
 
     def destroy_node(self):
-        if not self.read_only:
-            for config in JOINT_CONFIG.values():
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, config["id"], ADDR_TORQUE_ENABLE, TORQUE_DISABLE
-                )
-            for gid in self.gripper_ids:
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, gid, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
-                )
+        for dxl_id in self.torque_enabled_ids:
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
+            )
 
         self.port_handler.closePort()
         super().destroy_node()

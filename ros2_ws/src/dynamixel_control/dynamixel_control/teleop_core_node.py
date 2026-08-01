@@ -35,23 +35,13 @@ TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 DXL_MIN_TICK = 0
 DXL_MAX_TICK = 4095
 
-DEFAULT_JOINT_NAMES = [
-    "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
-    "gripper_left_pinion_joint",
-]
-
-# 실기 버스 스캔값 (2026-07-29). ID→관절 대응은 **ID 오름차순 가정**이며 미검증.
-DEFAULT_MOTOR_IDS = [21, 22, 23, 24, 2, 15]
-DEFAULT_CENTERS = [2048] * 6
-DEFAULT_DIRECTIONS = [1] * 6
-
-# 소프트리밋 기본 OFF — 모터가 아직 본체에 장착되지 않았다(통신 파이프라인 점검용).
-# 장착 후에는 URDF(robot_arm.urdf)의 관절 리밋에 맞춰 반드시 다시 켤 것.
-# 리밋을 꺼도 tick 은 0~4095 로 clamp 되므로 서보 자체 범위는 넘지 않는다.
-DEFAULT_LIMIT_ENABLED = [False] * 6
-DEFAULT_MIN_RADS = [-math.pi] * 6
-DEFAULT_MAX_RADS = [math.pi] * 6
-
+DEFAULT_JOINT_NAMES = ["arm_joint_1", "arm_joint_2", "arm_joint_3"]
+DEFAULT_MOTOR_IDS = [0, 1, 2]
+DEFAULT_CENTERS = [2048, 2048, 2048]
+DEFAULT_DIRECTIONS = [1, 1, 1]
+DEFAULT_LIMIT_ENABLED = [True, True, True]
+DEFAULT_MIN_RADS = [-math.pi, -math.pi, 0.0]
+DEFAULT_MAX_RADS = [math.pi, 0.0, math.pi]
 
 class TeleopCore(Node):
     def __init__(self):
@@ -65,7 +55,7 @@ class TeleopCore(Node):
 
         # --- 동작 파라미터 ---
         self.declare_parameter("jog_step_rad", 0.05)      # displacement=±1 당 이동량
-        self.declare_parameter("joint_min_rad", -math.pi) # 호환용 fallback 공통 리밋
+        self.declare_parameter("joint_min_rad", -math.pi)  # 호환용 fallback 공통 리밋
         self.declare_parameter("joint_max_rad", math.pi)
         self.declare_parameter("joint_limit_enabled", DEFAULT_LIMIT_ENABLED)
         self.declare_parameter("joint_min_rads", DEFAULT_MIN_RADS)
