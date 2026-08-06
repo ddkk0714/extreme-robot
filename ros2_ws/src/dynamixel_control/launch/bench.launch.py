@@ -43,6 +43,7 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz')
     joy_node = LaunchConfiguration('joy_node')
     joy_device = LaunchConfiguration('joy_device')
+    port = LaunchConfiguration('port')
 
     urdf_path = os.path.join(
         get_package_share_directory('robot_arm_description'),
@@ -72,6 +73,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'joy_device', default_value='0',
             description='joy_node 의 device_id (/dev/input/js<N>)',
+        ),
+        DeclareLaunchArgument(
+            'port', default_value='/dev/ttyUSB0',
+            description='position_node 가 열 시리얼 포트. USB 재연결로 번호가 '
+                         '밀리면(/dev/ttyUSB1 등) 바꿔서 넘길 것',
         ),
 
         # 게임패드 드라이버.
@@ -110,6 +116,7 @@ def generate_launch_description():
         Node(
             package='dynamixel_control', executable='position_node',
             name='dynamixel_position_node', output='screen',
+            parameters=[{'port': port}],
             condition=IfCondition(use_hardware),
         ),
 

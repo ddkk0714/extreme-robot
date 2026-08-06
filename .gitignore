@@ -31,5 +31,11 @@ docs/
 ros2_ws/*.log
 ros2_ws/debug_capture.png
 
+# 키보드 텔레옵 저장 자세 (teleop_core poses_file 기본 경로 — 벤치마다 다름, 런타임 산출물)
+ros2_ws/dynamixel_arm_poses.json
+# 리미트 측정 모드(calib_*)로 실측한 관절별 상/하한 (teleop_core joint_limits_file
+# 기본 경로 — 벤치/서보마다 다른 실측값, 런타임 산출물)
+ros2_ws/dynamixel_arm_joint_limits.json
+
 # 분석 스크립트가 뱉는 중간 데이터 (stow_eval.py sweep 등 — 스크립트로 재생성 가능)
 ros2_ws/*.npy
