@@ -321,7 +321,7 @@ class TeleopCore(Node):
 
         # --- 동작 파라미터 ---
         self.declare_parameter("jog_step_rad", 0.05)      # displacement=±1 당 이동량
-        self.declare_parameter("joint_min_rad", -math.pi) # 호환용 fallback 공통 리밋
+        self.declare_parameter("joint_min_rad", -math.pi)  # 호환용 fallback 공통 리밋
         self.declare_parameter("joint_max_rad", math.pi)
         self.declare_parameter("joint_limit_enabled", DEFAULT_LIMIT_ENABLED)
         self.declare_parameter("joint_min_rads", DEFAULT_MIN_RADS)

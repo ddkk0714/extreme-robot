@@ -418,7 +418,13 @@ class ArmFsmNode(Node):
         # 별도 콜백그룹인 이유: _tick 은 analytic IK 의 FK 호출에서 블로킹 대기한다.
         # 같은 그룹이면 IK 도는 동안 heartbeat 가 굶어 stale 판정을 맞는다.
         # → main() 이 MultiThreadedExecutor 로 띄운다.
-        self._status = ARM_STOWED_LOCKED
+        #
+        # ⚠️ 기동 직후엔 실제 접힘 자세를 아직 확인 못 했으므로 STOWED_LOCKED(주행 허가)로
+        # 시작하지 않는다 — 첫 _tick() 이전 짧은 순간(재시작 시 팔이 임의 자세여도) 파워
+        # 트레인이 즉시 주행 허가로 오인할 수 있었다. _do_stowed_locked()가 실제 검증 후
+        # 승격하도록 아래에서 함께 수정 — _do_locked()가 이미 쓰는 것과 같은 안전 측
+        # 기본값(ARM_EXECUTING, 미확인 상태 표시)으로 시작한다.
+        self._status = ARM_EXECUTING
         self._hb_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(1.0 / HEARTBEAT_RATE_HZ, self._publish_heartbeat,
                           callback_group=self._hb_group)
@@ -855,9 +861,19 @@ class ArmFsmNode(Node):
             self._transition(State.STOWED_LOCKED)
 
     def _do_stowed_locked(self):
-        """빈손으로 접혀 잠긴 평상시 상태이자 하역 완료 최종 권위."""
-        self._set_status(ARM_STOWED_LOCKED)
+        """빈손으로 접혀 잠긴 평상시 상태이자 하역 완료 최종 권위.
+
+        ⚠️ 이 상태 진입 경로는 `_do_stowing()`의 settle 확인된 전이뿐 아니라 **기동 시
+        기본값**(__init__의 `self.state = State.STOWED_LOCKED`)도 있다 — 재시작 시 팔이
+        실제로 어떤 자세든 있을 수 있는데 그 경우를 검증 없이 신뢰하면 안 된다. `_do_locked()`
+        와 동일하게 매 tick `_near_stow_posture()`+`_is_settled()`로 실측 확인하고, 통과
+        못 하면 `STOWED_LOCKED`(주행 허가) 대신 `EXECUTING`(미확인)을 발행한다.
+        """
         self.pick_target = None
+        if self._near_stow_posture() and self._is_settled():
+            self._set_status(ARM_STOWED_LOCKED)
+        else:
+            self._set_status(ARM_EXECUTING)
 
     def _do_locked(self):
         """현재 자세 홀드: MoveIt에 새 goal 안 보냄 → 브릿지가 torque로 마지막 위치 유지.

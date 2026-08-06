@@ -10,8 +10,16 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/root/.Xauthority
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # 호스트 ~/.Xauthority 라이브 마운트. 로컬 데스크톱 xhost 방식과 달리 SSH -X(untrusted
+      # forwarding)는 재접속마다 새 MIT-MAGIC-COOKIE를 요구하는데, xhost +local:docker는 이
+      # 쿠키 인증까지는 못 뚫는다 — 컨테이너가 호스트의 실제 Xauthority를 그대로 봐야 매번 갱신된
+      # 쿠키를 읽는다(스냅샷 복사가 아니라 마운트라 세션이 바뀌어도 계속 맞음).
+      # ⚠️ 호스트에 ~/.Xauthority 파일이 아예 없으면(X를 한 번도 안 띄운 계정) Docker가 마운트
+      # 시점에 빈 디렉터리로 만들어버려 깨진다 — 처음 쓰는 팀원은 `touch ~/.Xauthority` 먼저.
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
       - ./ros2_ws:/root/ros2_ws
       - /dev:/dev
     network_mode: host
