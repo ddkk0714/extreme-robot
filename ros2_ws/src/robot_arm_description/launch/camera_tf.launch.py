@@ -31,13 +31,24 @@ OPTICAL_YAW = -math.pi / 2.0
 
 def generate_launch_description():
     args = [
-        # ── 전방 RGB-D 카메라 (차체 고정, CAD 실측값) ──
-        DeclareLaunchArgument('cam_x',     default_value='0.123'),
-        DeclareLaunchArgument('cam_y',     default_value='0.0'),
-        DeclareLaunchArgument('cam_z',     default_value='0.082'),
-        DeclareLaunchArgument('cam_roll',  default_value='0.0'),
-        DeclareLaunchArgument('cam_pitch', default_value='-0.26'),
-        DeclareLaunchArgument('cam_yaw',   default_value='0.0'),
+        # ── 전방 RGB-D 카메라 ──
+        # 2026-08-07 실측값 (camera_tf_tuner 로 RViz 에서 정렬).
+        #   뒤로 55.3cm, 오른쪽 44.7cm, 높이 16.5cm / yaw +27.0°
+        # ⚠️ 이건 **카메라를 책상에 올려둔 벤치 배치**다 — 차체에 정식 장착하면
+        #    반드시 다시 재야 한다(cam_x 가 음수인 것도 그래서다: 카메라가 로봇
+        #    베이스보다 뒤에 있다).
+        # 근거: RViz 에서 depth 포인트클라우드와 YOLO 검출 큐브가 실제 상자 위치에
+        #    겹치는 것을 눈으로 확인(전 6-DOF 를 한 번에 검증하는 방식). 다점
+        #    최소자승(calibrate_camera_pose.py / 튜너의 Solve)은 이 배치에서
+        #    오히려 부정확해 채택하지 않았다.
+        # 이전 값(차체 장착 CAD 추정, 실기 검증 전): x=0.123 y=0.0 z=0.082
+        #    roll=0.0 pitch=-0.26 yaw=0.0 — 정식 장착 시 출발점으로 참고.
+        DeclareLaunchArgument('cam_x',     default_value='-0.5526'),
+        DeclareLaunchArgument('cam_y',     default_value='-0.4469'),
+        DeclareLaunchArgument('cam_z',     default_value='0.1654'),
+        DeclareLaunchArgument('cam_roll',  default_value='0.0267'),
+        DeclareLaunchArgument('cam_pitch', default_value='0.0210'),
+        DeclareLaunchArgument('cam_yaw',   default_value='0.4718'),
     ]
 
     # ── 전방 RGB-D: base_link → camera_link ──
