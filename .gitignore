@@ -39,3 +39,7 @@ ros2_ws/dynamixel_arm_joint_limits.json
 
 # 분석 스크립트가 뱉는 중간 데이터 (stow_eval.py sweep 등 — 스크립트로 재생성 가능)
 ros2_ws/*.npy
+
+# camera_tf_tuner 의 save 서비스 산출물 (벤치/장착마다 다른 실측값 — 확정되면
+# camera_tf.launch.py 기본값에 직접 반영한다)
+ros2_ws/camera_tf_calib.txt

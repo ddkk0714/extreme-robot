@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'robot_arm_perception'
@@ -10,6 +13,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -23,6 +27,9 @@ setup(
             'perception_node = robot_arm_perception.perception_node:main',
             'stream_node = robot_arm_perception.stream_node:main',
             'metadata_sender_node = robot_arm_perception.metadata_sender_node:main',
+            'detection_markers = robot_arm_perception.detection_markers:main',
+            'camera_tf_tuner = robot_arm_perception.camera_tf_tuner:main',
+            'ground_truth_markers = robot_arm_perception.ground_truth_markers:main',
         ],
     },
 )
