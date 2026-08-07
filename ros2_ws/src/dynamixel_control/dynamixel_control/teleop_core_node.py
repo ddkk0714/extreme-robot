@@ -172,7 +172,11 @@ DXL_EXTENDED_MIN_TICK = -1_048_575
 DXL_EXTENDED_MAX_TICK = 1_048_575
 
 # 감속기(기어박스)가 달려서 서보 자신은 여러 바퀴 돌아야 관절이 그 비율만큼만
-# 도는 축(2026-08-02 사용자 확인: arm_joint_2/3 에 약 10:1). dynamixel_position_node
+# 도는 축. **2026-08-07 실측(scripts/measure_gear_ratio.py): arm_joint_2 = 9.034:1,
+# arm_joint_3 = 4.040:1 — 두 축의 감속비는 서로 다르다**(그 전까지 이 주석들은 둘 다
+# "약 10:1" 로 추정했으나 실측으로 뒤집혔다). 이 노드 자체는 기어비를 쓰지 않는다 —
+# 아래 rad 값은 전부 **서보축 각도**다. 관절 각도로 환산하는 건 moveit_dynamixel_bridge
+# 의 JOINT_CONFIG[*]["gear_ratio"] 쪽이고, 값의 단일 출처도 거기다. dynamixel_position_node
 # 의 extended_position_ids 파라미터(기본 [14,13,3], 아래 참고)와 짝 — 바뀌면 여기도
 # 같이 바꿀 것.
 #
@@ -226,7 +230,7 @@ DEFAULT_DIRECTIONS = [1, -1, 1, 1, 1, 1]
 # arm_joint_4 측정값은 URDF(robot_arm.urdf) 의 CAD 리밋(lower=-0.610865,
 # upper=0.698132)과도 근사해 신뢰할 만하다. arm_joint_2/3 는 처음엔 ±π 를 훨씬
 # 넘는 값(단일회전으로는 불가능)이라 거부됐었는데, 사용자 확인 결과 이 두 축엔
-# 감속기(기어박스, 약 10:1)가 달려있어 서보 자신이 여러 바퀴 도는 게 정상 설계였다
+# 감속기(2026-08-07 실측 9.034:1 / 4.040:1)가 달려있어 서보 자신이 여러 바퀴 도는 게 정상 설계였다
 # — EXTENDED_POSITION_NAMES/OP_MODE_EXTENDED_POSITION 로 다회전을 정식 지원하고
 # CALIB_SANE_RAD_LIMIT_EXTENDED 로 재검증을 통과해 반영했다(같은 세션에 함께
 # 측정된 arm_joint_5 는 폭 0(하한/상한을 실제로 안 움직임)이라 여전히 반영 안 함
@@ -263,7 +267,7 @@ DEFAULT_FLOOR_FROM_BOOT = [True, False, False, False, True, False]
 # 확인으로 갱신) — 실사용 중 arm_joint_2/3 가 ±π 를 훨씬 넘는 값(예: 9.2rad)으로,
 # arm_joint_5 가 사실상 폭 0(0.005rad)으로 기록되는 사고가 있었다. 처음엔 전자를
 # "단일회전 joint 가 다회전 모드로 잘못 남은 사고"로 의심했는데, 사용자 확인
-# 결과 arm_joint_2/3 에는 실제로 감속기(기어박스, 약 10:1)가 달려있어서 서보
+# 결과 arm_joint_2/3 에는 실제로 감속기(2026-08-07 실측 9.034:1 / 4.040:1)가 달려있어서 서보
 # 자신이 여러 바퀴 돌아야 관절이 그 비율만큼만 도는 게 **정상 설계**였다 —
 # 그래서 이 두 축은 EXTENDED_POSITION_NAMES 로 등록해 다회전을 정식 지원하고
 # (dynamixel_position_node.py 의 OP_MODE_EXTENDED_POSITION 참고), 이 축들만 훨씬
@@ -277,8 +281,8 @@ DEFAULT_FLOOR_FROM_BOOT = [True, False, False, False, True, False]
 # 을 로드하는 시점 둘 다에서 이 조건들을 검사해 이상하면 적용을 거부하고 로그로
 # 알린다.
 CALIB_SANE_RAD_LIMIT = math.pi * 1.05        # 단일회전 축 — 이보다 크면 물리적으로 불가능
-# 기어비 "아마 10:1"(사용자 확인, 확정 아님) 이라 여유를 넉넉히 뒀다 — 실제
-# 기어비가 다르거나 톱니 개수가 안 맞아도 오탐 거부하지 않도록.
+# 기어비가 축마다 다르고(2026-08-07 실측 9.034:1 / 4.040:1) 앞으로 또 바뀔 수 있어
+# 여유를 넉넉히 뒀다 — 기어비가 달라져도 정상 측정을 오탐 거부하지 않도록.
 CALIB_SANE_RAD_LIMIT_EXTENDED = math.pi * 15  # 감속기 축(EXTENDED_POSITION_NAMES)
 CALIB_MIN_RANGE_RAD = 0.05              # 이보다 좁으면 하한/상한을 실제로 안 움직인 것으로 간주
 
@@ -291,8 +295,8 @@ def _validate_calib_bounds(name, lower, upper):
     )
     if abs(lower) > sane_limit or abs(upper) > sane_limit:
         reason_extra = (
-            "감속기 축인데도 이 범위를 넘습니다 — 기어비가 가정(약 10:1)과 많이 "
-            "다르거나 캘리브레이션이 잘못됐을 수 있습니다."
+            "감속기 축인데도 이 범위를 넘습니다 — 기어비가 실측값(arm_joint_2=9.034:1, "
+            "arm_joint_3=4.040:1)과 많이 다르거나 캘리브레이션이 잘못됐을 수 있습니다."
             if name in EXTENDED_POSITION_NAMES else
             "서보가 Extended Position Control Mode(다회전)로 남아있을 가능성이 "
             "높습니다. operating mode(force_position_mode) 확인 후 재측정하세요."
