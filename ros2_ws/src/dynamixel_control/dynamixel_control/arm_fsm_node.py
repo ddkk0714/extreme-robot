@@ -128,6 +128,9 @@ from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from robot_arm_msgs.msg import ArrivalStatus, ChassisMode, ArmStatus, DetectedObject
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+# 관절 이름·순서의 단일 출처(ARM_JOINT_NAMES 주석 참고). 이 import 는 상수만 읽으며
+# 서보 포트를 열지 않는다 — 포트는 브릿지 노드 인스턴스가 생성될 때만 열린다.
+from dynamixel_control.moveit_dynamixel_bridge import JOINT_CONFIG
 
 
 # 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf) 기준 — URDF 자체는
@@ -136,7 +139,13 @@ from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
 # 도입된 3DOF 위치전용 IK — URDF가 3축만 있어서가 아니라 solver를 아직 5DOF로 확장 안
 # 해서임, 방향은 여전히 무시). MoveGroup 경로(§6 결정 '가')는 남겨두되 ik_mode:='moveit'로
 # 전환 가능하게만 유지.
-ARM_JOINT_NAMES = ['arm_joint_1', 'arm_joint_2', 'arm_joint_3']
+# 팔 관절 이름·순서는 **moveit_dynamixel_bridge.JOINT_CONFIG 가 단일 출처**다.
+# 여기에 리터럴로 다시 적지 말 것 — 2026-08-07 이전에는 `['arm_joint_1','arm_joint_2',
+# 'arm_joint_3']` 로 하드코딩돼 있었고, 브릿지가 실기 버스(arm_joint_2~5)에 맞춰
+# 갱신된 뒤에도 그대로 남아 **모터가 없는 arm_joint_1 을 명령하고 실제로 달려 있는
+# arm_joint_4/5 는 건드리지도 않는** 상태였다. dict 는 삽입 순서를 보존하므로
+# 궤적 메시지의 관절 순서도 브릿지와 자동으로 일치한다.
+ARM_JOINT_NAMES = list(JOINT_CONFIG)
 
 
 # ──────────────────────────────────────────────
@@ -285,7 +294,9 @@ class ArmFsmNode(Node):
         #
         # 이전 기본값 [0.0, -0.6, 1.2]은 j2=-0.6이 URDF 하한(0) 밖이라 애초에 도달 불가였다.
         # ⚠️ URDF 검증만 끝났고 실기 검증은 아직 — 실물 구동 전 서보 tick 대응 확인 필요.
-        self.declare_parameter('stow_joint_positions', [0.0, 0.0, 0.0])
+        # 길이는 ARM_JOINT_NAMES 를 따라간다 — 리터럴로 박아두면 축 수가 바뀔 때
+        # 길이 검증(아래)에 걸려 STOWING 모션이 **조용히 비활성**된다.
+        self.declare_parameter('stow_joint_positions', [0.0] * len(ARM_JOINT_NAMES))
         # STOWED_LOCKED 발행 전 "실제로 접힌 자세인지" 확인용 관절각 허용오차 — §5.1 잔여
         # 합의 ②(정지 안정성만 검사하고 접힘 자세 근접은 미확인) 대응. LOCKED 경유(지형/주행
         # 이벤트로 작업 중단)로 도달한 임의 자세를 STOWED_LOCKED로 착칭하지 않기 위함.
