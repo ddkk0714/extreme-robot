@@ -23,6 +23,7 @@ setup(
             'perception_node = robot_arm_perception.perception_node:main',
             'stream_node = robot_arm_perception.stream_node:main',
             'metadata_sender_node = robot_arm_perception.metadata_sender_node:main',
+            'vision_test = robot_arm_perception.vision_test_node:main',
         ],
     },
 )
