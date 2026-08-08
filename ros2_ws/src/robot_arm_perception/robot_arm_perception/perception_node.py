@@ -51,7 +51,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
 from geometry_msgs.msg import Pose, Point, Quaternion
-from sensor_msgs.msg import RegionOfInterest, Image as ImageMsg
+from sensor_msgs.msg import (
+    RegionOfInterest, Image as ImageMsg, PointCloud2, PointField)
 from cv_bridge import CvBridge
 from robot_arm_msgs.msg import DetectedObject, DetectedObjectArray
 from robot_arm_perception.model_presets import DEFAULT_MODEL, get_preset
@@ -221,6 +222,13 @@ class PerceptionNode(Node):
         self.declare_parameter('camera_mode', 'realsense')  # 'realsense' | 'test'
         self.declare_parameter('test_image_path', '')
 
+        # depth 포인트클라우드 (카메라 TF 캘리브 시각화용, 기본 off)
+        # RealSense는 프로세스 하나만 장치를 열 수 있어 realsense2_camera 드라이버를
+        # 따로 띄울 수 없다 — 클라우드가 필요하면 이 노드가 직접 내야 한다.
+        self.declare_parameter('publish_cloud', False)
+        self.declare_parameter('cloud_rate_hz', 5.0)   # 추론과 대역폭을 뺏지 않게 낮게
+        self.declare_parameter('cloud_decimation', 4)  # N픽셀마다 1점
+
         # 픽 대상 선별 (Phase 2 Step 3)
         self.declare_parameter('pick_classes', preset['pick_classes'])  # 쉼표구분 화이트리스트. 빈값=후보없음(관찰 전용 구간)
         self.declare_parameter('pick_min_conf', 0.5)    # 픽 후보 최소 confidence
@@ -267,6 +275,8 @@ class PerceptionNode(Node):
         self.pub_debug = self.create_publisher(ImageMsg, '/perception/debug_image', 1)
         # YOLO/오버레이와 무관한 raw 스트림 — 캡처 스레드가 매 프레임 발행(§3.2)
         self.pub_raw = self.create_publisher(ImageMsg, '/perception/raw_image', 1)
+        self.pub_cloud = self.create_publisher(PointCloud2, '/perception/depth_cloud', 1)
+        self._last_cloud_t = 0.0
         self._bridge = CvBridge()
 
         # 캡처 스레드는 카메라를 전담하며 추론을 기다리지 않는다. 추론 스레드는
@@ -348,6 +358,9 @@ class PerceptionNode(Node):
             raw.header.frame_id = frame_id
             self.pub_raw.publish(raw)
 
+            if depth_img is not None:
+                self._maybe_publish_cloud(depth_img, stamp, frame_id)
+
             # RealSense SDK 프레임 객체는 스레드 간 공유가 안전하지 않음 — keep()으로
             # 버퍼를 유지한 채 참조만 공유 슬롯에 넘긴다(색상/깊이 배열은 복사).
             if depth_frame is not None:
@@ -361,6 +374,64 @@ class PerceptionNode(Node):
                 elapsed = time.time() - t0
                 if interval - elapsed > 0:
                     time.sleep(interval - elapsed)
+
+    def _maybe_publish_cloud(self, depth_img, stamp, frame_id):
+        """depth → PointCloud2 (카메라 TF 캘리브 시각화용, 2026-08-07 추가).
+
+        RViz에서 이 점구름이 URDF 로봇 모델·책상면과 겹치도록 카메라 TF를 맞추면,
+        박스 다점 측정 없이도 roll/pitch/높이를 눈으로 잡을 수 있다 —
+        `camera_tf_tuner`와 짝으로 쓴다. 로봇 형상을 따로 YOLO로 학습할 필요가
+        없는 이유이기도 하다(형상은 이미 depth 안에 있다).
+
+        기본 off + 구독자 게이트 + 저속(5Hz) — 추론 스레드의 대역폭을 뺏지 않는다.
+        """
+        if not self.get_parameter('publish_cloud').value:
+            return
+        if self.pub_cloud.get_subscription_count() == 0:
+            return
+        cal = self._depth_cal
+        if cal is None:
+            return
+        rate = float(self.get_parameter('cloud_rate_hz').value)
+        now = time.time()
+        if rate <= 0.0 or now - self._last_cloud_t < 1.0 / rate:
+            return
+        self._last_cloud_t = now
+
+        step = max(int(self.get_parameter('cloud_decimation').value), 1)
+        z = depth_img[::step, ::step].astype(np.float32) * cal.scale
+        rows, cols = np.nonzero((z > cal.dmin) & (z < cal.dmax))
+        if rows.size == 0:
+            return
+        zz = z[rows, cols]
+        # 픽셀 → depth optical 3D. depth 스트림은 왜곡계수가 0이라 핀홀 식이
+        # rs2_deproject_pixel_to_point 와 같은 결과를 주고, 벡터화되어 수만 점도 1ms 안쪽이다.
+        xx = (cols * step - cal.di.ppx) / cal.di.fx * zz
+        yy = (rows * step - cal.di.ppy) / cal.di.fy * zz
+        points = np.stack((xx, yy, zz), axis=1)
+
+        # depth optical → color optical. 헤더 frame_id 가 color optical 기준이므로 필수다
+        # (D435 는 두 센서가 물리적으로 ~15mm 떨어져 있어 생략하면 그만큼 통째로 밀린다).
+        matrix = np.array(cal.d2c.rotation, dtype=np.float32).reshape(3, 3).T  # rs는 열 우선
+        translation = np.array(cal.d2c.translation, dtype=np.float32)
+        points = points @ matrix.T + translation
+
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        msg.height = 1
+        msg.width = int(points.shape[0])
+        msg.fields = [
+            PointField(name=name, offset=4 * i,
+                       datatype=PointField.FLOAT32, count=1)
+            for i, name in enumerate(('x', 'y', 'z'))
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.data = np.ascontiguousarray(points, dtype=np.float32).tobytes()
+        self.pub_cloud.publish(msg)
 
     def _inference_loop(self):
         """공유 슬롯의 최신 프레임만 소비 — 지연 프레임 큐가 쌓이지 않는다."""

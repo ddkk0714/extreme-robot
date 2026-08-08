@@ -1102,12 +1102,18 @@ class ArmFsmNode(Node):
         return np.array([p.x, p.y, p.z])
 
     def _solve_position_ik(self, target_xyz, q_init):
-        """FK + 수치 자코비안(finite-difference) 로 위치만 맞추는 3DOF IK.
+        """FK + 수치 자코비안(finite-difference) 로 위치만 맞추는 IK.
 
-        ARM_JOINT_NAMES가 앞 3관절(arm_joint_1~3)만 써서 MoveIt 6DOF pose IK 대신 이 방식을
-        기본으로 씀(HW-7 실측 확인, compute_ik가 현재 실제 tip pose에도 NO_IK_SOLUTION 반환하던
-        문제 회피 — URDF 자체는 5축 다 있음, solver가 아직 5DOF로 확장 안 됨). 방향은 포기하고
-        위치만 댐핑 최소자승(Levenberg-Marquardt 유사)으로 반복 수렴.
+        MoveIt 6DOF pose IK 대신 이 방식을 기본으로 씀(HW-7 실측 확인, compute_ik 가 현재
+        실제 tip pose 에도 NO_IK_SOLUTION 반환하던 문제 회피). 방향은 포기하고 위치만
+        댐핑 최소자승(Levenberg-Marquardt 유사)으로 반복 수렴.
+
+        ⚠️ 관절 수는 `ARM_JOINT_NAMES`(=JOINT_CONFIG) 에서 온다 — **여기에 상수로 박지 말 것.**
+        2026-08-08 수정: 예전엔 3 이 하드코딩돼 있었는데 실기 배선 확정으로 구동 관절이
+        4개(arm_joint_2~5, id 14/13/12/16)가 되면서 `q + dq` 가 shape (4,)+(3,) 로 깨져
+        APPROACH 에서 무조건 ValueError 로 죽었다(실기 dry-run 에서 발견).
+        자코비안은 3×n(작업공간 3차원 × 관절 n)이고, 감쇠항 `np.eye(3)` 은 작업공간 쪽이라
+        관절 수와 무관하게 3 이 맞다.
         """
         q = np.array(q_init, dtype=float)
         target = np.array(target_xyz, dtype=float)
@@ -1123,9 +1129,9 @@ class ArmFsmNode(Node):
             err = target - p
             if np.linalg.norm(err) < self.ik_tol:
                 return q.tolist()
-            J = np.zeros((3, 3))
-            for i in range(3):
-                dq = np.zeros(3)
+            J = np.zeros((3, q.size))
+            for i in range(q.size):
+                dq = np.zeros(q.size)
                 dq[i] = eps
                 p2 = self._fk_tip(q + dq)
                 if p2 is None:
