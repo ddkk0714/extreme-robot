@@ -49,13 +49,23 @@ def generate_launch_description():
         #    -6.8° / 반경 0.37m 로 정상 복귀했다(YOLO confidence 도 0.81→0.94).
         #    "인식은 되는데 IK 가 이상한 데를 가리킨다" 면 여기부터 의심할 것.
         #
+        # 📌 **캘리브 품질 판정 기준(2026-08-09 확립):** 숫자만 보고는 잘 맞췄는지 알 수 없다.
+        #    `/pick_target` 을 base_link 로 변환해 **방위각**을 보라 — `arm_joint_1`(베이스
+        #    요축)에 모터가 없어 팔이 +x 평면에서만 움직이므로, 방위각 차이가 그대로 파지
+        #    오차로 남는다. 실측 대응:
+        #      -10.3° → analytic IK 잔차 2.13cm (ik_tol 미수렴, 3cm 로 겨우 수용)
+        #       -4.4° → analytic IK 잔차 0.96cm (수렴)
+        #    ±5° 안쪽을 목표로 할 것. 그래도 안 줄면 캘리브가 아니라 **박스가 실제로 팔
+        #    정면에서 벗어나 있는** 것이므로 박스를 옮겨야 한다(둘을 혼동하지 말 것).
+        #
+        # 이전 값(2026-08-09 1차): x=0.2022 y=-0.6269 z=0.1402
         # 이전 값(2026-08-07 벤치): x=-0.5526 y=-0.4469 z=0.1654
         #    roll=0.0267 pitch=0.0210 yaw=0.4718
         # 이전 값(차체 장착 CAD 추정, 실기 검증 전): x=0.123 y=0.0 z=0.082
         #    roll=0.0 pitch=-0.26 yaw=0.0 — 정식 장착 시 출발점으로 참고.
         DeclareLaunchArgument('cam_x',     default_value='0.2022'),
-        DeclareLaunchArgument('cam_y',     default_value='-0.6269'),
-        DeclareLaunchArgument('cam_z',     default_value='0.1402'),
+        DeclareLaunchArgument('cam_y',     default_value='-0.5957'),
+        DeclareLaunchArgument('cam_z',     default_value='0.1272'),
         DeclareLaunchArgument('cam_roll',  default_value='-0.0619'),
         DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
         DeclareLaunchArgument('cam_yaw',   default_value='1.6265'),

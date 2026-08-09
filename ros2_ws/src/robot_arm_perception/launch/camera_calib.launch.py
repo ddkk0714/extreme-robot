@@ -77,8 +77,8 @@ def generate_launch_description():
         # camera_tf.launch.py 의 현재 기본값에서 이어서 조정한다 — 두 파일을 항상
         # 같이 갱신할 것(여기서 맞춘 값을 그쪽 기본값으로 옮기는 게 이 도구의 출구다).
         DeclareLaunchArgument('cam_x', default_value='0.2022'),
-        DeclareLaunchArgument('cam_y', default_value='-0.6269'),
-        DeclareLaunchArgument('cam_z', default_value='0.1402'),
+        DeclareLaunchArgument('cam_y', default_value='-0.5957'),
+        DeclareLaunchArgument('cam_z', default_value='0.1272'),
         DeclareLaunchArgument('cam_roll', default_value='-0.0619'),
         DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
         DeclareLaunchArgument('cam_yaw', default_value='1.6265'),
