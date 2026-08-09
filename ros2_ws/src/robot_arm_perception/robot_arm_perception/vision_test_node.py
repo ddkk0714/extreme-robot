@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from cv_bridge import CvBridge
 
@@ -140,6 +141,12 @@ class VisionTestNode(Node):
 
                 self._draw_one(display, i, x1, y1, x2, y2, obj.class_name, conf_val, mask_polygons)
 
+            # SIGTERM(예: `timeout`, docker stop)이 프레임 처리 중에 오면 rclpy 가
+            # context 를 먼저 내려버려서, 여기서 그냥 publish 하면 RCLError
+            # ("publisher's context is invalid") 트레이스백을 뱉고 죽는다.
+            if not rclpy.ok():
+                break
+
             self.pub_objects.publish(array_msg)
             if publish_debug and self.pub_debug.get_subscription_count() > 0:
                 self.pub_debug.publish(self.bridge.cv2_to_imgmsg(display, encoding="bgr8"))
@@ -180,7 +187,7 @@ def main(args=None):
     node = VisionTestNode()
     try:
         node.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
