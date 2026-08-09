@@ -68,7 +68,19 @@ GRIPPER_PRESETS = {
         #    파지에 성공했는데 FSM 이 실패로 보면 grasp 값을 먼저 낮춰볼 것.
         "grasp_effort_thresh": 250.0,  # 빈손 상한(119) 과 접촉(290) 사이
         "drop_effort_thresh": 200.0,   # 빈손 상한 위 — 물체가 빠지면 즉시 빈손 수준으로 떨어진다
-        "gripper_action_time": 1.0,
+        # FSM 이 개폐 명령을 낸 뒤 effort 를 읽기까지 기다리는 시간 [s].
+        #
+        # ⚠️ 2026-08-09 실기: 1.0 이면 **닫히는 도중에 판정**해서 grasp effort 가 0.0 으로
+        #    읽히고 파지가 무조건 실패한다. 서보 프로파일로 계산한 완전 개폐 시간은
+        #      스트로크 1484 tick (open 1083 → close -401)
+        #      Profile Velocity 80 = 18.3 rev/min = 1251 tick/s
+        #      Profile Acceleration 25 = 1.49 rev/s^2 → 가감속 각 0.20s(128 tick)
+        #      → 2*0.20 + (1484-256)/1251 = **1.39 s**
+        #    물체에 닿으면 감속해 더 걸리므로 여유를 둬 2.5 로 잡는다.
+        #
+        # 이 값은 gripper_open_tick/gripper_close_tick 이나 브릿지의 PROFILE_VELOCITY/
+        # PROFILE_ACCELERATION 을 바꾸면 같이 다시 계산해야 한다.
+        "gripper_action_time": 2.5,
     },
 }
 

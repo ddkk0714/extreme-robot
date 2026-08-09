@@ -241,6 +241,20 @@ class ArmFsmNode(Node):
         self.declare_parameter('ik_max_iters', 8)
         self.declare_parameter('ik_tol', 0.01)          # [m] 위치 수렴 허용오차
         self.declare_parameter('ik_accept_tol', 0.03)   # [m] 최종 실패 판정 기준
+        # 재시도(FAILED→PERCEIVE→PLAN) 때 타겟을 다시 인식하지 않고 처음 얼린 값을 재사용한다.
+        #
+        # ⚠️ 왜 필요한가 (2026-08-09 실기): APPROACH/DESCEND 로 팔이 움직이면 **팔 자신이
+        #    카메라 시야에 들어온다.** 그 상태에서 재시도가 PERCEIVE 를 다시 돌면 YOLO 가
+        #    팔/그리퍼를 박스로 잡거나 진짜 박스가 가려져서 타겟이 통째로 튄다 — 실측으로
+        #    base_link (0.348,-0.053,0.056) → (0.603,0.481,0.067) 로 53cm 점프했고, 그
+        #    뒤로는 IK 실패만 반복하는 루프에 빠졌다.
+        #
+        # 기본값 False(=매번 다시 인식)는 기존 동작이다. 현장에서는 박스가 실제로 움직였을
+        # 수 있어 다시 보는 게 맞을 때도 있기 때문에 옵트인으로 둔다.
+        #
+        # 🔧 근본 해결은 따로다: 재인식 전에 팔을 시야 밖(관측 자세)으로 물린 뒤 보는 것.
+        #    그게 들어가기 전까지는 이 플래그가 실용적인 우회다.
+        self.declare_parameter('freeze_target_on_retry', False)
         self.declare_parameter('arm_move_speed', 0.5)   # [rad/s] 직접명령 시 소요시간 추정용
         # 그리퍼 — gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
         # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
@@ -318,6 +332,7 @@ class ArmFsmNode(Node):
         self.ik_max_iters = int(g('ik_max_iters').value)
         self.ik_tol = g('ik_tol').value
         self.ik_accept_tol = g('ik_accept_tol').value
+        self.freeze_target_on_retry = bool(g('freeze_target_on_retry').value)
         self.arm_move_speed = g('arm_move_speed').value
         self.gripper_type = gripper_type
         self.gripper_joints = list(g('gripper_joints').value)
@@ -522,6 +537,9 @@ class ArmFsmNode(Node):
             if msg.mission_id == self._last_completed_mission_id:
                 return  # 이미 완료된 mission_id 재발행 — 재실행 금지
             self.mission_id = msg.mission_id
+            # 새 mission — 얼린 타겟은 이전 mission 것이므로 반드시 버린다
+            # (freeze_target_on_retry 가 켜져 있어도 mission 을 넘어 재사용하면 안 된다).
+            self._clear_frozen_target()
             self._set_status(ARM_WORK_READY)
             self._transition(State.PERCEIVE)
             self._pending_arrival = None
@@ -643,9 +661,28 @@ class ArmFsmNode(Node):
             return
         self._transition(State.PLAN)
 
+    def _has_frozen_target(self):
+        """이번 mission 에서 이미 얼려둔 타겟이 있는가 (ik_mode 별로 저장 위치가 다르다)."""
+        if self.ik_mode == 'moveit':
+            return self._planned_grasp_pose is not None and self._planned_approach_pose is not None
+        return self._planned_grasp_xyz is not None and self._planned_approach_xyz is not None
+
+    def _clear_frozen_target(self):
+        """얼린 타겟을 버린다 — 새 mission 진입 시 호출."""
+        self._planned_grasp_pose = None
+        self._planned_approach_pose = None
+        self._planned_grasp_xyz = None
+        self._planned_approach_xyz = None
+
     def _do_plan(self):
         """Freeze one detection and derive separate approach and grasp targets."""
         self._set_status(ARM_PLANNING)
+        if self.freeze_target_on_retry and self._has_frozen_target():
+            # 같은 mission 안의 재시도 — 팔이 시야에 들어와 오염됐을 수 있는 새 관측 대신
+            # 처음 얼린 타겟을 그대로 쓴다(파라미터 주석 참고).
+            self.get_logger().info('freeze_target_on_retry: 기존 타겟 재사용 (재인식 생략)')
+            self._transition(State.APPROACH)
+            return
         if self.ik_mode == 'moveit':
             self._planned_grasp_pose = self._grasp_pose_in_base()
             if self._planned_grasp_pose is None:
