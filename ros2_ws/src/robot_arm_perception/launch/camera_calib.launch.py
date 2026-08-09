@@ -76,12 +76,12 @@ def generate_launch_description():
             description='줄자로 잰 박스 위치, cm, base_link 기준. 예: "30,0,3; 35,15,3"'),
         # camera_tf.launch.py 의 현재 기본값에서 이어서 조정한다 — 두 파일을 항상
         # 같이 갱신할 것(여기서 맞춘 값을 그쪽 기본값으로 옮기는 게 이 도구의 출구다).
-        DeclareLaunchArgument('cam_x', default_value='-0.5526'),
-        DeclareLaunchArgument('cam_y', default_value='-0.4469'),
-        DeclareLaunchArgument('cam_z', default_value='0.1654'),
-        DeclareLaunchArgument('cam_roll', default_value='0.0267'),
-        DeclareLaunchArgument('cam_pitch', default_value='0.0210'),
-        DeclareLaunchArgument('cam_yaw', default_value='0.4718'),
+        DeclareLaunchArgument('cam_x', default_value='0.2022'),
+        DeclareLaunchArgument('cam_y', default_value='-0.6269'),
+        DeclareLaunchArgument('cam_z', default_value='0.1402'),
+        DeclareLaunchArgument('cam_roll', default_value='-0.0619'),
+        DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
+        DeclareLaunchArgument('cam_yaw', default_value='1.6265'),
         DeclareLaunchArgument(
             'perception', default_value='true',
             description='false 면 perception_node 를 안 띄운다(이미 따로 돌릴 때)'),
