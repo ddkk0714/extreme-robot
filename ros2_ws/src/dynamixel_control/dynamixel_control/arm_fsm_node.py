@@ -1121,6 +1121,11 @@ class ArmFsmNode(Node):
         lam = 0.01
         max_step = 0.4
 
+        # 마지막 해의 위치 잔차 [m] — 호출부가 로그에 실어 "수렴(ik_tol)" 과 "겨우 수용
+        # (ik_accept_tol)" 을 구분할 수 있게 한다. 이 둘은 3배 차이(1cm vs 3cm)인데
+        # 로그가 같으면 파지가 빗나갈 때 IK 를 의심할지 캘리브를 의심할지 못 가린다.
+        self._last_ik_residual = None
+
         p = self._fk_tip(q)
         if p is None:
             return None
@@ -1128,6 +1133,7 @@ class ArmFsmNode(Node):
         for _ in range(self.ik_max_iters):
             err = target - p
             if np.linalg.norm(err) < self.ik_tol:
+                self._last_ik_residual = float(np.linalg.norm(err))
                 return q.tolist()
             J = np.zeros((3, q.size))
             for i in range(q.size):
@@ -1146,7 +1152,9 @@ class ArmFsmNode(Node):
             if p is None:
                 return None
 
-        if np.linalg.norm(target - p) < self.ik_accept_tol:
+        residual = float(np.linalg.norm(target - p))
+        if residual < self.ik_accept_tol:
+            self._last_ik_residual = residual
             return q.tolist()
         return None
 
@@ -1158,8 +1166,19 @@ class ArmFsmNode(Node):
             self.get_logger().warn(f'analytic IK 실패 — 목표 도달 불가: {target_xyz}')
             return False
         self._publish_joint_trajectory(solution, q_current)
-        self.get_logger().info(
-            f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동')
+        residual = getattr(self, '_last_ik_residual', None)
+        # 잔차가 ik_tol 을 넘으면 "수렴 실패했지만 수용 범위" 라는 뜻 — 파지가 그만큼
+        # 빗나가므로 눈에 띄게 남긴다.
+        if residual is not None and residual >= self.ik_tol:
+            self.get_logger().warn(
+                f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동 '
+                f'(잔차 {residual * 100:.1f}cm — ik_tol {self.ik_tol * 100:.0f}cm 미수렴, '
+                f'ik_accept_tol {self.ik_accept_tol * 100:.0f}cm 로 수용)')
+        else:
+            self.get_logger().info(
+                f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동 '
+                f'(잔차 {residual * 100:.1f}cm)' if residual is not None
+                else f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동')
         return True
 
     def _begin_stow_move(self):
