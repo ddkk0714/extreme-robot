@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>로봇팔 관제 — 읽기 전용</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <strong>로봇팔 관제</strong>
+    <span class="badge badge-ro" title="이 모니터는 어떤 토픽도 발행하지 않습니다">읽기 전용</span>
+  </div>
+  <div class="topbar-right">
+    <span id="conn" class="chip chip-muted">연결 중…</span>
+    <span id="clients" class="chip chip-muted">접속 —</span>
+    <button id="theme-toggle" class="btn" type="button" title="라이트/다크 전환">◑</button>
+  </div>
+</header>
+
+<!-- HW 에러가 있을 때만 나타나는 전폭 배너. 색만으로 알리지 않는다(아이콘+라벨 동반). -->
+<div id="hw-banner" class="banner banner-critical" hidden></div>
+<div id="js-banner" class="banner banner-serious" hidden></div>
+
+<section class="strip" aria-label="상태 스트립">
+  <div class="strip-card">
+    <div class="strip-label">팔 상태 <span class="muted">/arm_status</span></div>
+    <div class="strip-value"><span id="arm-status">—</span>
+      <span id="arm-mission" class="muted"></span></div>
+    <div id="arm-age" class="strip-sub">—</div>
+    <div class="strip-note">
+      State 17종은 어떤 토픽으로도 나오지 않습니다.
+      <code>EXECUTING</code> 하나에 APPROACH·DESCEND·GRASP·LIFT 가 뭉쳐 있습니다.
+    </div>
+  </div>
+
+  <div class="strip-card">
+    <div class="strip-label">섀시 <span class="muted">/chassis_mode</span></div>
+    <div class="strip-value"><span id="chassis-mode">—</span></div>
+    <div id="chassis-gate" class="strip-sub">—</div>
+    <div id="drive-ready" class="strip-sub">—</div>
+  </div>
+
+  <div class="strip-card">
+    <div class="strip-label">드라이버</div>
+    <div class="strip-value"><span id="js-domain">—</span></div>
+    <div id="js-domain-note" class="strip-sub">—</div>
+    <div id="ctrl-fault" class="strip-sub">—</div>
+  </div>
+
+  <div class="strip-card strip-card-wide">
+    <div class="strip-label">토픽 신선도</div>
+    <div id="topic-dots" class="dots"></div>
+  </div>
+</section>
+
+<main class="grid">
+
+  <!-- A. 모터 ------------------------------------------------------------ -->
+  <section class="panel panel-wide" aria-labelledby="h-motors">
+    <div class="panel-head">
+      <h2 id="h-motors">서보</h2>
+      <span id="motor-thresholds" class="muted small"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="tbl" id="motor-table">
+        <caption class="sr-only">모터별 위치·속도·전류·급변 여유·온도</caption>
+        <thead>
+          <tr>
+            <th scope="col">ID</th><th scope="col">관절</th>
+            <th scope="col" class="num">위치</th>
+            <th scope="col" class="num">목표오차</th>
+            <th scope="col" class="num">속도</th>
+            <th scope="col">전류 / 트립</th>
+            <th scope="col">급변 여유</th>
+            <th scope="col">온도</th>
+            <th scope="col">전류 60초</th>
+          </tr>
+        </thead>
+        <tbody id="motor-rows"><tr><td colspan="9" class="muted">수신 대기…</td></tr></tbody>
+      </table>
+    </div>
+    <p class="footnote">
+      전류 raw 1 LSB ≈ 2.69 mA. 온도는 라운드로빈 2 Hz 라 모터별 갱신이 느리고,
+      <strong>0 은 “0 °C”가 아니라 아직 폴링이 안 닿았다는 뜻</strong>이라 <code>—</code> 로 표시합니다.
+    </p>
+  </section>
+
+  <!-- C. 비전 ------------------------------------------------------------ -->
+  <section class="panel" aria-labelledby="h-vision">
+    <div class="panel-head">
+      <h2 id="h-vision">비전</h2>
+      <label class="inline">
+        <span class="muted small">소스</span>
+        <select id="video-source" class="btn">
+          <option value="off">끔</option>
+          <option value="raw">raw — 원본 (인식 노드 부하 없음)</option>
+          <option value="debug">debug — 마스크·거리 오버레이 (부하 있음)</option>
+        </select>
+      </label>
+    </div>
+    <div class="video-wrap">
+      <img id="video" alt="영상 스트림" hidden>
+      <canvas id="video-overlay" hidden></canvas>
+      <div id="video-off" class="video-off">
+        영상 꺼짐.
+        <strong>raw</strong> 는 인식 노드가 어차피 항상 발행하는 원본이라 켜도 그쪽 부하가 늘지 않습니다
+        (검출 박스는 이 화면이 대신 그립니다).
+        <strong>debug</strong> 는 켜는 동안에만 인식 노드가 마스크·거리 오버레이를 그립니다.
+      </div>
+    </div>
+    <div id="detect-meta" class="muted small">—</div>
+    <ul id="detections" class="detlist"></ul>
+  </section>
+
+  <!-- B. 관절 ------------------------------------------------------------ -->
+  <section class="panel" aria-labelledby="h-joints">
+    <div class="panel-head"><h2 id="h-joints">관절</h2>
+      <span id="joint-domain" class="muted small"></span></div>
+    <div class="table-wrap">
+      <table class="tbl">
+        <thead><tr>
+          <th scope="col">이름</th><th scope="col" class="num">위치</th>
+          <th scope="col" class="num">속도</th><th scope="col" class="num">effort</th>
+        </tr></thead>
+        <tbody id="joint-rows"><tr><td colspan="4" class="muted">수신 대기…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="limit-note" class="footnote"></div>
+  </section>
+
+  <!-- D. 텔레옵 ---------------------------------------------------------- -->
+  <section class="panel" aria-labelledby="h-teleop">
+    <div class="panel-head"><h2 id="h-teleop">원격조종</h2></div>
+    <dl class="kv" id="teleop-kv"></dl>
+    <div class="unobservable">
+      <div class="unobservable-head">⚠ 관측 불가 — 이 화면으로 알 수 없는 것</div>
+      <ul id="unobservable-list"></ul>
+    </div>
+  </section>
+
+  <!-- E. 이벤트 ---------------------------------------------------------- -->
+  <section class="panel panel-wide" aria-labelledby="h-events">
+    <div class="panel-head"><h2 id="h-events">이벤트 · 트립 블랙박스</h2>
+      <a class="btn" id="dl-events" download="events.jsonl">이벤트 내려받기</a></div>
+    <ol id="events" class="events"></ol>
+  </section>
+
+  <!-- Jetson ------------------------------------------------------------- -->
+  <section class="panel" aria-labelledby="h-system">
+    <div class="panel-head"><h2 id="h-system">Jetson</h2></div>
+    <dl class="kv" id="system-kv"></dl>
+    <p class="footnote">
+      서멀 스로틀링은 현장에서 인식 FPS 가 떨어지는 가장 흔한 원인인데
+      지금까지 어디에도 표시되지 않았습니다.
+    </p>
+  </section>
+
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

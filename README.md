@@ -115,8 +115,11 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 | 패키지 | 역할 |
 | ------ | ---- |
 | **dynamixel_control** | 핵심 런타임. `yolo_detection`(카메라+YOLO) → `yolo_bridge`(P제어) → `position_node`(XL430 서보 구동) 3노드 파이프라인 |
-| **robot_arm_description** | 로봇팔 URDF(6축 + 그리퍼), `display.launch.py`(RViz 시각화) |
+| **robot_arm_description** | 로봇팔 URDF(**5축** + 랙피니언 그리퍼 + 손목 카메라), `display.launch.py`(RViz 시각화) |
 | **robot_arm_moveit_config** | MoveIt 경로계획 설정(SRDF/IK/컨트롤러), `demo.launch.py` |
+| **robot_arm_perception** | RealSense + YOLO markerless 인식(`perception_node`), SRT 스트리밍, RViz 캘리브 도구 |
+| **robot_arm_msgs** | 파워트레인 팀과 공유하는 커스텀 메시지 5개 |
+| **robot_arm_gui** | 브라우저 관제 GUI(읽기 전용). 서보 진단·FSM/계약 상태·YOLO 인식·텔레옵 현황 — §4-4 |
 | **pick_test_pkg** | 그리퍼 단독 테스트 노드(`pick_test_node`) |
 
 > 각 패키지·노드의 상세 구조는 [`CLAUDE.md`](CLAUDE.md) 참고.
@@ -227,7 +230,53 @@ ros2 topic pub -r 20 /joy sensor_msgs/msg/Joy \
 
 L1(`buttons[4]`)을 `0`으로 바꾸면 팔이 즉시 멈춥니다.
 
-### 4-4. YOLO 카메라-Dynamixel 추적 파이프라인
+### 4-4. 관제 GUI (브라우저, 읽기 전용)
+
+서보 전류·온도, 관절 상태, FSM/파워트레인 계약 상태, YOLO 인식 결과와 영상, 원격조종 현황을
+**브라우저 한 페이지**에서 봅니다. 새로 설치할 것은 없습니다(파이썬 표준 라이브러리만 씁니다).
+
+```bash
+# 컨테이너 안에서
+cd /root/ros2_ws
+bash src/robot_arm_gui/scripts/run_monitor.sh
+
+# 하드웨어가 없어도 화면 전체를 확인할 수 있습니다 (가짜 토픽 발행)
+bash src/robot_arm_gui/scripts/run_monitor.sh fake:=true
+
+# 포트를 바꾸려면
+bash src/robot_arm_gui/scripts/run_monitor.sh port:=8089
+```
+
+기본은 `127.0.0.1:8088` 입니다. **원격 PC에서 보려면 SSH 포트포워딩을 권장**합니다:
+
+```bash
+# 노트북에서
+ssh -L 8088:localhost:8088 <jetson-주소>
+# 그 다음 브라우저에서 http://localhost:8088
+```
+
+현장 Wi-Fi의 아무 기기(폰 포함)에서 바로 보고 싶으면 `bind:=0.0.0.0` 을 주세요.
+⚠️ `network_mode: host` 라 포트가 그대로 열립니다.
+
+| 화면 | 내용 |
+| --- | --- |
+| 상태 스트립 | `/arm_status` + 신선도(0.5초 넘으면 파워트레인이 차를 세웁니다), 섀시 모드와 **작업 허가/잠금**, 차 주행 가능 여부, 어느 드라이버가 떠 있는지 |
+| 서보 | 모터별 위치·목표오차·속도 + **전류/트립 여유**, **급변 트립 여유**, 온도 미터 + 60초 스파크라인 |
+| 비전 | 영상(MJPEG) + 검출 목록(클래스·확신도·3D 위치·깊이 유무) + `/pick_target` 강조 |
+| 원격조종 | 어느 프론트엔드가 붙었는지, jog 활성, `/joy` 신선도, 데드맨 눌림 |
+| 이벤트 | 상태 전이·HW 에러·명령 로그 + **트립 블랙박스** 내려받기 |
+| Jetson | CPU·메모리·온도(서멀 스로틀링 확인) |
+
+> **영상 소스 두 가지의 비용이 다릅니다.**
+> `raw`(원본)는 인식 노드가 어차피 항상 발행하므로 켜도 그쪽 일이 **늘지 않습니다** — 검출 박스는 이 화면이 대신 그립니다.
+> `debug`(마스크·거리 오버레이)는 **구독자가 있는 동안에만** 인식 노드가 그리므로 Jetson 부하가 생깁니다.
+> 평소엔 `raw`, 마스크나 거리 표시가 필요할 때만 `debug` 를 쓰세요. 기본은 꺼짐입니다.
+
+> **읽기 전용입니다.** 이 모니터는 어떤 토픽도 발행하지 않습니다 — 화면에서 팔을 움직이거나
+> 에러를 해제할 수 없습니다. 관측할 수 없는 항목(E-stop 래치, teleop stop 여부, 입력 전압 등)은
+> 화면에 "관측 불가"로 이유와 함께 표시됩니다.
+
+### 4-5. YOLO 카메라-Dynamixel 추적 파이프라인
 
 USB 카메라로 스마트폰을 감지하고 Dynamixel 모터가 카메라를 추적하는 파이프라인입니다.
 
