@@ -32,6 +32,7 @@ setup(
             'camera_tf_tuner = robot_arm_perception.camera_tf_tuner:main',
             'ground_truth_markers = robot_arm_perception.ground_truth_markers:main',
             'depth_method_compare = robot_arm_perception.depth_method_compare:main',
+            'mask_pca_explain = robot_arm_perception.mask_pca_explain:main',
         ],
     },
 )
