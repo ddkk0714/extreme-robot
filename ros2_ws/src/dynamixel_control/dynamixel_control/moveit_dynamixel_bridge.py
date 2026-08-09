@@ -91,16 +91,32 @@ DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Pr
 # **검증된 적 없는 가정**이었고, 실제로 축마다 최대 1100 tick(≈97°) 어긋나 있었다.
 # 기어비와 마찬가지로 영점이 틀리면 IK 결과가 통째로 그만큼 어긋난다.
 # ⚠️ 팔을 분해·재조립하거나 서보를 뿔에서 뺐다 끼우면 이 값은 무효다 — 다시 측정할 것.
+#
+# 🔁 **2026-08-09 재측정.** `extended` 축(arm_joint_2/3)의 다회전 카운트는 전원을 내리면
+#    초기화되므로, 한 바퀴(4096) 밖의 center 는 그걸 잰 전원 세션 안에서만 유효하다.
+#    실제로 arm_joint_3 의 구 center=4281 은 전원 사이클 후 관절각을 -1.58 rad 로
+#    읽게 만들었다(안전범위는 0~2.034) — 그대로 구동하면 틀린 기준점 위에서 +90°
+#    스윙한다. 아래 값은 그래서 다시 잰 것이다.
+#      교차검증: 순수 카운트 초기화라면 새 center 는 4281-4096=185 여야 하는데 278 이
+#      나왔다(관절 2.0° 차) — 즉 -87° 편차는 전부 카운트 초기화分이고 자세 재현
+#      오차는 2° 수준이었다는 뜻.
+#
+# ⚠️ **직결(1:1) 축인 arm_joint_4/5 는 신뢰도가 한 단계 낮다.** 감속기 축(9:1, 4:1)은
+#    역구동이 안 돼 손으로 세운 자세가 그대로 유지되지만, 직결 축은 토크를 끄면
+#    중력으로 흘러내린다(arm_joint_4 는 손을 떼면 늘 같은 자리로 처지고, arm_joint_5 는
+#    붙잡고 있어도 +1.5°/s 로 미끄러졌다). 2026-08-07 캘리브 대비 편차도 감속기 축은
+#    1.7~2.0° 인데 이 두 축은 6.0°/7.5° 다. 파지가 손목 기울기 방향으로 어긋나면
+#    기어비보다 먼저 여기를 의심할 것.
 JOINT_CONFIG = {
     # 2026-08-07 실측: 9.034:1 (관절 90° 회전 기준)
-    "arm_joint_2": {"id": 14, "center": 1627, "direction": -1,
+    "arm_joint_2": {"id": 14, "center": 1448, "direction": -1,
                     "gear_ratio": 9.034, "extended": True},
     # 2026-08-07 실측: 4.040:1 — arm_joint_2 와 다른 감속기다(오타 아님)
-    "arm_joint_3": {"id": 13, "center": 4281, "direction": 1,
+    "arm_joint_3": {"id": 13, "center": 278, "direction": 1,
                     "gear_ratio": 4.040, "extended": True},
-    "arm_joint_4": {"id": 12, "center": 2563, "direction": 1,
+    "arm_joint_4": {"id": 12, "center": 2495, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
-    "arm_joint_5": {"id": 16, "center": 949, "direction": 1,
+    "arm_joint_5": {"id": 16, "center": 1034, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
 }
 ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
