@@ -16,6 +16,13 @@ from dynamixel_control import joint_limits
 
 
 ADDR_TORQUE_ENABLE = 64
+# Goal PWM (RAM) — 서보가 낼 수 있는 토크 상한. 그리퍼 과전류 트립 방지용.
+# XL430 은 전류 제어(모드 5 / Goal Current)가 없어 이게 유일한 힘 제한 수단이다.
+ADDR_GOAL_PWM = 100
+# EEPROM 영역 — **토크 OFF 상태에서만 써진다.**
+ADDR_OPERATING_MODE = 11
+MODE_POSITION = 3           # 단일회전 0~4095
+MODE_EXTENDED_POSITION = 4  # 다회전, tick 이 범위를 넘고 음수도 된다
 ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_GOAL_POSITION = 116
 ADDR_PRESENT_LOAD = 126
@@ -195,6 +202,8 @@ class MoveItDynamixelBridge(Node):
         # 다회전 그리퍼 여부. preset 에 없으면 단일회전으로 본다(보수적 — 다회전을
         # 잘못 켜면 tick 이 wrap 없이 계속 나가 랙 끝단을 밀어붙인다).
         self.declare_parameter("gripper_extended", bool(preset.get("extended", False)))
+        # 0 이면 쓰지 않는다(서보 기본 885=100% 유지). preset 주석에 값 근거 있음.
+        self.declare_parameter("gripper_goal_pwm", int(preset.get("gripper_goal_pwm", 0)))
         self.declare_parameter("read_only", False)
         self.declare_parameter("gripper_only_mode", False)
 
@@ -205,6 +214,7 @@ class MoveItDynamixelBridge(Node):
         self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
         self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
         self.gripper_extended = bool(self.get_parameter("gripper_extended").value)
+        self.gripper_goal_pwm = int(self.get_parameter("gripper_goal_pwm").value)
         self.read_only = bool(self.get_parameter("read_only").value)
         self.gripper_only_mode = bool(
             self.get_parameter("gripper_only_mode").value)
@@ -315,14 +325,17 @@ class MoveItDynamixelBridge(Node):
         else:
             # 팔 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for joint_name, config in JOINT_CONFIG.items():
-                if self._enable_torque(config["id"], joint_name):
+                if self._enable_torque(config["id"], joint_name, config["extended"]):
                     self.group_sync_read.addParam(config["id"])
                     self.active_ids.add(config["id"])
                     self.torque_enabled_ids.add(config["id"])
 
             # 그리퍼 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for gid in self.gripper_ids:
-                if self._enable_torque(gid, f"gripper(id {gid})"):
+                if self._enable_torque(gid, f"gripper(id {gid})", self.gripper_extended):
+                    # Operating Mode 변경이 일부 RAM 값을 초기화하므로 모드·토크가 확정된
+                    # **뒤에** 쓴다.
+                    self._write_gripper_goal_pwm(gid)
                     self.group_sync_read.addParam(gid)
                     self.active_ids.add(gid)
                     self.torque_enabled_ids.add(gid)
@@ -405,7 +418,75 @@ class MoveItDynamixelBridge(Node):
                     f"result={result}, error={error} — 과전류 토크 트립 위험"
                 )
 
-    def _enable_torque(self, dxl_id, label):
+    def _write_gripper_goal_pwm(self, dxl_id):
+        """그리퍼 토크 상한(Goal PWM) 설정 — 파지 중 Overload 트립 방지.
+
+        물체를 문 채 목표에 도달 못 하면 서보는 무한정 밀어붙이다 Overload 로 토크가
+        끊긴다(2026-08-09 실기). 여기서 상한을 걸면 그 힘에서 멈춰 계속 물고 있는다.
+        값 근거와 조정 방향은 `gripper_presets.py` 의 `gripper_goal_pwm` 주석 참고.
+        """
+        if self.gripper_goal_pwm <= 0:
+            return
+        result, error = self.packet_handler.write2ByteTxRx(
+            self.port_handler, dxl_id, ADDR_GOAL_PWM, self.gripper_goal_pwm)
+        if result != 0 or error != 0:
+            self.get_logger().warn(
+                f"Goal PWM 쓰기 실패: id={dxl_id}, result={result}, error={error} — "
+                "토크 상한이 안 걸려 파지 중 Overload 트립 가능")
+        else:
+            self.get_logger().info(
+                f"Goal PWM 설정: id={dxl_id} -> {self.gripper_goal_pwm} "
+                f"(최대 885, 파지 토크 상한)")
+
+    def _ensure_operating_mode(self, dxl_id, label, extended):
+        """Operating Mode 를 이 축이 요구하는 값으로 맞춘다 (토크 인가 **전에** 호출).
+
+        ⚠️ 2026-08-09 실기: 그리퍼(id 3)가 **Velocity 모드(1)** 로 남아 있어 파지가 계속
+           실패했다. Velocity 모드에서는 Goal Position(116) 이 **통째로 무시된다** — 브릿지가
+           tick 을 써넣는 것도 성공하고(레지스터에 -401 이 그대로 들어가 있었다), 토크도
+           켜져 있고, Hardware Error 도 0 인데, 서보는 Goal Velocity(=0) 만 따르므로
+           **한 tick 도 움직이지 않는다.** 에러가 아무데도 안 나서 원인을 찾기 어렵다.
+
+           증상: 그리퍼 position 이 세션 내내 고정값, effort 가 정확히 0.0(빈손이어도
+           62~119 는 나와야 한다), FSM 은 `grasp effort 0.0 below threshold` 로 실패.
+
+        그 전까지 이 브릿지는 모드를 **한 번도 쓰지 않고** 다른 도구(레거시
+        `dynamixel_position_node`, `gripper_calibration` 등)가 남긴 값을 그대로 물려받았다.
+        그래서 그 도구들을 돌린 뒤 모드가 바뀌어 있으면 조용히 깨졌다.
+        """
+        desired = MODE_EXTENDED_POSITION if extended else MODE_POSITION
+        current, result, error = self.packet_handler.read1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+        if result != 0:
+            self.get_logger().warn(
+                f"Operating Mode 조회 실패: {label}, id={dxl_id}, result={result}")
+            return False
+        if current == desired:
+            return True
+
+        # 주소 11 은 EEPROM 이라 토크가 걸린 채로는 안 써진다 — 반드시 먼저 끈다.
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        result, error = self.packet_handler.write1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_OPERATING_MODE, desired)
+        readback, _, _ = self.packet_handler.read1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+        if result != 0 or readback != desired:
+            self.get_logger().error(
+                f"Operating Mode 설정 실패: {label}, id={dxl_id}, "
+                f"{current} → {desired} 시도했으나 현재 {readback} "
+                f"(result={result}, error={error}) — 이 축은 명령이 무시된다")
+            return False
+        self.get_logger().warn(
+            f"Operating Mode 교정: {label}, id={dxl_id}, {current} → {desired} "
+            f"({'extended position' if extended else 'position'}). "
+            "다른 도구가 모드를 바꿔놓은 상태였다.")
+        return True
+
+    def _enable_torque(self, dxl_id, label, extended=False):
+        # 모드가 틀리면 Goal Position 이 무시되므로 토크보다 먼저 맞춘다(EEPROM = 토크 OFF 필요).
+        if not self._ensure_operating_mode(dxl_id, label, extended):
+            return False
         # 토크 인가 전에 모션 프로파일부터 넣는다(급가속 트립 방지).
         self._write_motion_profile(dxl_id, label)
         result, error = self.packet_handler.write1ByteTxRx(
