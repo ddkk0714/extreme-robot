@@ -37,7 +37,6 @@ rad 끝단(`gripper_open_rad`=1.9444 / `gripper_close_rad`=0.0)은 URDF 가 정�
 그대로 쓸 수 있다 — `gripper_calibration.py`(포트 직접 오픈, 2모터 전제)와 다른 점이다.
 """
 import argparse
-import math
 import os
 import select
 import sys

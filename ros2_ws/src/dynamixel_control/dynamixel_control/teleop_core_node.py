@@ -206,19 +206,18 @@ EXTENDED_POSITION_NAMES = {"arm_joint_2", "arm_joint_3", "gripper_left_pinion_jo
 # 다시 2모터 동시구동을 시도한다면 마스터-팔로워 방식(하나는 위치제어, 하나는
 # 그 위치를 실측 추종하는 토크/전류 제어)처럼 서로 안 겨루는 구조가 필요하다.
 DEFAULT_JOINT_NAMES = [
-    "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
-    "gripper_left_pinion_joint",
+    "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
 ]
 
 # 실기 버스 스캔값 (2026-08-01, 사용자 재확인). arm_joint_1(ID 11)은 현재 미연결.
 # 그리퍼는 ID 3 하나만 구동(위 주석 참고, ID 4는 미등록 → 자유회전).
-DEFAULT_MOTOR_IDS = [11, 14, 13, 12, 16, 3]
-DEFAULT_CENTERS = [2048] * 6
+DEFAULT_MOTOR_IDS = [14, 13, 12, 16]
+DEFAULT_CENTERS = [1627, 4281, 2563, 949]
 # arm_joint_2 는 2026-08-01 사용자 요청으로 방향 반전(-1). direction 은 tick 변환
 # (_rad_to_tick)에만 쓰이던 값이라, 읽기 쪽(on_joint_states/_publish_sim_joint_states)도
 # 같은 direction 을 곱해 goal_rad 와 같은 '명령 도메인'으로 맞춰줬다 — 안 그러면
 # stop/자세 저장·이동이 center(2048) 밖에서 순간적으로 튄다.
-DEFAULT_DIRECTIONS = [1, -1, 1, 1, 1, 1]
+DEFAULT_DIRECTIONS = [-1, 1, 1, 1]
 
 # 소프트리밋 기본 OFF — 모터가 아직 본체에 장착되지 않았다(통신 파이프라인 점검용).
 # 장착 후에는 URDF(robot_arm.urdf)의 관절 리밋에 맞춰 반드시 다시 켤 것.
@@ -235,9 +234,9 @@ DEFAULT_DIRECTIONS = [1, -1, 1, 1, 1, 1]
 # CALIB_SANE_RAD_LIMIT_EXTENDED 로 재검증을 통과해 반영했다(같은 세션에 함께
 # 측정된 arm_joint_5 는 폭 0(하한/상한을 실제로 안 움직임)이라 여전히 반영 안 함
 # — CALIB_MIN_RANGE_RAD 주석 참고).
-DEFAULT_LIMIT_ENABLED = [False, True, True, True, False, False]
-DEFAULT_MIN_RADS = [-math.pi, 2.195127, -2.055534, -0.613592, -math.pi, -math.pi]
-DEFAULT_MAX_RADS = [math.pi, 9.199283, 7.666836, 0.828350, math.pi, math.pi]
+DEFAULT_LIMIT_ENABLED = [True, True, True, False]
+DEFAULT_MIN_RADS = [2.195127, -2.055534, -0.613592, -math.pi]
+DEFAULT_MAX_RADS = [9.199283, 7.666836, 0.828350, math.pi]
 
 # 팔 관절(arm_joint_1..5) 전부 "켰을 때 각도보다 아래(키보드 ↓/s 방향)로 안 가게"
 # 처리한다 — 처음엔 arm_joint_2/3만 예외 처리했다가(2026-08-02), 사용자 요청으로
@@ -261,7 +260,7 @@ DEFAULT_MAX_RADS = [math.pi, 9.199283, 7.666836, 0.828350, math.pi, math.pi]
 # 실행되면 하한이 boot 값으로 덮어써져 실측 하한을 잃는다 — __init__ 의
 # floor_from_boot_names 처리 참고).
 # joint_names 파라미터와 병렬 배열.
-DEFAULT_FLOOR_FROM_BOOT = [True, False, False, False, True, False]
+DEFAULT_FLOOR_FROM_BOOT = [False, False, False, True]
 
 # 리미트 측정 모드(calib_*) 결과 안전성 검사 (2026-08-02 추가, 같은 날 기어비
 # 확인으로 갱신) — 실사용 중 arm_joint_2/3 가 ±π 를 훨씬 넘는 값(예: 9.2rad)으로,

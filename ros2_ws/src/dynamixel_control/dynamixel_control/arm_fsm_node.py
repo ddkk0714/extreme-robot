@@ -101,6 +101,7 @@
 """
 from copy import deepcopy
 from enum import Enum, auto
+import random
 
 import numpy as np
 
@@ -121,6 +122,7 @@ from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import FollowJointTrajectory
+from robot_arm_msgs.action import ArmTestMove, EndEffectorRotate
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (MotionPlanRequest, Constraints, PositionConstraint,
                              OrientationConstraint, BoundingVolume, RobotState)
@@ -168,6 +170,8 @@ STAMP_FUTURE_TOL = 0.5
 
 # moveit_msgs/MoveItErrorCodes.SUCCESS
 MOVEIT_SUCCESS = 1
+MISSION_PICK_PLACE = "PICK_PLACE"
+MISSION_ROTARY_TOOL = "ROTARY_TOOL"
 
 
 class State(Enum):
@@ -176,11 +180,15 @@ class State(Enum):
     PLAN = auto()
     APPROACH = auto()
     DESCEND = auto()
+    DESCEND_STOPPED = auto()
     GRASP = auto()
     GRASP_CHECK = auto()
     LIFT = auto()
     CARRY = auto()
     RELEASE = auto()
+    ARM_TEST_MOVE = auto()
+    RANDOM_ARM_DEMO = auto()
+    END_EFFECTOR_ROTATE = auto()
     DONE = auto()
     FAILED = auto()
     # Supervisor/safety states retained from the existing drivetrain contract.
@@ -196,7 +204,8 @@ class State(Enum):
 # 불필요 — 계약 v2 하트비트를 CARRY 자체 루프가 계속 발행해야 하므로 굳이 LOCKED로 빼지 않음.
 PREEMPTIBLE_STATES = (
     State.PERCEIVE, State.PLAN, State.APPROACH, State.DESCEND,
-    State.GRASP, State.GRASP_CHECK, State.LIFT,
+    State.GRASP, State.GRASP_CHECK, State.LIFT, State.ARM_TEST_MOVE,
+    State.RANDOM_ARM_DEMO, State.END_EFFECTOR_ROTATE,
 )
 
 # STOW_REQUEST(운영자 포기·재정렬 유도)로 즉시 RELEASE(or LOWER_RELEASE)→STOWING 강제
@@ -255,12 +264,18 @@ class ArmFsmNode(Node):
         # 🔧 근본 해결은 따로다: 재인식 전에 팔을 시야 밖(관측 자세)으로 물린 뒤 보는 것.
         #    그게 들어가기 전까지는 이 플래그가 실용적인 우회다.
         self.declare_parameter('freeze_target_on_retry', False)
+        self.declare_parameter('gripper_change_mode', False)
+        self.declare_parameter('gripper_disabled', False)
+        self.declare_parameter('stop_after_descend', False)
         self.declare_parameter('arm_move_speed', 0.5)   # [rad/s] 직접명령 시 소요시간 추정용
         # 그리퍼 — gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
         # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
-        self.declare_parameter('gripper_type', DEFAULT_GRIPPER)
-        gripper_type = self.get_parameter('gripper_type').value
+        self.declare_parameter('end_effector_preset', DEFAULT_GRIPPER)
+        gripper_type = self.get_parameter('end_effector_preset').value
         gpreset = get_preset(gripper_type, self.get_logger())
+        self.declare_parameter('mission_type', gpreset['allowed_mission'])
+        mission_type = str(self.get_parameter('mission_type').value)
+        self.validate_mission_preset(mission_type, gpreset)
 
         self.declare_parameter('gripper_joints', gpreset['gripper_joints'])
         self.declare_parameter('gripper_open', gpreset['gripper_open_rad'])
@@ -275,6 +290,18 @@ class ArmFsmNode(Node):
         # CARRY 중 DROP 감지 시 REGRASP↔PERCEIVE 루프 대신 GRIP_LOST 완전 래치로 대체함
         # (자동 재시도 없음, 새 MISSION_STOP+ArrivalStatus conjunction으로만 재개).
         self.declare_parameter('gripper_action_time', gpreset['gripper_action_time'])  # [s]
+        self.declare_parameter('rotary_relative', True)
+        self.declare_parameter('rotary_ticks', 0)
+        self.declare_parameter(
+            'rotary_max_abs_current', gpreset['max_abs_current'])
+        self.declare_parameter('rotary_timeout', gpreset['motion_timeout'])
+        self.declare_parameter('integrated_test_mode', False)
+        self.declare_parameter('random_demo_enabled', False)
+        self.declare_parameter('random_seed', 42)
+        self.declare_parameter('random_pose_count', 3)
+        self.declare_parameter('arm_test_max_abs_current', 300)
+        self.declare_parameter('arm_test_stall_timeout', 2.0)
+        self.declare_parameter('arm_test_step_timeout', 8.0)
         self.declare_parameter('tick_rate', 10.0)
         # chassis_mode 수신 끊김 워치독 — §5.1 "수신 끊김 = default-deny(잠금 유지)"
         self.declare_parameter('chassis_mode_timeout', 1.0)      # [s]
@@ -333,14 +360,38 @@ class ArmFsmNode(Node):
         self.ik_tol = g('ik_tol').value
         self.ik_accept_tol = g('ik_accept_tol').value
         self.freeze_target_on_retry = bool(g('freeze_target_on_retry').value)
+        self.gripper_change_mode = bool(g('gripper_change_mode').value)
+        self.gripper_disabled = (
+            self.gripper_change_mode or bool(g('gripper_disabled').value))
+        self.stop_after_descend = (
+            self.gripper_change_mode or bool(g('stop_after_descend').value))
         self.arm_move_speed = g('arm_move_speed').value
         self.gripper_type = gripper_type
+        self.end_effector_kind = gpreset['kind']
+        self.mission_type = mission_type
         self.gripper_joints = list(g('gripper_joints').value)
         self.gripper_open = g('gripper_open').value
         self.gripper_close = g('gripper_close').value
         self.grasp_thresh = g('grasp_effort_thresh').value
         self.drop_thresh = g('drop_effort_thresh').value
         self.gripper_action_time = g('gripper_action_time').value
+        self.rotary_relative = bool(g('rotary_relative').value)
+        self.rotary_ticks = int(g('rotary_ticks').value)
+        self.rotary_max_abs_current = int(
+            g('rotary_max_abs_current').value)
+        self.rotary_timeout = float(g('rotary_timeout').value)
+        self.integrated_test_mode = bool(g('integrated_test_mode').value)
+        self.random_demo_enabled = bool(g('random_demo_enabled').value)
+        self.random_seed = int(g('random_seed').value)
+        self.random_pose_count = int(g('random_pose_count').value)
+        if self.random_pose_count <= 0:
+            raise RuntimeError('random_pose_count must be positive')
+        self.arm_test_max_abs_current = int(
+            g('arm_test_max_abs_current').value)
+        self.arm_test_stall_timeout = float(
+            g('arm_test_stall_timeout').value)
+        self.arm_test_step_timeout = float(
+            g('arm_test_step_timeout').value)
         self.chassis_mode_timeout = g('chassis_mode_timeout').value
         self.locked_pos_tol = g('locked_pos_tol').value
         self.locked_vel_tol = g('locked_vel_tol').value
@@ -361,15 +412,19 @@ class ArmFsmNode(Node):
         # QoS 는 계약(contract.py/qos_profiles.py) 기준. heartbeat 계열을 depth 10 으로
         # 두면 낡은 샘플이 큐에 쌓여 파워트레인의 age(신선도) 판정이 어긋난다.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(DetectedObject, '/pick_target', self._on_pick_target, latched)
-        self.create_subscription(ArrivalStatus, '/arrival_status', self._on_arrival, ARRIVAL_QOS)
-        self.create_subscription(ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
+        self.create_subscription(
+            DetectedObject, '/pick_target', self._on_pick_target, latched)
+        self.create_subscription(
+            ArrivalStatus, '/arrival_status', self._on_arrival, ARRIVAL_QOS)
+        self.create_subscription(
+            ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" —
         # moveit_dynamixel_bridge가 Hardware Error Status를 집계해 발행(내부용 토픽,
         # 파워트레인 DDS 경계를 넘지 않음). _is_settled()에서 게이트로 사용.
-        self.create_subscription(Bool, '/dynamixel/controller_fault',
-                                  self._on_controller_fault, 10)
+        self.create_subscription(
+            Bool, '/dynamixel/controller_fault',
+            self._on_controller_fault, 10)
 
         self.pub_status = self.create_publisher(ArmStatus, '/arm_status', HEARTBEAT_QOS)
 
@@ -377,9 +432,14 @@ class ArmFsmNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self._move = ActionClient(self, MoveGroup, 'move_action')          # MoveIt (ik_mode=='moveit')
+        # MoveIt path (ik_mode == 'moveit').
+        self._move = ActionClient(self, MoveGroup, 'move_action')
         self._grip = ActionClient(self, FollowJointTrajectory,
                                   '/gripper_controller/follow_joint_trajectory')
+        self._rotate = ActionClient(
+            self, EndEffectorRotate, '/end_effector/rotate')
+        self._arm_test = ActionClient(
+            self, ArmTestMove, '/arm/test_move')
 
         # analytic IK 경로 (ik_mode=='analytic', 기본): FK 서비스 + 직접 관절궤적 publish
         # ⚠️ FK 호출은 _tick(타이머 콜백) 안에서 블로킹 대기함 — self 를 spin하면 이미
@@ -430,6 +490,18 @@ class ArmFsmNode(Node):
         self._motion_ok = False
         self._arm_goal_handle = None
         self._grip_sent = False            # 상태 진입 시 _transition에서 리셋
+        self._rotate_sent = False
+        self._rotate_state = 'idle'
+        self._rotate_ok = False
+        self._rotate_goal_handle = None
+        self._arm_test_sent = False
+        self._arm_test_state = 'idle'
+        self._arm_test_ok = False
+        self._arm_test_goal_handle = None
+        self._random_pose_index = 0
+        self._random_previous_offsets = [0, 0, 0, 0]
+        self._random_poses = self.generate_random_poses(
+            self.random_seed, self.random_pose_count)
         self._stow_move_sent = False       # 상태 진입 시 _transition에서 리셋
 
         # ── heartbeat ─────────────────────────────
@@ -460,7 +532,8 @@ class ArmFsmNode(Node):
         self.create_timer(period, self._tick, callback_group=self._tick_group)
         self.get_logger().info(
             f'arm_fsm_node started (MoveIt 경로, state=STOWED_LOCKED, '
-            f'gripper_type={self.gripper_type}, '
+            f'end_effector_preset={self.gripper_type}, '
+            f'mission_type={self.mission_type}, '
             f'heartbeat={HEARTBEAT_RATE_HZ}Hz)'
         )
 
@@ -468,6 +541,31 @@ class ArmFsmNode(Node):
 
     def _on_pick_target(self, msg):
         self.pick_target = msg
+
+    @staticmethod
+    def validate_mission_preset(mission_type, preset):
+        """Reject mismatched mission/end-effector combinations at startup."""
+        allowed = preset['allowed_mission']
+        if mission_type not in (MISSION_PICK_PLACE, MISSION_ROTARY_TOOL):
+            raise RuntimeError(f"unknown mission_type {mission_type!r}")
+        if mission_type != allowed:
+            raise RuntimeError(
+                f"mission_type {mission_type} is incompatible with "
+                f"end-effector kind {preset['kind']} (requires {allowed})")
+
+    @staticmethod
+    def generate_random_poses(seed, count):
+        """Generate deterministic nonzero offsets inside temporary limits."""
+        limits = (20, 40, 40, 80)
+        generator = random.Random(seed)
+        poses = []
+        for _ in range(count):
+            pose = []
+            for limit in limits:
+                magnitude = generator.randint(5, limit)
+                pose.append(magnitude if generator.randrange(2) else -magnitude)
+            poses.append(pose)
+        return poses
 
     def _on_arrival(self, msg):
         if not self._stamp_is_fresh(msg.header.stamp, self._last_arrival_stamp):
@@ -506,7 +604,10 @@ class ArmFsmNode(Node):
                      or (self.state == State.LOCKED and self._prev_state == State.LIFT))
             self._cancel_arm_motion()
             self.locked = False
-            self._transition(State.LOWER_RELEASE if aloft else State.RELEASE)
+            if self.mission_type == MISSION_ROTARY_TOOL:
+                self._transition(State.STOWING)
+            else:
+                self._transition(State.LOWER_RELEASE if aloft else State.RELEASE)
 
         self._try_advance()
 
@@ -516,6 +617,8 @@ class ArmFsmNode(Node):
         if self.state in PREEMPTIBLE_STATES:
             self._prev_state = self.state
             self._cancel_arm_motion()
+            self._cancel_arm_test_motion()
+            self._cancel_end_effector_motion()
             self._transition(State.LOCKED)
 
     def _try_advance(self):
@@ -541,18 +644,30 @@ class ArmFsmNode(Node):
             # (freeze_target_on_retry 가 켜져 있어도 mission 을 넘어 재사용하면 안 된다).
             self._clear_frozen_target()
             self._set_status(ARM_WORK_READY)
-            self._transition(State.PERCEIVE)
+            self._transition(
+                self._rotary_entry_state()
+                if self.mission_type == MISSION_ROTARY_TOOL
+                else State.PERCEIVE)
             self._pending_arrival = None
         elif (self.state == State.LOCKED and msg.status == ARRIVED_PICKUP
                 and msg.mission_id == self.mission_id):
             self.locked = False
             self._set_status(ARM_WORK_READY)
-            self._transition(State.PERCEIVE)
+            self._transition(
+                self._rotary_entry_state()
+                if self.mission_type == MISSION_ROTARY_TOOL
+                else State.PERCEIVE)
             self._pending_arrival = None
         elif (self.state == State.CARRY and msg.status == ARRIVED_DROP
                 and msg.mission_id == self.mission_id):
             self._transition(State.RELEASE)
             self._pending_arrival = None
+
+    def _rotary_entry_state(self):
+        if not self.integrated_test_mode:
+            return State.END_EFFECTOR_ROTATE
+        return (State.RANDOM_ARM_DEMO if self.random_demo_enabled
+                else State.ARM_TEST_MOVE)
 
     def _stamp_is_fresh(self, stamp, prev_stamp):
         """0/미래/동일·역행 stamp 거부 (계약 §5.1 heartbeat freshness 기준)."""
@@ -726,7 +841,9 @@ class ArmFsmNode(Node):
             ok = self._motion_ok
             self._motion_state = 'idle'
             if ok:
-                self._transition(State.GRASP)
+                self._transition(
+                    State.DESCEND_STOPPED
+                    if self.stop_after_descend else State.GRASP)
             else:
                 self._fail('descend motion failed')
             return
@@ -735,8 +852,19 @@ class ArmFsmNode(Node):
         elif not self._move_to_xyz(self._planned_grasp_xyz):
             self._fail('descend IK failed')
 
+    def _do_descend_stopped(self):
+        """Latched arm-only test endpoint after a successful DESCEND."""
+        self._set_status(ARM_EXECUTING)
+
     def _do_grasp(self):
         """Close the gripper; success evaluation belongs to GRASP_CHECK."""
+        if getattr(self, 'gripper_change_mode', False):
+            self._transition(State.DESCEND_STOPPED)
+            return
+        if (self.mission_type != MISSION_PICK_PLACE
+                or self.end_effector_kind != 'gripper'):
+            self._fail('GRASP is disabled for the selected end effector')
+            return
         self._set_status(ARM_EXECUTING)
         if not self._grip_sent:
             self._send_gripper(self.gripper_close)
@@ -747,6 +875,13 @@ class ArmFsmNode(Node):
 
     def _do_grasp_check(self):
         """Determine grasp success from the existing joint_states effort feedback."""
+        if getattr(self, 'gripper_change_mode', False):
+            self._transition(State.DESCEND_STOPPED)
+            return
+        if (self.mission_type != MISSION_PICK_PLACE
+                or self.end_effector_kind != 'gripper'):
+            self._fail('GRASP_CHECK is disabled for the selected end effector')
+            return
         self._set_status(ARM_EXECUTING)
         if self._gripper_effort() >= self.grasp_thresh:
             self._transition(State.LIFT)
@@ -864,6 +999,13 @@ class ArmFsmNode(Node):
         return (t.x, t.y, max(0.0, t.z - self.lift_height))
 
     def _do_release(self):
+        if getattr(self, 'gripper_change_mode', False):
+            self._transition(State.DESCEND_STOPPED)
+            return
+        if (self.mission_type != MISSION_PICK_PLACE
+                or self.end_effector_kind != 'gripper'):
+            self._fail('RELEASE is disabled for the selected end effector')
+            return
         self._set_status(ARM_EXECUTING)
         if not self._grip_sent:
             self._send_gripper(self.gripper_open)
@@ -872,9 +1014,119 @@ class ArmFsmNode(Node):
         if self._elapsed() > self.gripper_action_time:
             self._transition(State.DONE)
 
+    def _do_arm_test_move(self):
+        """Run the fixed guarded arm sequence exactly once in test mode."""
+        if (not self.integrated_test_mode
+                or self.mission_type != MISSION_ROTARY_TOOL
+                or self.end_effector_kind != 'rotary'):
+            self._fail('ARM_TEST_MOVE requires integrated rotary test mode')
+            return
+        self._set_status(ARM_EXECUTING)
+        if self._arm_test_state == 'active':
+            return
+        if self._arm_test_state == 'done':
+            if self._arm_test_ok:
+                self._transition(State.END_EFFECTOR_ROTATE)
+            else:
+                # The rotate action is never sent on this branch.
+                self._fail('guarded arm test action failed')
+            return
+        if self._arm_test_sent:
+            return
+        self._send_arm_test_goal([5, 10, 10, 20], random_demo=False)
+
+    def _do_random_arm_demo(self):
+        """Move to one deterministic bounded pose, then rotate ID 5."""
+        if (not self.integrated_test_mode or not self.random_demo_enabled
+                or self.mission_type != MISSION_ROTARY_TOOL
+                or self.end_effector_kind != 'rotary'):
+            self._fail('RANDOM_ARM_DEMO safety gate closed')
+            return
+        self._set_status(ARM_EXECUTING)
+        if self._random_pose_index >= len(self._random_poses):
+            self._transition(State.DONE)
+            return
+        if self._random_pose_index > 0 and self._elapsed() < 1.0:
+            return
+        if self._arm_test_state == 'active':
+            return
+        if self._arm_test_state == 'done':
+            if not self._arm_test_ok:
+                self._fail('random arm pose action failed')
+                return
+            self._random_previous_offsets = list(
+                self._random_poses[self._random_pose_index])
+            self._transition(State.END_EFFECTOR_ROTATE)
+            return
+        if self._arm_test_sent:
+            return
+        target = self._random_poses[self._random_pose_index]
+        deltas = [target[i] - self._random_previous_offsets[i]
+                  for i in range(4)]
+        self._send_arm_test_goal(deltas, random_demo=True)
+
+    def _send_arm_test_goal(self, deltas, random_demo):
+        goal = ArmTestMove.Goal()
+        goal.motor_ids = [14, 13, 12, 16]
+        goal.delta_ticks = deltas
+        goal.random_demo = random_demo
+        goal.max_abs_current = self.arm_test_max_abs_current
+        goal.stall_timeout = self.arm_test_stall_timeout
+        goal.step_timeout = self.arm_test_step_timeout
+        if not self._arm_test.server_is_ready():
+            self.get_logger().warn('/arm/test_move action server not ready')
+        self._arm_test_sent = True
+        self._arm_test_state = 'active'
+        self._arm_test.send_goal_async(goal).add_done_callback(
+            self._on_arm_test_goal_response)
+
+    def _do_end_effector_rotate(self):
+        """Run exactly one rotary-tool action; never translate it to grasp."""
+        if (self.mission_type != MISSION_ROTARY_TOOL
+                or self.end_effector_kind != 'rotary'):
+            self._fail('END_EFFECTOR_ROTATE requires ROTARY_TOOL + rotary preset')
+            return
+        self._set_status(ARM_EXECUTING)
+        if self._rotate_state == 'active':
+            return
+        if self._rotate_state == 'done':
+            if self._rotate_ok:
+                if self.integrated_test_mode and self.random_demo_enabled:
+                    self._random_pose_index += 1
+                    self._transition(
+                        State.RANDOM_ARM_DEMO
+                        if self._random_pose_index < len(self._random_poses)
+                        else State.DONE)
+                else:
+                    self._transition(State.DONE)
+            else:
+                self._fail('end-effector rotate action failed')
+            return
+        if self._rotate_sent:
+            return
+
+        goal = EndEffectorRotate.Goal()
+        goal.relative = (True if (self.integrated_test_mode
+                                  and self.random_demo_enabled)
+                         else self.rotary_relative)
+        goal.ticks = (
+            300 if self._random_pose_index % 2 == 0 else -300
+        ) if (self.integrated_test_mode and self.random_demo_enabled) \
+            else self.rotary_ticks
+        goal.max_abs_current = self.rotary_max_abs_current
+        goal.timeout = self.rotary_timeout
+        if not self._rotate.server_is_ready():
+            self.get_logger().warn('/end_effector/rotate action server not ready')
+        self._rotate_sent = True
+        self._rotate_state = 'active'
+        self._rotate.send_goal_async(goal).add_done_callback(
+            self._on_rotate_goal_response)
+
     def _do_done(self):
         """Mission sequence terminal state; stowing remains the contract finalizer."""
         self._set_status(ARM_DONE)
+        if self.integrated_test_mode:
+            return
         self._transition(State.STOWING)
 
     def _do_failed(self):
@@ -993,6 +1245,18 @@ class ArmFsmNode(Node):
         self._arm_move_deadline = None
         self._motion_state = 'idle'
 
+    def _cancel_end_effector_motion(self):
+        if self._rotate_goal_handle is not None:
+            self._rotate_goal_handle.cancel_goal_async()
+            self._rotate_goal_handle = None
+        self._rotate_state = 'idle'
+
+    def _cancel_arm_test_motion(self):
+        if self._arm_test_goal_handle is not None:
+            self._arm_test_goal_handle.cancel_goal_async()
+            self._arm_test_goal_handle = None
+        self._arm_test_state = 'idle'
+
     def _build_move_group_goal(self, pose_stamped):
         """목표 pose → MoveGroup goal (plan & execute). tip_link를 pose로 이동."""
         req = MotionPlanRequest()
@@ -1025,7 +1289,8 @@ class ArmFsmNode(Node):
 
         constraints = Constraints()
         constraints.position_constraints.append(pc)
-        constraints.orientation_constraints.append(oc)
+        # 4축 실기 팔 테스트: orientation constraint는 사용하지 않고
+        # tip_link 위치만 목표로 planning한다.
         req.goal_constraints.append(constraints)
 
         goal = MoveGroup.Goal()
@@ -1248,8 +1513,48 @@ class ArmFsmNode(Node):
 
     # ── 그리퍼 ─────────────────────────────────
 
+    def _on_arm_test_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._arm_test_ok = False
+            self._arm_test_state = 'done'
+            return
+        self._arm_test_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(
+            self._on_arm_test_result)
+
+    def _on_arm_test_result(self, future):
+        wrapped = future.result()
+        self._arm_test_ok = bool(wrapped.result.success)
+        self._arm_test_state = 'done'
+        self._arm_test_goal_handle = None
+
+    def _on_rotate_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._rotate_ok = False
+            self._rotate_state = 'done'
+            return
+        self._rotate_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(self._on_rotate_result)
+
+    def _on_rotate_result(self, future):
+        wrapped = future.result()
+        self._rotate_ok = bool(wrapped.result.success)
+        self._rotate_state = 'done'
+        self._rotate_goal_handle = None
+
     def _send_gripper(self, position):
-        """gripper_controller에 FollowJointTrajectory 단일 점 전송 (fire-and-forget)."""
+        """Send GRASP/RELEASE through the preset-selected gripper driver.
+
+        The bridge owns hardware ID, endpoint, and operating-mode safety.  It
+        rejects this action while the restored single-motor driver remains
+        uncalibrated or ID 5 is not verified in position-control mode.
+        """
+        if self.gripper_disabled:
+            self.get_logger().error(
+                'gripper command blocked: gripper_disabled=true')
+            return
         traj = JointTrajectory()
         traj.joint_names = self.gripper_joints
         pt = JointTrajectoryPoint()
@@ -1284,6 +1589,8 @@ class ArmFsmNode(Node):
     def _fail(self, reason):
         self.get_logger().error(reason)
         self._cancel_arm_motion()
+        self._cancel_arm_test_motion()
+        self._cancel_end_effector_motion()
         self._transition(State.FAILED)
 
     def _transition(self, new_state):
@@ -1303,6 +1610,12 @@ class ArmFsmNode(Node):
         self.state = new_state
         self._state_enter_t = self.get_clock().now()
         self._grip_sent = False
+        self._arm_test_sent = False
+        self._arm_test_state = 'idle'
+        self._arm_test_ok = False
+        self._rotate_sent = False
+        self._rotate_state = 'idle'
+        self._rotate_ok = False
         self._stow_move_sent = False
 
     def _set_status(self, status):

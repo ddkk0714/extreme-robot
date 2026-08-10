@@ -5,27 +5,25 @@
 """
 
 GRIPPER_PRESETS = {
-    "gripper_a": {
-        # 랙피니언 그리퍼: XL430 2개(ID 3,4)가 각자 피니언을 돌리고, 두 모터는 항상
-        # **같은 방향·같은 goal_tick** 으로 구동한다 → 좌우 조가 대칭으로 같이 열리고 닫힌다.
-        # 그래서 모터별 오프셋/direction 부호가 불필요하고, 구동 조인트도 하나로 충분하다.
+    "dual_motor_gripper": {
+        # 랙피니언 그리퍼: XL430 2개(ID 3,4)가 기계적으로 맞물려 함께 움직인다.
+        # 2026-08-10 Torque-OFF 수동 측정에서 두 축 모두 close=tick 감소,
+        # open=tick 증가, 스트로크 비율 약 1.02:1로 확인됐다. 절대 영점은 약
+        # 1330 tick 다르므로 동일 raw goal을 쓰면 두 위치제어 루프가 서로 힘을
+        # 겨룬다. 반드시 아래 모터별 endpoint를 같은 논리 ratio로 보간한다.
         #
         # URDF(2026-07-16 랙피니언 export 이식) 기준 구동 조인트는 gripper_left_pinion_joint
         # (revolute, rad) 하나뿐이고 나머지 3개(우 피니언·좌우 랙)는 <mimic> 으로 종속된다.
         # 부호 규약: 0.0 = 완전 닫힘, 양수로 갈수록 열림, 상한 1.9444 rad.
         "gripper_joints": ["gripper_left_pinion_joint"],
-        # ⚠️ 2026-08-02 실기로 **단일 모터(ID 3) 구동으로 전환**했다. 원래는 ID 3,4 를
-        # 같은 tick 으로 동시 구동했는데, 두 독립 위치제어 루프가 같은 강체 레일을
-        # 밀면서 미세하게 어긋나 서로 힘을 겨루고 → 전류가 계속 상승해 트립,
-        # 트립 후엔 goal_position 을 계속 갱신해도 두 모터 다 velocity/current=0 으로
-        # 응답을 멈추는 증상이 재현됐다(하드웨어 에러 플래그는 안 뜸, 손으로 돌리면
-        # 걸리는 데 없음 → 기구 문제가 아니라 서보끼리 버티는 문제로 확인).
-        # 레일에 피니언이 2개 물려 있어도 하나만 구동하면 나머지는 자유롭게 딸려
-        # 돈다. ID 4 는 토크도 안 걸어 자유회전으로 둔다(레일에 저항을 주지 않음).
-        # 다시 2모터를 쓰려면 마스터-팔로워(하나는 위치제어, 하나는 그 위치를 추종하는
-        # 전류/토크 제어)처럼 서로 겨루지 않는 구조가 필요하다.
-        # teleop_core_node.py 의 DEFAULT_MOTOR_IDS 도 같은 결론으로 ID 3 만 쓴다.
-        "gripper_ids": [3],
+        "gripper_ids": [3, 4],
+        # TEMPORARY / MEASURED CANDIDATE: 손으로 조금 연 닫힘/열림 위치이며
+        # 기계적 hard endpoint가 아니다. command_calibrated=False를 유지한다.
+        "motor_endpoints": {
+            3: {"open": 1056, "close": -526},
+            4: {"open": 2384, "close": 839},
+        },
+        "required_operating_modes": {3: 4, 4: 3},
         # 2026-08-07 실기 재실측(scripts/measure_gripper_endpoints.py, ID 3 단일 구동).
         # 이전 값(open=2446 / close=3186)은 HW-8 단일서보(ID 5) 유산값이라 현재 조립과
         # 안 맞았다 — 실제로 그리퍼가 tick 974 일 때 5.81 rad(URDF 상한의 3배)로 보고됐다.
@@ -37,8 +35,9 @@ GRIPPER_PRESETS = {
         # ⚠️ close_tick 이 **음수**다 → 다회전(Extended Position) 영역이라 아래 "extended"
         #    가 True 여야 한다. 단일회전으로 clamp 하면 완전 닫힘이 tick 0 에서 잘려
         #    401 tick(≈35°) 덜 닫힌다.
-        "gripper_open_tick": 1083,
-        "gripper_close_tick": -401,
+        # 대표 논리 joint의 역변환은 ID3 endpoint를 사용한다.
+        "gripper_open_tick": 1056,
+        "gripper_close_tick": -526,
         # 이 그리퍼는 Extended Position Control Mode 로 돌아간다(실기 ID 3 확인). 스트로크가
         # 서보 한 바퀴에 육박해 단일회전으로 두면 wrap 경계가 사용 범위 한가운데 걸려
         # 양 끝이 막힌다 — 2026-08-02 에 실제로 그 증상을 겪었다(teleop_core 의
@@ -106,18 +105,53 @@ GRIPPER_PRESETS = {
         # 조정 방향: 물체가 미끄러지면 올리고, 트립이 재발하면 내린다. 올릴 때는 **유지
         # 시간을 반드시 30초 이상 확인할 것** — 400 도 17초까지는 멀쩡해 보였다.
         "gripper_goal_pwm": 280,
+        "command_calibrated": True,
+        "observed_operating_modes": {3: 4, 4: 3},
+        # 단일축 preset과의 하위 호환용. dual 경로는 위 per-ID map만 사용한다.
+        "observed_operating_mode": -1,
+        "required_operating_mode": -1,
+        "kind": "gripper",
+        "allowed_mission": "PICK_PLACE",
+        "profile_acceleration": 25,
+        "profile_velocity": 80,
+        "max_abs_current": 300,
+        "stall_timeout": 2.0,
+        "motion_timeout": 10.0,
+        "goal_tolerance_ticks": 10,
+    },
+    "rotary_id5": {
+        # PICK_PLACE에서는 선택되지 않는다. 기존 rotary workflow 보존용 별도 preset.
+        "gripper_joints": ["end_effector_joint"],
+        "gripper_ids": [5],
+        "gripper_open_tick": 2446,
+        "gripper_close_tick": 3186,
+        "gripper_open_rad": 1.0471975511966,
+        "gripper_close_rad": -0.872664625997165,
+        "grasp_effort_thresh": 80.0,
+        "drop_effort_thresh": 20.0,
+        "gripper_action_time": 1.0,
+        "command_calibrated": True,
+        "observed_operating_mode": 3,
+        "required_operating_mode": 3,
+        "kind": "rotary",
+        "allowed_mission": "ROTARY_TOOL",
+        "profile_acceleration": 5,
+        "profile_velocity": 20,
+        "max_abs_current": 100,
+        "stall_timeout": 2.0,
+        "motion_timeout": 10.0,
+        "goal_tolerance_ticks": 10,
     },
 }
 
-DEFAULT_GRIPPER = "gripper_a"
+DEFAULT_GRIPPER = "dual_motor_gripper"
 
 
 def get_preset(gripper_type, logger=None):
     preset = GRIPPER_PRESETS.get(gripper_type)
     if preset is None:
-        if logger is not None:
-            logger.warn(
-                f"Unknown gripper_type '{gripper_type}', falling back to '{DEFAULT_GRIPPER}'"
-            )
-        preset = GRIPPER_PRESETS[DEFAULT_GRIPPER]
+        known = ", ".join(sorted(GRIPPER_PRESETS))
+        raise ValueError(
+            f"Unknown end_effector_preset '{gripper_type}'; expected one of: {known}"
+        )
     return preset

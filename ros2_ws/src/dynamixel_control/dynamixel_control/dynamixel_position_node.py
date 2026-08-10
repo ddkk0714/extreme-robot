@@ -191,7 +191,8 @@ def _signed(value, byte_count):
     value &= (1 << bits) - 1
     return value - (1 << bits) if value >= (1 << (bits - 1)) else value
 
-# 실기 버스 스캔값(전부 XL430-W250/model 1060). arm_joint_1(ID 11)은 현재 미연결.
+
+# 검증된 4축 arm 버스 매핑. arm_joint_1(ID 11)과 구형 gripper ID 3은 등록하지 않는다.
 #
 # ⚠️ 2026-08-02 그리퍼 단일 모터로 전환: 원래 물리 서보 2개(id 3,4)를 랙피니언
 # 한 레일에 물려 이름을 두 번 등록해 항상 같은 tick 을 동시 발행했는데, 실기
@@ -202,18 +203,16 @@ def _signed(value, byte_count):
 # 2개가 물려있어도 하나만 구동하면 나머지는 자유롭게 딸려 돈다 — 그래서 ID4를
 # 아예 목록에서 뺐다(미등록 → 토크 안 걸림 → 자유회전, 레일에 저항 안 줌).
 # teleop_core_node.py 의 DEFAULT_MOTOR_IDS 도 같이 뺐다.
-DEFAULT_MOTOR_IDS = [11, 14, 13, 12, 16, 3]
+DEFAULT_MOTOR_IDS = [14, 13, 12, 16]
 
 # URDF(robot_arm.urdf)의 구동 관절 이름과 모터 ID 순서를 맞춤.
 # 구동 조인트는 gripper_left_pinion_joint 하나뿐 — 나머지 그리퍼 관절(우 피니언·좌우 랙)은
 # 전부 mimic 이라 여기 없다. 그리퍼는 ID 3 하나만 구동(위 DEFAULT_MOTOR_IDS 주석 참고).
 DEFAULT_JOINT_NAMES = [
-    "arm_joint_1",
     "arm_joint_2",
     "arm_joint_3",
     "arm_joint_4",
     "arm_joint_5",
-    "gripper_left_pinion_joint",
 ]
 
 # 프로파일 가감속 기본값. **0(=최고속 즉시 이동)으로 두지 말 것** — 명령마다
@@ -256,7 +255,7 @@ class DynamixelPositionNode(Node):
         # 맞먹어 단일회전 wrap 경계(0/4095)에 양쪽 다 걸리는 문제라 2026-08-02
         # 추가(teleop_core_node.py 의 EXTENDED_POSITION_NAMES 주석 참고, 이 파라미터
         # 와 짝 — 바뀌면 같이 바꿀 것).
-        self.declare_parameter("extended_position_ids", [14, 13, 3])
+        self.declare_parameter("extended_position_ids", [14, 13])
         # 2026-08-01: 지연 최소화 요청으로 read/write 둘 다 상향(20→30Hz, 50→100Hz).
         # flush_goals 는 pending_goals 가 비어있으면 그냥 return 이라 write_rate_hz를
         # 올려도 유휴 트래픽이 늘지 않는다 — 실제 명령이 있을 때만 주기가 짧아진다.
@@ -544,7 +543,29 @@ class DynamixelPositionNode(Node):
                 self.get_logger().info(
                     f"ID {dxl_id} operating mode {mode} → {target_mode}({mode_label})")
 
-        # 프로파일 가감속 — 0이면 명령마다 최고속으로 튀어 과전류 트립이 난다.
+        # Torque ON 전에 반드시 Present→Goal 동기화와 readback을 끝낸다.
+        present, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"ID {dxl_id} startup Present Position 읽기 실패 — Torque ON 차단")
+            return False
+        result, error = self.packet_handler.write4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_GOAL_POSITION,
+            present & 0xFFFFFFFF)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"ID {dxl_id} startup Goal Position 동기화 실패 — Torque ON 차단")
+            return False
+        goal, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_GOAL_POSITION)
+        if result != 0 or error != 0 or goal != present:
+            self.get_logger().error(
+                f"ID {dxl_id} startup Goal readback 불일치 "
+                f"(present={present}, goal={goal}) — Torque ON 차단")
+            return False
+
+        # 프로파일 가감속 — 동기화 검증 후, Torque ON 전에만 쓴다.
         self.packet_handler.write4ByteTxRx(
             self.port_handler, dxl_id, ADDR_PROFILE_ACCELERATION, self.profile_acc)
         self.packet_handler.write4ByteTxRx(
@@ -775,14 +796,25 @@ class DynamixelPositionNode(Node):
             if enable:
                 pos, result, error = self.packet_handler.read4ByteTxRx(
                     self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
-                if result == 0 and error == 0:
-                    self.packet_handler.write4ByteTxRx(
-                        self.port_handler, dxl_id, ADDR_GOAL_POSITION,
-                        pos & 0xFFFFFFFF)
-                    self.pending_goals.pop(dxl_id, None)
-                else:
-                    self.get_logger().warn(
-                        f"ID {dxl_id} 현재 위치 읽기 실패 — 홀드 없이 토크만 켭니다")
+                if result != 0 or error != 0:
+                    self.get_logger().error(
+                        f"ID {dxl_id} 현재 위치 읽기 실패 — Torque ON 차단")
+                    continue
+                result, error = self.packet_handler.write4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_POSITION,
+                    pos & 0xFFFFFFFF)
+                if result != 0 or error != 0:
+                    self.get_logger().error(
+                        f"ID {dxl_id} Goal 동기화 실패 — Torque ON 차단")
+                    continue
+                goal, result, error = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_POSITION)
+                if result != 0 or error != 0 or goal != pos:
+                    self.get_logger().error(
+                        f"ID {dxl_id} Goal readback 불일치 "
+                        f"(present={pos}, goal={goal}) — Torque ON 차단")
+                    continue
+                self.pending_goals.pop(dxl_id, None)
 
             result, error = self.packet_handler.write1ByteTxRx(
                 self.port_handler, dxl_id,
@@ -805,7 +837,9 @@ class DynamixelPositionNode(Node):
                         # 없이도 여기서 확실하게 재활성화됐으니 latch 를 지운다.
                         # 진짜 HW 에러 비트는 그대로 남겨둔다(그건 여전히 reboot
                         # 로만 지워야 신뢰할 수 있음).
-                        self.error_latched[dxl_id] &= ~((1 << CURRENT_TRIP_BIT) | (1 << CURRENT_SPIKE_BIT))
+                        self.error_latched[dxl_id] &= ~(
+                            (1 << CURRENT_TRIP_BIT)
+                            | (1 << CURRENT_SPIKE_BIT))
                         if not self.error_latched[dxl_id]:
                             del self.error_latched[dxl_id]
         self._publish_hardware_errors()

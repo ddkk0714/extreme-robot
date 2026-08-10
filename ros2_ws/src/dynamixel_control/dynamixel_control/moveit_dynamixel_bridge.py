@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 
 import math
+import threading
+import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Int32MultiArray
 from control_msgs.action import FollowJointTrajectory
+from robot_arm_msgs.action import ArmRecordedPath, ArmTestMove, EndEffectorRotate
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
 
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
@@ -24,7 +29,10 @@ ADDR_OPERATING_MODE = 11
 MODE_POSITION = 3           # 단일회전 0~4095
 MODE_EXTENDED_POSITION = 4  # 다회전, tick 이 범위를 넘고 음수도 된다
 ADDR_HARDWARE_ERROR_STATUS = 70
+ADDR_PROFILE_ACCELERATION = 108
+ADDR_PROFILE_VELOCITY = 112
 ADDR_GOAL_POSITION = 116
+ADDR_MOVING_STATUS = 123
 ADDR_PRESENT_LOAD = 126
 ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_POSITION = 132
@@ -133,6 +141,12 @@ JOINT_CONFIG = {
                     "gear_ratio": 1.0, "extended": False},
 }
 ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
+ARM_ID_SEQUENCE = [config["id"] for config in JOINT_CONFIG.values()]
+ARM_TEST_SEQUENCE = ((14, 5), (13, 10), (12, 10), (16, 20))
+RANDOM_ARM_RANGES = {14: 20, 13: 40, 12: 40, 16: 80}
+RECORDED_PATH_IDS = (14, 13, 12)
+RECORDED_PATH_START_TOLERANCE = {14: 20, 13: 30, 12: 20}
+RECORDED_PATH_MAX_WAYPOINT_STEP = 50
 
 # 모터가 없어 실측할 수 없지만 **URDF 상으로는 존재하는** 관절 — 고정값으로 발행한다.
 #
@@ -186,12 +200,19 @@ class MoveItDynamixelBridge(Node):
     def __init__(self):
         super().__init__("moveit_dynamixel_bridge")
 
-        # --- 그리퍼 파라미터 (랙피니언 2모터 동일방향 구동, ID 3/4) ---
+        # --- 그리퍼 파라미터 (preset에 따라 단일/복수 모터 공통 처리) ---
         # gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
         # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
-        self.declare_parameter("gripper_type", DEFAULT_GRIPPER)
-        self.gripper_type = self.get_parameter("gripper_type").value
+        self.declare_parameter("end_effector_preset", DEFAULT_GRIPPER)
+        self.gripper_type = self.get_parameter("end_effector_preset").value
         preset = get_preset(self.gripper_type, self.get_logger())
+        self.declare_parameter("gripper_change_mode", False)
+        self.declare_parameter("gripper_disabled", False)
+        self.gripper_change_mode = bool(
+            self.get_parameter("gripper_change_mode").value)
+        self.gripper_disabled = (
+            self.gripper_change_mode
+            or bool(self.get_parameter("gripper_disabled").value))
 
         self.declare_parameter("gripper_joints", preset["gripper_joints"])
         self.declare_parameter("gripper_ids", preset["gripper_ids"])  # 빈 배열이면 그리퍼 비활성
@@ -204,24 +225,118 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("gripper_extended", bool(preset.get("extended", False)))
         # 0 이면 쓰지 않는다(서보 기본 885=100% 유지). preset 주석에 값 근거 있음.
         self.declare_parameter("gripper_goal_pwm", int(preset.get("gripper_goal_pwm", 0)))
+        self.declare_parameter(
+            "gripper_command_calibrated", preset["command_calibrated"])
+        self.declare_parameter(
+            "gripper_observed_operating_mode",
+            preset["observed_operating_mode"])
+        self.declare_parameter(
+            "gripper_required_operating_mode",
+            preset["required_operating_mode"])
+        self.declare_parameter("end_effector_kind", preset["kind"])
+        self.declare_parameter(
+            "end_effector_profile_acceleration",
+            preset["profile_acceleration"])
+        self.declare_parameter(
+            "end_effector_profile_velocity", preset["profile_velocity"])
+        self.declare_parameter(
+            "end_effector_max_abs_current", preset["max_abs_current"])
+        self.declare_parameter(
+            "end_effector_stall_timeout", preset["stall_timeout"])
+        self.declare_parameter(
+            "end_effector_motion_timeout", preset["motion_timeout"])
+        self.declare_parameter(
+            "end_effector_goal_tolerance_ticks",
+            preset["goal_tolerance_ticks"])
         self.declare_parameter("read_only", False)
         self.declare_parameter("gripper_only_mode", False)
+        self.declare_parameter("integrated_test_mode", False)
+        self.declare_parameter("random_demo_enabled", False)
+        self.declare_parameter("arm_test_max_abs_current", 300)
+        self.declare_parameter("arm_test_stall_timeout", 2.0)
+        self.declare_parameter("arm_test_step_timeout", 8.0)
+        self.declare_parameter("arm_test_goal_tolerance_ticks", 10)
+        self.declare_parameter("trajectory_goal_tolerance_rad", 0.03)
+        self.declare_parameter("trajectory_goal_timeout_s", 10.0)
+        self.declare_parameter("trajectory_feedback_timeout_s", 0.5)
 
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
+        if self.gripper_disabled:
+            # Keep the logical gripper joint/MoveIt geometry, but remove every
+            # physical gripper ID before the serial port is opened.  All bus
+            # registration, feedback, torque, PWM and trajectory paths use
+            # this list as their hardware authority.
+            self.gripper_ids = []
         self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
         self.gripper_close_rad = float(self.get_parameter("gripper_close_rad").value)
         self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
         self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
         self.gripper_extended = bool(self.get_parameter("gripper_extended").value)
         self.gripper_goal_pwm = int(self.get_parameter("gripper_goal_pwm").value)
+        self.gripper_command_calibrated = bool(
+            self.get_parameter("gripper_command_calibrated").value)
+        self.gripper_observed_operating_mode = self.get_parameter(
+            "gripper_observed_operating_mode").value
+        self.gripper_required_operating_mode = int(self.get_parameter(
+            "gripper_required_operating_mode").value)
+        self.end_effector_kind = str(
+            self.get_parameter("end_effector_kind").value)
+        self.end_effector_profile_acceleration = int(self.get_parameter(
+            "end_effector_profile_acceleration").value)
+        self.end_effector_profile_velocity = int(self.get_parameter(
+            "end_effector_profile_velocity").value)
+        self.end_effector_max_abs_current = int(self.get_parameter(
+            "end_effector_max_abs_current").value)
+        self.end_effector_stall_timeout = float(self.get_parameter(
+            "end_effector_stall_timeout").value)
+        self.end_effector_motion_timeout = float(self.get_parameter(
+            "end_effector_motion_timeout").value)
+        self.end_effector_goal_tolerance_ticks = int(self.get_parameter(
+            "end_effector_goal_tolerance_ticks").value)
+        self.gripper_motor_endpoints = {
+            int(dxl_id): {name: int(value) for name, value in endpoints.items()}
+            for dxl_id, endpoints in preset.get("motor_endpoints", {}).items()
+        }
+        self.gripper_required_operating_modes = {
+            int(dxl_id): int(mode) for dxl_id, mode in
+            preset.get("required_operating_modes", {}).items()
+        }
+        self.gripper_observed_operating_modes = {
+            int(dxl_id): int(mode) for dxl_id, mode in
+            preset.get("observed_operating_modes", {}).items()
+        }
         self.read_only = bool(self.get_parameter("read_only").value)
         self.gripper_only_mode = bool(
             self.get_parameter("gripper_only_mode").value)
+        self.integrated_test_mode = bool(
+            self.get_parameter("integrated_test_mode").value)
+        self.random_demo_enabled = bool(
+            self.get_parameter("random_demo_enabled").value)
+        self.arm_test_max_abs_current = int(
+            self.get_parameter("arm_test_max_abs_current").value)
+        self.arm_test_stall_timeout = float(
+            self.get_parameter("arm_test_stall_timeout").value)
+        self.arm_test_step_timeout = float(
+            self.get_parameter("arm_test_step_timeout").value)
+        self.arm_test_goal_tolerance_ticks = int(
+            self.get_parameter("arm_test_goal_tolerance_ticks").value)
+        self.trajectory_goal_tolerance = float(
+            self.get_parameter("trajectory_goal_tolerance_rad").value)
+        self.trajectory_goal_timeout = float(
+            self.get_parameter("trajectory_goal_timeout_s").value)
+        self.trajectory_feedback_timeout = float(
+            self.get_parameter("trajectory_feedback_timeout_s").value)
 
-        # 기어비 실측 반영용 — JOINT_CONFIG 의 gear_ratio 기본값을 런타임에 덮어쓴다.
-        # "<joint>:<ratio>" 문자열 배열로 받는다(예: ["arm_joint_2:9.8"]). rclpy 는
-        # dict 타입 파라미터가 없어서 이 형태를 쓴다.
+        self._bus_lock = threading.Lock()
+        self._feedback_lock = threading.Lock()
+        self._latest_arm_positions = {}
+        self._latest_arm_feedback_time = None
+        self._torque_states = {}
+        self._random_arm_baseline = None
+
+        # 최신 upstream의 실측 zero/direction/gear-ratio와 보수적 joint-limit을
+        # 그대로 사용한다. 미확정 리밋이 하나라도 있으면 일반 arm write는 닫는다.
         self.declare_parameter("gear_ratios", [])
         self.gear_ratios = {}
         for entry in self.get_parameter("gear_ratios").value:
@@ -234,41 +349,18 @@ class MoveItDynamixelBridge(Node):
             except ValueError:
                 self.get_logger().warn(f"gear_ratios: '{entry}' 파싱 실패 — 무시")
                 continue
-            if ratio <= 0.0:
-                self.get_logger().warn(f"gear_ratios: '{entry}' 은 양수여야 함 — 무시")
-                continue
-            self.gear_ratios[name] = ratio
-            self.get_logger().info(f"gear_ratio 덮어쓰기: {name} = {ratio}")
+            if ratio > 0.0:
+                self.gear_ratios[name] = ratio
 
-        geared = {n: self._joint_gear_ratio(n) for n, c in JOINT_CONFIG.items()
-                  if c["extended"]}
-        if geared:
-            self.get_logger().info(
-                "감속기 축 기어비: "
-                + ", ".join(f"{n}={r:.3f}:1" for n, r in geared.items())
-                + " (2026-08-07 실측 — 파지 위치가 계통적으로 어긋나면 여기부터 의심)"
-            )
-
-        self.get_logger().info(
-            "관절 안전 리밋: "
-            + ", ".join(
-                f"{n}=[{joint_limits.get_limits(n)[0]:+.3f},{joint_limits.get_limits(n)[1]:+.3f}]"
-                for n in JOINT_CONFIG if joint_limits.get_limits(n) is not None
-            )
-        )
-        unregistered = [n for n in JOINT_CONFIG if joint_limits.get_limits(n) is None]
-        if unregistered:
-            self.get_logger().warn(
-                f"joint_limits 에 없는 축 {unregistered} — **리밋 없이 그대로 나간다.** "
-                "joint_limits.py 에 추가할 것."
-            )
-        provisional = [n for n in joint_limits.provisional_joints() if n in JOINT_CONFIG]
-        if provisional:
-            self.get_logger().warn(
-                f"관절 {provisional} 은 가동범위 실측이 없어 보수적으로 좁혀둔 상태다"
-                f"(±{joint_limits.PROVISIONAL_HALF_RANGE} rad). 이 축이 거의 안 움직이면 "
-                "리밋 탓이다 — scripts/measure_joint_limits.py 로 실측할 것."
-            )
+        self.arm_command_calibrated = not any(
+            name in JOINT_CONFIG for name in joint_limits.provisional_joints()
+        ) and all(joint_limits.get_limits(name) is not None for name in JOINT_CONFIG)
+        if (not self.read_only and not self.gripper_only_mode
+                and not self.integrated_test_mode
+                and not self.arm_command_calibrated):
+            raise RuntimeError(
+                "Arm writes blocked: physical joint limits are not fully calibrated. "
+                "Use read_only:=true or the explicitly bounded integrated_test_mode.")
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -322,23 +414,45 @@ class MoveItDynamixelBridge(Node):
                     f"Read-only mode: 토크/레지스터 쓰기 없이 모니터링만 — "
                     f"팔 {sorted(ARM_IDS)} + 그리퍼 {self.gripper_ids}"
                 )
+        elif self.integrated_test_mode:
+            # Diagnostic integration mode owns the same bus but performs no
+            # startup writes. Actions enable only the motor currently tested.
+            for dxl_id in ARM_ID_SEQUENCE + list(self.gripper_ids):
+                if self.group_sync_read.addParam(dxl_id):
+                    self.active_ids.add(dxl_id)
+            self.get_logger().info(
+                "Integrated test mode: monitoring arm and selected end "
+                "effector IDs; all startup writes are disabled")
         else:
             # 팔 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for joint_name, config in JOINT_CONFIG.items():
-                if self._enable_torque(config["id"], joint_name, config["extended"]):
+                required_mode = (MODE_EXTENDED_POSITION if config["extended"]
+                                 else MODE_POSITION)
+                if self._enable_torque(config["id"], joint_name, required_mode):
                     self.group_sync_read.addParam(config["id"])
                     self.active_ids.add(config["id"])
                     self.torque_enabled_ids.add(config["id"])
 
-            # 그리퍼 서보: 토크 ON 성공한 ID만 SyncRead 등록
-            for gid in self.gripper_ids:
-                if self._enable_torque(gid, f"gripper(id {gid})", self.gripper_extended):
-                    # Operating Mode 변경이 일부 RAM 값을 초기화하므로 모드·토크가 확정된
-                    # **뒤에** 쓴다.
-                    self._write_gripper_goal_pwm(gid)
-                    self.group_sync_read.addParam(gid)
-                    self.active_ids.add(gid)
-                    self.torque_enabled_ids.add(gid)
+            # Gripper startup writes require independently verified endpoints
+            # and the position-control mode expected by Goal Position.  Mode
+            # initialization belongs to an explicit commissioning utility; the
+            # production bridge never changes EEPROM/RAM control modes.
+            if self._gripper_startup_torque_allowed():
+                for gid in self.gripper_ids:
+                    if self._enable_torque(
+                            gid, f"gripper(id {gid})",
+                            self._required_gripper_mode(gid)):
+                        self._write_gripper_goal_pwm(gid)
+                        self.group_sync_read.addParam(gid)
+                        self.active_ids.add(gid)
+                        self.torque_enabled_ids.add(gid)
+            else:
+                for gid in self.gripper_ids:
+                    if self.group_sync_read.addParam(gid):
+                        self.active_ids.add(gid)
+                self.get_logger().warn(
+                    "Gripper startup torque blocked: endpoints or operating "
+                    "mode are not commissioned")
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -356,6 +470,8 @@ class MoveItDynamixelBridge(Node):
             10,
         )
 
+        self._action_group = ReentrantCallbackGroup()
+
         self.action_server = ActionServer(
             self,
             FollowJointTrajectory,
@@ -371,8 +487,38 @@ class MoveItDynamixelBridge(Node):
             FollowJointTrajectory,
             "/gripper_controller/follow_joint_trajectory",
             execute_callback=self.execute_gripper,
-            goal_callback=self.goal_callback,
+            goal_callback=self.gripper_goal_callback,
             cancel_callback=self.cancel_callback,
+        )
+
+        self.rotate_action_server = ActionServer(
+            self,
+            EndEffectorRotate,
+            "/end_effector/rotate",
+            execute_callback=self.execute_rotate,
+            goal_callback=self.rotate_goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=self._action_group,
+        )
+
+        self.arm_test_action_server = ActionServer(
+            self,
+            ArmTestMove,
+            "/arm/test_move",
+            execute_callback=self.execute_arm_test_move,
+            goal_callback=self.arm_test_goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=self._action_group,
+        )
+
+        self.arm_recorded_path_action_server = ActionServer(
+            self,
+            ArmRecordedPath,
+            "/arm/recorded_path",
+            execute_callback=self.execute_arm_recorded_path,
+            goal_callback=self.arm_recorded_path_goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=self._action_group,
         )
 
         self.joint_state_pub = self.create_publisher(
@@ -395,6 +541,8 @@ class MoveItDynamixelBridge(Node):
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
             f"gripper_type={self.gripper_type}, gripper_ids={self.gripper_ids}, "
+            f"gripper_change_mode={self.gripper_change_mode}, "
+            f"gripper_disabled={self.gripper_disabled}, "
             f"read_only={self.read_only}, gripper_only_mode={self.gripper_only_mode})"
         )
 
@@ -438,72 +586,84 @@ class MoveItDynamixelBridge(Node):
                 f"Goal PWM 설정: id={dxl_id} -> {self.gripper_goal_pwm} "
                 f"(최대 885, 파지 토크 상한)")
 
-    def _ensure_operating_mode(self, dxl_id, label, extended):
-        """Operating Mode 를 이 축이 요구하는 값으로 맞춘다 (토크 인가 **전에** 호출).
+    def _required_gripper_mode(self, dxl_id):
+        return self.gripper_required_operating_modes.get(
+            dxl_id, self.gripper_required_operating_mode)
 
-        ⚠️ 2026-08-09 실기: 그리퍼(id 3)가 **Velocity 모드(1)** 로 남아 있어 파지가 계속
-           실패했다. Velocity 모드에서는 Goal Position(116) 이 **통째로 무시된다** — 브릿지가
-           tick 을 써넣는 것도 성공하고(레지스터에 -401 이 그대로 들어가 있었다), 토크도
-           켜져 있고, Hardware Error 도 0 인데, 서보는 Goal Velocity(=0) 만 따르므로
-           **한 tick 도 움직이지 않는다.** 에러가 아무데도 안 나서 원인을 찾기 어렵다.
-
-           증상: 그리퍼 position 이 세션 내내 고정값, effort 가 정확히 0.0(빈손이어도
-           62~119 는 나와야 한다), FSM 은 `grasp effort 0.0 below threshold` 로 실패.
-
-        그 전까지 이 브릿지는 모드를 **한 번도 쓰지 않고** 다른 도구(레거시
-        `dynamixel_position_node`, `gripper_calibration` 등)가 남긴 값을 그대로 물려받았다.
-        그래서 그 도구들을 돌린 뒤 모드가 바뀌어 있으면 조용히 깨졌다.
-        """
-        desired = MODE_EXTENDED_POSITION if extended else MODE_POSITION
-        current, result, error = self.packet_handler.read1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_OPERATING_MODE)
-        if result != 0:
-            self.get_logger().warn(
-                f"Operating Mode 조회 실패: {label}, id={dxl_id}, result={result}")
-            return False
-        if current == desired:
-            return True
-
-        # 주소 11 은 EEPROM 이라 토크가 걸린 채로는 안 써진다 — 반드시 먼저 끈다.
-        self.packet_handler.write1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
-        result, error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_OPERATING_MODE, desired)
-        readback, _, _ = self.packet_handler.read1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_OPERATING_MODE)
-        if result != 0 or readback != desired:
+    def _enable_torque(self, dxl_id, label, required_mode=None):
+        """현재 위치를 goal로 검증 동기화한 뒤에만 해당 ID의 torque를 켠다."""
+        try:
+            with self._bus_lock:
+                torque = self._read_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1, "startup torque")
+                if torque != TORQUE_DISABLE:
+                    raise RuntimeError(
+                        f"startup requires Torque OFF, readback={torque}")
+                if required_mode is not None:
+                    mode = self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1,
+                        "startup operating mode")
+                    if mode != required_mode:
+                        raise RuntimeError(
+                            f"operating mode mismatch: expected "
+                            f"{required_mode}, read {mode}; automatic mode "
+                            "writes are disabled")
+                present = self._read_register(
+                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                    "startup present position", signed=True)
+                self._write_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4,
+                    present & 0xFFFFFFFF, "startup synchronize goal")
+                goal_readback = self._read_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4,
+                    "startup goal readback", signed=True)
+                if abs(goal_readback - present) > 1:
+                    raise RuntimeError(
+                        f"Present->Goal readback mismatch: "
+                        f"present={present}, goal={goal_readback}")
+                self._write_motion_profile(dxl_id, label)
+                self._write_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                    TORQUE_ENABLE, "startup torque enable")
+                torque_readback = self._read_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                    "startup torque readback")
+                if torque_readback != TORQUE_ENABLE:
+                    raise RuntimeError(
+                        f"Torque ON readback failed: {torque_readback}")
+        except Exception as exc:
             self.get_logger().error(
-                f"Operating Mode 설정 실패: {label}, id={dxl_id}, "
-                f"{current} → {desired} 시도했으나 현재 {readback} "
-                f"(result={result}, error={error}) — 이 축은 명령이 무시된다")
+                f"Torque enable blocked: {label}, id={dxl_id}: {exc}")
             return False
-        self.get_logger().warn(
-            f"Operating Mode 교정: {label}, id={dxl_id}, {current} → {desired} "
-            f"({'extended position' if extended else 'position'}). "
-            "다른 도구가 모드를 바꿔놓은 상태였다.")
+        self.get_logger().info(f"Torque enabled safely: {label} -> id {dxl_id}")
         return True
-
-    def _enable_torque(self, dxl_id, label, extended=False):
-        # 모드가 틀리면 Goal Position 이 무시되므로 토크보다 먼저 맞춘다(EEPROM = 토크 OFF 필요).
-        if not self._ensure_operating_mode(dxl_id, label, extended):
-            return False
-        # 토크 인가 전에 모션 프로파일부터 넣는다(급가속 트립 방지).
-        self._write_motion_profile(dxl_id, label)
-        result, error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE
-        )
-        if result != 0 or error != 0:
-            self.get_logger().warn(
-                f"Torque enable failed: {label}, id={dxl_id}, result={result}, error={error}"
-            )
-            return False
-        else:
-            self.get_logger().info(f"Torque enabled: {label} -> id {dxl_id}")
-            return True
 
     def _joint_gear_ratio(self, joint_name):
         """실측으로 덮어쓸 수 있는 기어비(`gear_ratios` 파라미터 > JOINT_CONFIG 기본값)."""
         return self.gear_ratios.get(joint_name, JOINT_CONFIG[joint_name]["gear_ratio"])
+
+    def _read_register(self, dxl_id, address, size, label, signed=False):
+        reader = {
+            1: self.packet_handler.read1ByteTxRx,
+            2: self.packet_handler.read2ByteTxRx,
+            4: self.packet_handler.read4ByteTxRx,
+        }[size]
+        value, result, error = reader(self.port_handler, dxl_id, address)
+        if result != 0 or error != 0:
+            raise RuntimeError(
+                f"ID {dxl_id} {label} read failed: result={result}, error={error}")
+        return to_signed(value, size) if signed else value
+
+    def _write_register(self, dxl_id, address, size, value, label):
+        writer = {
+            1: self.packet_handler.write1ByteTxRx,
+            4: self.packet_handler.write4ByteTxRx,
+        }[size]
+        result, error = writer(
+            self.port_handler, dxl_id, address, value)
+        if result != 0 or error != 0:
+            raise RuntimeError(
+                f"ID {dxl_id} {label} write failed: result={result}, error={error}")
 
     def rad_to_tick(self, joint_name, rad):
         """관절 rad → 서보 tick. 안전 리밋 clamp 후 기어비를 곱해 서보축 도메인으로 올린다.
@@ -544,6 +704,28 @@ class MoveItDynamixelBridge(Node):
             return max(DXL_EXTENDED_MIN_TICK, min(DXL_EXTENDED_MAX_TICK, tick))
         return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
 
+    def gripper_pos_to_ratio(self, rad):
+        """Convert the logical joint position to close ratio (open=0, close=1)."""
+        span = self.gripper_close_rad - self.gripper_open_rad
+        ratio = 0.0 if span == 0.0 else (rad - self.gripper_open_rad) / span
+        return max(0.0, min(1.0, ratio))
+
+    def gripper_goals_for_ratio(self, ratio):
+        """Map one logical close ratio to independently calibrated motor goals."""
+        ratio = max(0.0, min(1.0, float(ratio)))
+        if not self.gripper_motor_endpoints:
+            return {gid: self.gripper_pos_to_tick(
+                self.gripper_open_rad + ratio * (
+                    self.gripper_close_rad - self.gripper_open_rad))
+                    for gid in self.gripper_ids}
+        if set(self.gripper_motor_endpoints) != set(self.gripper_ids):
+            raise RuntimeError("gripper endpoint IDs do not match selected IDs")
+        return {
+            gid: int(round(values["open"] + ratio * (
+                values["close"] - values["open"])))
+            for gid, values in self.gripper_motor_endpoints.items()
+        }
+
     def gripper_tick_to_pos(self, tick):
         span = self.gripper_open_tick - self.gripper_close_tick
         if span == 0:
@@ -581,7 +763,131 @@ class MoveItDynamixelBridge(Node):
         self.get_logger().info("Received FollowJointTrajectory goal")
         return GoalResponse.ACCEPT
 
+    def _gripper_commands_allowed(self):
+        """Return true only for calibrated position-command operation."""
+        if not self.gripper_command_calibrated:
+            return False
+        if self.gripper_required_operating_modes:
+            return (set(self.gripper_required_operating_modes)
+                    == set(self.gripper_ids)
+                    and self.gripper_observed_operating_modes
+                    == self.gripper_required_operating_modes)
+        return (self.gripper_observed_operating_mode
+                == self.gripper_required_operating_mode)
+
+    def _gripper_startup_torque_allowed(self):
+        """Only the dual gripper may retain its historical startup behavior."""
+        return self.end_effector_kind == "gripper" \
+            and self._gripper_commands_allowed()
+
+    def gripper_goal_callback(self, goal_request):
+        """Reject gripper motion until mode and endpoints are commissioned."""
+        if (getattr(self, "gripper_disabled", False)
+                or self.end_effector_kind != "gripper" or self.read_only
+                or not self._gripper_commands_allowed()):
+            self.get_logger().warn(
+                "Rejecting gripper goal: command calibration/mode gate closed")
+            return GoalResponse.REJECT
+        return self.goal_callback(goal_request)
+
+    def rotate_goal_callback(self, goal_request):
+        """Accept rotation only for the selected single-axis rotary preset."""
+        if (self.read_only or self.end_effector_kind != "rotary"
+                or self.gripper_ids != [5]
+                or not self._gripper_commands_allowed()):
+            self.get_logger().warn(
+                "Rejecting rotate goal: rotary_id5 preset is not active")
+            return GoalResponse.REJECT
+        if goal_request.max_abs_current < 0 or goal_request.timeout < 0.0:
+            return GoalResponse.REJECT
+        if not goal_request.relative and not 0 <= goal_request.ticks <= 4095:
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def arm_test_goal_callback(self, goal_request):
+        """Accept only the explicitly approved four-axis tick sequence."""
+        requested = tuple(zip(goal_request.motor_ids, goal_request.delta_ticks))
+        fixed_sequence = requested == ARM_TEST_SEQUENCE
+        random_sequence = (
+            bool(goal_request.random_demo)
+            and self.random_demo_enabled
+            and tuple(goal_request.motor_ids) == tuple(ARM_ID_SEQUENCE)
+            and len(goal_request.delta_ticks) == len(ARM_ID_SEQUENCE)
+            and all(abs(int(delta)) <= 2 * RANDOM_ARM_RANGES[dxl_id]
+                    for dxl_id, delta in requested)
+        )
+        if (self.read_only or not self.integrated_test_mode
+                or self.gripper_only_mode
+                or self.end_effector_kind != "rotary"
+                or self.gripper_ids != [5]
+                or not (fixed_sequence and not goal_request.random_demo
+                        or random_sequence)):
+            self.get_logger().warn(
+                "Rejecting arm test goal: mode/preset/sequence gate closed")
+            return GoalResponse.REJECT
+        if (goal_request.max_abs_current < 0
+                or goal_request.stall_timeout < 0.0
+                or goal_request.step_timeout < 0.0):
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    @staticmethod
+    def split_recorded_path_request(goal_request):
+        """Validate and split the flattened, signed recorded-path request."""
+        motor_ids = tuple(int(v) for v in goal_request.motor_ids)
+        counts = tuple(int(v) for v in goal_request.waypoint_counts)
+        flat = tuple(int(v) for v in goal_request.signed_waypoints)
+        if motor_ids != RECORDED_PATH_IDS:
+            raise ValueError(
+                f"motor_ids must be exactly {list(RECORDED_PATH_IDS)}")
+        if len(counts) != len(motor_ids) or any(count <= 0 for count in counts):
+            raise ValueError("one positive waypoint_count is required per motor")
+        if sum(counts) != len(flat):
+            raise ValueError("waypoint_counts do not match signed_waypoints")
+
+        paths = []
+        offset = 0
+        for dxl_id, count in zip(motor_ids, counts):
+            waypoints = flat[offset:offset + count]
+            offset += count
+            if dxl_id == 12 and any(not 0 <= value <= 4095
+                                    for value in waypoints):
+                raise ValueError("ID 12 Mode 3 waypoint outside [0, 4095]")
+            deltas = [b - a for a, b in zip(waypoints, waypoints[1:])]
+            if any(delta == 0 or abs(delta) > RECORDED_PATH_MAX_WAYPOINT_STEP
+                   for delta in deltas):
+                raise ValueError("waypoint step must be in [1, 50] ticks")
+            signs = {1 if delta > 0 else -1 for delta in deltas}
+            if len(signs) > 1:
+                raise ValueError(f"ID {dxl_id} waypoint direction reverses")
+            paths.append((dxl_id, waypoints))
+        return paths
+
+    def arm_recorded_path_goal_callback(self, goal_request):
+        """Accept only the explicit three-axis signed recorded-path action."""
+        try:
+            self.split_recorded_path_request(goal_request)
+        except ValueError as exc:
+            self.get_logger().warn(f"Rejecting recorded path: {exc}")
+            return GoalResponse.REJECT
+        if (self.read_only or not self.integrated_test_mode
+                or self.gripper_only_mode
+                or self.end_effector_kind != "rotary"
+                or self.gripper_ids != [5]
+                or int(goal_request.max_abs_current) <= 0
+                or float(goal_request.stall_timeout) <= 0.0
+                or float(goal_request.step_timeout) <= 0.0
+                or not 1 <= int(goal_request.goal_tolerance) <= 10):
+            self.get_logger().warn(
+                "Rejecting recorded path: mode/preset/safety gate closed")
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
     def arm_goal_callback(self, goal_request):
+        if getattr(self, "integrated_test_mode", False):
+            self.get_logger().error(
+                "Integrated test mode: rejecting normal arm trajectory")
+            return GoalResponse.REJECT
         if self.gripper_only_mode:
             self.get_logger().error(
                 "Gripper-only mode: rejecting arm FollowJointTrajectory goal")
@@ -602,9 +908,10 @@ class MoveItDynamixelBridge(Node):
         if dxl_id not in ARM_IDS:
             self.get_logger().warn(f"Unknown arm motor ID from teleop: {dxl_id}")
             return
-        if self.gripper_only_mode:
+        if (self.gripper_only_mode
+                or getattr(self, "integrated_test_mode", False)):
             self.get_logger().error(
-                f"Gripper-only mode: rejecting arm teleop command id={dxl_id}")
+                f"Diagnostic mode: rejecting arm teleop command id={dxl_id}")
             return
         if self.read_only:
             self.get_logger().warn("Read-only mode: ignoring teleop goal")
@@ -649,9 +956,10 @@ class MoveItDynamixelBridge(Node):
         return result
 
     def trajectory_callback(self, msg):
-        if self.gripper_only_mode:
+        if (self.gripper_only_mode
+                or getattr(self, "integrated_test_mode", False)):
             self.get_logger().error(
-                "Gripper-only mode: rejecting arm trajectory topic command")
+                "Diagnostic mode: rejecting arm trajectory topic command")
             return
         if self.read_only:
             self.get_logger().warn("Read-only mode: ignoring arm trajectory")
@@ -704,10 +1012,734 @@ class MoveItDynamixelBridge(Node):
         self.group_sync_write.clearParam()
 
     # ------------------------------------------------------------------ gripper
+    @staticmethod
+    def arm_test_goal_reached(position, goal, velocity, tolerance):
+        return abs(position - goal) <= tolerance and velocity == 0
+
+    @staticmethod
+    def recorded_direction_violation(delta, expected_direction, state):
+        """Track a sustained reverse episode while tolerating brief rebound."""
+        if delta * expected_direction < -2:
+            state["samples"] += 1
+            state["ticks"] += abs(delta)
+            return state["samples"] >= 3 or state["ticks"] > 10
+        if delta * expected_direction >= 0:
+            state["samples"] = 0
+            state["ticks"] = 0
+        return False
+
+    def execute_arm_test_move(self, goal_handle):
+        """Run the approved one-motor-at-a-time four-axis tick sequence."""
+        request = goal_handle.request
+        result = ArmTestMove.Result()
+        completed = 0
+        succeeded = False
+        canceled = False
+        reason = "unknown failure"
+        selected = (
+            self.integrated_test_mode
+            and not self.read_only
+            and not self.gripper_only_mode
+            and self.end_effector_kind == "rotary"
+            and self.gripper_ids == [5]
+        )
+        sequence = tuple(zip(request.motor_ids, request.delta_ticks))
+        random_demo = bool(request.random_demo)
+        current_limit = int(request.max_abs_current) \
+            or self.arm_test_max_abs_current
+        stall_timeout = float(request.stall_timeout) \
+            or self.arm_test_stall_timeout
+        step_timeout = float(request.step_timeout) \
+            or self.arm_test_step_timeout
+
+        try:
+            if not selected:
+                raise RuntimeError("integrated_test_mode + rotary_id5 required")
+            if random_demo:
+                if (not self.random_demo_enabled
+                        or tuple(request.motor_ids) != tuple(ARM_ID_SEQUENCE)):
+                    raise RuntimeError("random arm demo gate/ID sequence invalid")
+            elif sequence != ARM_TEST_SEQUENCE:
+                raise RuntimeError(
+                    f"arm test sequence must be {ARM_TEST_SEQUENCE}")
+
+            # Fail closed unless every approved arm starts torque-free and
+            # fault-free. ID 5 is deliberately not touched by this action.
+            with self._bus_lock:
+                starts = {}
+                for dxl_id in ARM_ID_SEQUENCE:
+                    torque = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, "arm torque")
+                    hardware_error = self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "arm hardware error")
+                    starts[dxl_id] = self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        "arm starting position", signed=True)
+                    if torque != TORQUE_DISABLE:
+                        raise RuntimeError(
+                            f"ID {dxl_id} Torque must start OFF")
+                    if hardware_error != 0:
+                        raise RuntimeError(
+                            f"ID {dxl_id} hardware error "
+                            f"0x{hardware_error:02X}")
+                if random_demo:
+                    id5_torque = self._read_register(
+                        5, ADDR_TORQUE_ENABLE, 1, "ID5 torque")
+                    id5_error = self._read_register(
+                        5, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "ID5 hardware error")
+                    if id5_torque != TORQUE_DISABLE or id5_error != 0:
+                        raise RuntimeError(
+                            "ID 5 must start Torque OFF with Hardware Error 0")
+            if random_demo and self._random_arm_baseline is None:
+                self._random_arm_baseline = starts
+
+            for dxl_id, delta in sequence:
+                if goal_handle.is_cancel_requested:
+                    canceled = True
+                    reason = "canceled before next arm step"
+                    break
+                with self._bus_lock:
+                    mode = self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1, "operating mode")
+                    torque = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, "torque")
+                    hardware_error = self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "hardware error")
+                    start = self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        "present position", signed=True)
+                if mode not in (3, 4):
+                    raise RuntimeError(
+                        f"ID {dxl_id} position mode must be 3 or 4, got {mode}")
+                if torque != TORQUE_DISABLE:
+                    raise RuntimeError(f"ID {dxl_id} Torque is not OFF")
+                if hardware_error != 0:
+                    raise RuntimeError(
+                        f"ID {dxl_id} hardware error 0x{hardware_error:02X}")
+                goal = start + int(delta)
+                if random_demo:
+                    baseline = self._random_arm_baseline[dxl_id]
+                    offset = goal - baseline
+                    if (abs(offset) < 5
+                            or abs(offset) > RANDOM_ARM_RANGES[dxl_id]):
+                        raise RuntimeError(
+                            f"ID {dxl_id} random target offset {offset} "
+                            f"outside approved range")
+                if mode == 3 and not 0 <= goal <= 4095:
+                    raise RuntimeError(
+                        f"ID {dxl_id} goal {goal} outside [0, 4095]")
+                encoded_goal = goal & 0xFFFFFFFF
+
+                try:
+                    with self._bus_lock:
+                        self._write_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4,
+                            start & 0xFFFFFFFF, "synchronize arm goal")
+                        synced_goal = self._read_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4,
+                            "synchronized arm goal readback", signed=True)
+                        if synced_goal != start:
+                            raise RuntimeError(
+                                f"ID {dxl_id} Present->Goal readback mismatch: "
+                                f"present={start}, goal={synced_goal}")
+                        self._write_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_ENABLE,
+                            "arm test torque enable")
+                        self.torque_enabled_ids.add(dxl_id)
+                        self._write_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4, encoded_goal,
+                            "arm test goal")
+
+                    deadline = time.monotonic() + step_timeout
+                    last_progress_time = time.monotonic()
+                    last_progress_position = start
+                    step_complete = False
+                    while time.monotonic() < deadline:
+                        if goal_handle.is_cancel_requested:
+                            canceled = True
+                            reason = f"canceled during ID {dxl_id}"
+                            break
+                        with self._bus_lock:
+                            position = self._read_register(
+                                dxl_id, ADDR_PRESENT_POSITION, 4,
+                                "present position", signed=True)
+                            velocity = self._read_register(
+                                dxl_id, ADDR_PRESENT_VELOCITY, 4,
+                                "present velocity", signed=True)
+                            current = self._read_register(
+                                dxl_id, ADDR_PRESENT_LOAD, 2,
+                                "present current", signed=True)
+                            moving_status = self._read_register(
+                                dxl_id, ADDR_MOVING_STATUS, 1,
+                                "moving status")
+                            hardware_error = self._read_register(
+                                dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                "hardware error")
+                        feedback = ArmTestMove.Feedback()
+                        feedback.motor_id = dxl_id
+                        feedback.goal_position = goal
+                        feedback.present_position = position
+                        feedback.present_velocity = velocity
+                        feedback.present_current = current
+                        feedback.moving_status = moving_status
+                        feedback.hardware_error = hardware_error
+                        goal_handle.publish_feedback(feedback)
+                        if hardware_error:
+                            raise RuntimeError(
+                                f"ID {dxl_id} hardware error "
+                                f"0x{hardware_error:02X}")
+                        if abs(current) >= current_limit:
+                            raise RuntimeError(
+                                f"ID {dxl_id} abs(current) {abs(current)} "
+                                f"reached limit {current_limit}")
+                        if self.arm_test_goal_reached(
+                                position, goal, velocity,
+                                self.arm_test_goal_tolerance_ticks):
+                            step_complete = True
+                            break
+                        if abs(position - last_progress_position) >= 2:
+                            last_progress_position = position
+                            last_progress_time = time.monotonic()
+                        elif (time.monotonic() - last_progress_time
+                                >= stall_timeout):
+                            raise RuntimeError(f"ID {dxl_id} position stalled")
+                        time.sleep(0.05)
+                    if canceled:
+                        break
+                    if not step_complete:
+                        raise RuntimeError(f"ID {dxl_id} step timeout")
+                finally:
+                    with self._bus_lock:
+                        self._write_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                            "arm step torque disable")
+                        torque_readback = self._read_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1,
+                            "arm step torque readback")
+                    self.torque_enabled_ids.discard(dxl_id)
+                    if torque_readback != TORQUE_DISABLE:
+                        raise RuntimeError(
+                            f"ID {dxl_id} Torque OFF readback failed: "
+                            f"{torque_readback}")
+                completed += 1
+
+            if not canceled and completed == len(sequence):
+                succeeded = True
+                reason = "approved arm test sequence completed"
+        except Exception as exc:
+            reason = str(exc)
+        finally:
+            # Once this diagnostic mode is selected, all arm exits explicitly
+            # disable and verify all four IDs, even those not yet reached.
+            if selected:
+                final_errors = []
+                for dxl_id in ARM_ID_SEQUENCE:
+                    try:
+                        with self._bus_lock:
+                            self._write_register(
+                                dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                TORQUE_DISABLE, "final arm torque disable")
+                            torque = self._read_register(
+                                dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                "final arm torque readback")
+                        self.torque_enabled_ids.discard(dxl_id)
+                        if torque != TORQUE_DISABLE:
+                            final_errors.append(
+                                f"ID {dxl_id} torque readback={torque}")
+                    except Exception as exc:
+                        final_errors.append(f"ID {dxl_id}: {exc}")
+                if random_demo:
+                    try:
+                        with self._bus_lock:
+                            self._write_register(
+                                5, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                                "final random demo ID5 torque disable")
+                            id5_torque = self._read_register(
+                                5, ADDR_TORQUE_ENABLE, 1,
+                                "final random demo ID5 torque readback")
+                        self.torque_enabled_ids.discard(5)
+                        if id5_torque != TORQUE_DISABLE:
+                            final_errors.append(
+                                f"ID 5 torque readback={id5_torque}")
+                    except Exception as exc:
+                        final_errors.append(f"ID 5: {exc}")
+                if final_errors:
+                    succeeded = False
+                    reason = "final Torque OFF failed: " + "; ".join(final_errors)
+
+        result.success = succeeded
+        result.completed_steps = completed
+        result.reason = reason
+        if canceled:
+            goal_handle.canceled()
+        elif succeeded:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return result
+
+    def execute_arm_recorded_path(self, goal_handle):
+        """Replay a validated signed path without writing ID 16 or ID 5."""
+        request = goal_handle.request
+        result = ArmRecordedPath.Result()
+        completed = 0
+        succeeded = False
+        canceled = False
+        reason = "unknown failure"
+        selected = (
+            self.integrated_test_mode
+            and not self.read_only
+            and not self.gripper_only_mode
+            and self.end_effector_kind == "rotary"
+            and self.gripper_ids == [5]
+        )
+        try:
+            if not selected:
+                raise RuntimeError("integrated_test_mode + rotary_id5 required")
+            paths = self.split_recorded_path_request(request)
+            current_limit = int(request.max_abs_current)
+            stall_timeout = float(request.stall_timeout)
+            step_timeout = float(request.step_timeout)
+            tolerance = int(request.goal_tolerance)
+
+            # Read all five safety states, but never write ID 16 or ID 5.
+            starts = {}
+            with self._bus_lock:
+                for dxl_id in (*RECORDED_PATH_IDS, 16, 5):
+                    torque = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, "recorded path torque")
+                    hardware_error = self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "recorded path hardware error")
+                    starts[dxl_id] = self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        "recorded path starting position", signed=True)
+                    if torque != TORQUE_DISABLE:
+                        raise RuntimeError(f"ID {dxl_id} Torque must start OFF")
+                    if hardware_error != 0:
+                        raise RuntimeError(
+                            f"ID {dxl_id} hardware error 0x{hardware_error:02X}")
+                for dxl_id in RECORDED_PATH_IDS:
+                    mode = self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1, "operating mode")
+                    required_mode = 4 if dxl_id in (14, 13) else 3
+                    if mode != required_mode:
+                        raise RuntimeError(
+                            f"ID {dxl_id} mode must be {required_mode}, got {mode}")
+
+            for dxl_id, waypoints in paths:
+                start_error = abs(starts[dxl_id] - waypoints[0])
+                allowed = RECORDED_PATH_START_TOLERANCE[dxl_id]
+                if start_error > allowed:
+                    raise RuntimeError(
+                        f"ID {dxl_id} start error {start_error} exceeds {allowed}")
+
+            for dxl_id, waypoints in paths:
+                # Earlier joints can mechanically displace a torque-free later
+                # joint, so repeat the start gate immediately before each axis.
+                with self._bus_lock:
+                    phase_start = self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        "recorded axis starting position", signed=True)
+                    phase_torque = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        "recorded axis starting torque")
+                    phase_error = self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "recorded axis starting hardware error")
+                allowed = RECORDED_PATH_START_TOLERANCE[dxl_id]
+                if abs(phase_start - waypoints[0]) > allowed:
+                    raise RuntimeError(
+                        f"ID {dxl_id} phase start error "
+                        f"{abs(phase_start - waypoints[0])} exceeds {allowed}")
+                if phase_torque != TORQUE_DISABLE or phase_error != 0:
+                    raise RuntimeError(
+                        f"ID {dxl_id} unsafe phase start torque={phase_torque} "
+                        f"error={phase_error}")
+                try:
+                    # Synchronize once, then retain torque across every
+                    # waypoint for this axis to prevent gravity rebound.
+                    with self._bus_lock:
+                        self._write_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4,
+                            phase_start & 0xFFFFFFFF,
+                            "synchronize recorded axis goal")
+                        synced_goal = self._read_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4,
+                            "synchronized recorded goal readback", signed=True)
+                        if synced_goal != phase_start:
+                            raise RuntimeError(
+                                f"ID {dxl_id} Present->Goal readback mismatch: "
+                                f"present={phase_start}, goal={synced_goal}")
+                        self._write_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_ENABLE,
+                            "recorded path axis torque enable")
+                    self.torque_enabled_ids.add(dxl_id)
+
+                    for waypoint_index, goal in enumerate(waypoints):
+                        if goal_handle.is_cancel_requested:
+                            canceled = True
+                            reason = "canceled before next recorded waypoint"
+                            break
+                        with self._bus_lock:
+                            hardware_error = self._read_register(
+                                dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                "hardware error")
+                            start = self._read_register(
+                                dxl_id, ADDR_PRESENT_POSITION, 4,
+                                "present position", signed=True)
+                        if hardware_error != 0:
+                            raise RuntimeError(
+                                f"ID {dxl_id} hardware error "
+                                f"0x{hardware_error:02X}")
+                        if abs(start - goal) <= tolerance:
+                            completed += 1
+                            continue
+                        expected_direction = 1 if goal > start else -1
+                        encoded_goal = goal & 0xFFFFFFFF
+                        with self._bus_lock:
+                            self._write_register(
+                                dxl_id, ADDR_GOAL_POSITION, 4, encoded_goal,
+                                "recorded path goal")
+
+                        deadline = time.monotonic() + step_timeout
+                        last_progress_time = time.monotonic()
+                        last_progress_position = start
+                        last_observed_position = start
+                        reverse_state = {"samples": 0, "ticks": 0}
+                        step_complete = False
+                        while time.monotonic() < deadline:
+                            if goal_handle.is_cancel_requested:
+                                canceled = True
+                                reason = f"canceled during ID {dxl_id}"
+                                break
+                            with self._bus_lock:
+                                position = self._read_register(
+                                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                                    "present position", signed=True)
+                                velocity = self._read_register(
+                                    dxl_id, ADDR_PRESENT_VELOCITY, 4,
+                                    "present velocity", signed=True)
+                                current = self._read_register(
+                                    dxl_id, ADDR_PRESENT_LOAD, 2,
+                                    "present current", signed=True)
+                                moving_status = self._read_register(
+                                    dxl_id, ADDR_MOVING_STATUS, 1,
+                                    "moving status")
+                                hardware_error = self._read_register(
+                                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                    "hardware error")
+                            feedback = ArmRecordedPath.Feedback()
+                            feedback.motor_id = dxl_id
+                            feedback.waypoint_index = waypoint_index
+                            feedback.goal_position = goal
+                            feedback.present_position = position
+                            feedback.present_velocity = velocity
+                            feedback.present_current = current
+                            feedback.moving_status = moving_status
+                            feedback.hardware_error = hardware_error
+                            goal_handle.publish_feedback(feedback)
+                            if hardware_error:
+                                raise RuntimeError(
+                                    f"ID {dxl_id} hardware error "
+                                    f"0x{hardware_error:02X}")
+                            if abs(current) >= current_limit:
+                                raise RuntimeError(
+                                    f"ID {dxl_id} abs(current) {abs(current)} "
+                                    f"reached limit {current_limit}")
+                            observed_delta = position - last_observed_position
+                            if self.recorded_direction_violation(
+                                    observed_delta, expected_direction,
+                                    reverse_state):
+                                raise RuntimeError(
+                                    f"ID {dxl_id} sustained opposite movement "
+                                    f"samples={reverse_state['samples']} "
+                                    f"ticks={reverse_state['ticks']}")
+                            last_observed_position = position
+                            if self.arm_test_goal_reached(
+                                    position, goal, velocity, tolerance):
+                                step_complete = True
+                                break
+                            if abs(position - last_progress_position) >= 2:
+                                last_progress_position = position
+                                last_progress_time = time.monotonic()
+                            elif time.monotonic() - last_progress_time >= stall_timeout:
+                                raise RuntimeError(f"ID {dxl_id} position stalled")
+                            time.sleep(0.05)
+                        if canceled:
+                            break
+                        if not step_complete:
+                            raise RuntimeError(
+                                f"ID {dxl_id} waypoint {waypoint_index} timeout")
+                        completed += 1
+                finally:
+                    with self._bus_lock:
+                        self._write_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                            "recorded axis torque disable")
+                        torque_readback = self._read_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1,
+                            "recorded axis torque readback")
+                    if torque_readback != TORQUE_DISABLE:
+                        raise RuntimeError(
+                            f"ID {dxl_id} Torque OFF readback failed")
+                    self.torque_enabled_ids.discard(dxl_id)
+                if canceled:
+                    break
+
+            if not canceled and completed == sum(request.waypoint_counts):
+                succeeded = True
+                reason = "recorded path completed"
+        except Exception as exc:
+            reason = str(exc)
+        finally:
+            final_errors = []
+            if selected:
+                # Only controlled arm IDs receive safety writes. ID 16 and ID 5
+                # are deliberately read-only throughout this action.
+                for dxl_id in RECORDED_PATH_IDS:
+                    try:
+                        with self._bus_lock:
+                            torque = self._read_register(
+                                dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                "final recorded path torque readback")
+                            if torque != TORQUE_DISABLE:
+                                self._write_register(
+                                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                    TORQUE_DISABLE,
+                                    "final recorded path torque disable")
+                                torque = self._read_register(
+                                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                    "final recorded path torque re-readback")
+                            hardware_error = self._read_register(
+                                dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                "final recorded path hardware error")
+                        self.torque_enabled_ids.discard(dxl_id)
+                        if torque != TORQUE_DISABLE or hardware_error != 0:
+                            final_errors.append(
+                                f"ID {dxl_id} torque={torque} "
+                                f"error={hardware_error}")
+                    except Exception as exc:
+                        final_errors.append(f"ID {dxl_id}: {exc}")
+                for dxl_id in (16, 5):
+                    try:
+                        with self._bus_lock:
+                            torque = self._read_register(
+                                dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                "untouched final torque readback")
+                            hardware_error = self._read_register(
+                                dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                "untouched final hardware error")
+                        if torque != TORQUE_DISABLE or hardware_error != 0:
+                            final_errors.append(
+                                f"ID {dxl_id} torque={torque} error={hardware_error}")
+                    except Exception as exc:
+                        final_errors.append(f"ID {dxl_id}: {exc}")
+            if final_errors:
+                succeeded = False
+                reason = "final safety readback failed: " + "; ".join(final_errors)
+
+        result.success = succeeded
+        result.completed_waypoints = completed
+        result.reason = reason
+        if canceled:
+            goal_handle.canceled()
+        elif succeeded:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return result
+
+    @staticmethod
+    def rotation_goal(start, relative, ticks):
+        """Resolve a tick-space rotary request without wraparound surprises."""
+        goal = start + int(ticks) if relative else int(ticks)
+        if not DXL_MINIMUM_POSITION_VALUE <= goal <= DXL_MAXIMUM_POSITION_VALUE:
+            raise ValueError(
+                f"goal {goal} outside Position Mode limits [0, 4095]")
+        return goal
+
+    def execute_rotate(self, goal_handle):
+        """Execute one guarded tick-space move for the rotary ID 5 preset."""
+        request = goal_handle.request
+        result = EndEffectorRotate.Result()
+        dxl_id = 5
+        start = None
+        final = None
+        maximum_current = 0
+        reason = "unknown failure"
+        succeeded = False
+        canceled = False
+        selected = False
+        current_limit = int(request.max_abs_current) \
+            or self.end_effector_max_abs_current
+        timeout = float(request.timeout) or self.end_effector_motion_timeout
+        try:
+            if (self.end_effector_kind != "rotary"
+                    or self.gripper_ids != [dxl_id]):
+                raise RuntimeError("rotary_id5 preset is not active")
+            selected = True
+            with self._bus_lock:
+                mode = self._read_register(
+                    dxl_id, ADDR_OPERATING_MODE, 1, "operating mode")
+                torque = self._read_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1, "torque")
+                hardware_error = self._read_register(
+                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                    "hardware error")
+                start_signed = self._read_register(
+                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                    "present position", signed=True)
+                start = start_signed % 4096
+            if mode != 3:
+                raise RuntimeError(f"Operating Mode must be 3, got {mode}")
+            if torque != 0:
+                raise RuntimeError("Torque must be OFF before rotate action")
+            if hardware_error != 0:
+                raise RuntimeError(
+                    f"hardware error 0x{hardware_error:02X}")
+            goal = self.rotation_goal(start, request.relative, request.ticks)
+
+            with self._bus_lock:
+                self._write_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4, start,
+                    "synchronize goal")
+                synced_goal = self._read_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4,
+                    "synchronized goal readback", signed=True)
+                if synced_goal != start:
+                    raise RuntimeError(
+                        f"ID {dxl_id} Present->Goal readback mismatch: "
+                        f"present={start}, goal={synced_goal}")
+                self._write_register(
+                    dxl_id, ADDR_PROFILE_ACCELERATION, 4,
+                    self.end_effector_profile_acceleration,
+                    "profile acceleration")
+                self._write_register(
+                    dxl_id, ADDR_PROFILE_VELOCITY, 4,
+                    self.end_effector_profile_velocity,
+                    "profile velocity")
+                self._write_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_ENABLE,
+                    "torque enable")
+                self.torque_enabled_ids.add(dxl_id)
+                self._write_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4, goal,
+                    "rotate goal")
+
+            deadline = time.monotonic() + timeout
+            last_progress_time = time.monotonic()
+            last_progress_position = start
+            while time.monotonic() < deadline:
+                if goal_handle.is_cancel_requested:
+                    canceled = True
+                    reason = "canceled"
+                    break
+                with self._bus_lock:
+                    position_signed = self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        "present position", signed=True)
+                    velocity = self._read_register(
+                        dxl_id, ADDR_PRESENT_VELOCITY, 4,
+                        "present velocity", signed=True)
+                    current = self._read_register(
+                        dxl_id, ADDR_PRESENT_LOAD, 2,
+                        "present current", signed=True)
+                    moving_status = self._read_register(
+                        dxl_id, ADDR_MOVING_STATUS, 1, "moving status")
+                    hardware_error = self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "hardware error")
+                final = position_signed % 4096
+                maximum_current = max(maximum_current, abs(current))
+                feedback = EndEffectorRotate.Feedback()
+                feedback.goal_position = goal
+                feedback.present_position = final
+                feedback.present_velocity = velocity
+                feedback.present_current = current
+                feedback.moving_status = moving_status
+                feedback.hardware_error = hardware_error
+                goal_handle.publish_feedback(feedback)
+                if hardware_error:
+                    reason = f"hardware error 0x{hardware_error:02X}"
+                    break
+                if abs(current) >= current_limit:
+                    reason = (
+                        f"abs(current) {abs(current)} reached limit "
+                        f"{current_limit}")
+                    break
+                if abs(final - goal) <= self.end_effector_goal_tolerance_ticks \
+                        and velocity == 0:
+                    succeeded = True
+                    reason = "goal reached"
+                    break
+                if abs(final - last_progress_position) >= 2:
+                    last_progress_position = final
+                    last_progress_time = time.monotonic()
+                elif time.monotonic() - last_progress_time \
+                        >= self.end_effector_stall_timeout:
+                    reason = "position stalled"
+                    break
+                time.sleep(0.1)
+            else:
+                reason = "motion timeout"
+        except Exception as exc:
+            reason = str(exc)
+        finally:
+            try:
+                # Never touch ID 5 when a different preset is selected.  Once
+                # rotary_id5 is selected, every exit path must leave it OFF.
+                if not selected:
+                    raise RuntimeError(
+                        "no Torque write: rotary_id5 preset is not active")
+                with self._bus_lock:
+                    self._write_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                        "final torque disable")
+                    torque_readback = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        "final torque readback")
+                self.torque_enabled_ids.discard(dxl_id)
+                if torque_readback != TORQUE_DISABLE:
+                    succeeded = False
+                    reason = f"Torque OFF readback failed: {torque_readback}"
+            except Exception as exc:
+                succeeded = False
+                if selected:
+                    reason = f"final Torque OFF failed: {exc}"
+
+        if final is None:
+            final = start if start is not None else 0
+        result.success = succeeded
+        result.final_position = int(final)
+        result.actual_delta = int(final - start) if start is not None else 0
+        result.max_abs_current = int(maximum_current)
+        result.reason = reason
+        if canceled:
+            goal_handle.canceled()
+        elif succeeded:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return result
+
     def execute_gripper(self, goal_handle):
         trajectory = goal_handle.request.trajectory
 
         result = FollowJointTrajectory.Result()
+
+        if (getattr(self, "gripper_disabled", False)
+                or self.end_effector_kind != "gripper"
+                or not self._gripper_commands_allowed()):
+            self.get_logger().error(
+                "Gripper execution blocked: command calibration/mode gate closed")
+            goal_handle.abort()
+            result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+            result.error_string = "Gripper command calibration or mode is not verified"
+            return result
 
         if not self.gripper_ids:
             self.get_logger().warn("Gripper goal received but gripper_ids is empty — ignored")
@@ -718,15 +1750,18 @@ class MoveItDynamixelBridge(Node):
         if trajectory.points:
             point = trajectory.points[-1]
             name_to_pos = dict(zip(trajectory.joint_names, point.positions))
-            # 단일 구동 조인트(gripper_left_pinion_joint)만 사용 — 나머지 3개(우 피니언·좌우 랙)는
-            # URDF <mimic> 으로 종속된다. 두 서보(id 3,4)에는 같은 goal_tick 을 보낸다.
+            # Preset의 논리 구동 조인트 하나를 실제 gripper_ids 전체에 매핑한다.
             target_rad = None
             for jn in self.gripper_joints:
                 if jn in name_to_pos:
                     target_rad = name_to_pos[jn]
                     break
             if target_rad is not None:
-                self._write_gripper(target_rad)
+                if not self._write_gripper(target_rad):
+                    goal_handle.abort()
+                    result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+                    result.error_string = "Dual gripper motion failed; both motors torqued off"
+                    return result
             else:
                 self.get_logger().warn(
                     f"Gripper goal has no known finger joint {self.gripper_joints}"
@@ -737,23 +1772,103 @@ class MoveItDynamixelBridge(Node):
         result.error_string = "Gripper command sent to Dynamixel"
         return result
 
-    def _write_gripper(self, rad):
-        if self.read_only:
-            self.get_logger().warn("Read-only mode: ignoring gripper command")
-            return
-        goal_tick = self.gripper_pos_to_tick(rad)
+    def _torque_off_gripper(self, reason):
+        """Best-effort paired stop: a fault on either motor disables both."""
+        failures = []
         for gid in self.gripper_ids:
-            result, error = self.packet_handler.write4ByteTxRx(
-                self.port_handler, gid, ADDR_GOAL_POSITION, goal_tick
-            )
-            if result != 0 or error != 0:
-                self.get_logger().warn(
-                    f"Gripper write failed: id={gid}, result={result}, error={error}"
-                )
-        self.get_logger().info(
-            f"gripper -> {rad:.4f} rad -> tick {goal_tick} "
-            f"(ids {self.gripper_ids})"
-        )
+            try:
+                self._write_register(
+                    gid, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                    f"dual gripper emergency stop ({reason})")
+                self.torque_enabled_ids.discard(gid)
+            except Exception as exc:
+                failures.append(f"ID {gid}: {exc}")
+        if failures:
+            self.get_logger().error(
+                f"Dual gripper Torque OFF incomplete ({reason}): "
+                + "; ".join(failures))
+            return False
+        self.get_logger().error(
+            f"Dual gripper Torque OFF: IDs {self.gripper_ids} ({reason})")
+        return True
+
+    def _write_gripper(self, rad):
+        if (getattr(self, "gripper_disabled", False)
+                or self.end_effector_kind != "gripper" or self.read_only
+                or not self._gripper_commands_allowed()):
+            self.get_logger().warn(
+                "Ignoring gripper command: read-only/calibration/mode gate closed")
+            return False
+
+        ratio = self.gripper_pos_to_ratio(rad)
+        goals = self.gripper_goals_for_ratio(ratio)
+        positions = {}
+        last_progress = {}
+        try:
+            with self._bus_lock:
+                for gid in self.gripper_ids:
+                    mode = self._read_register(
+                        gid, ADDR_OPERATING_MODE, 1, "gripper operating mode")
+                    required = self._required_gripper_mode(gid)
+                    if mode != required:
+                        raise RuntimeError(
+                            f"ID {gid} mode {mode}, expected {required}")
+                    hardware_error = self._read_register(
+                        gid, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        "gripper hardware error")
+                    if hardware_error:
+                        raise RuntimeError(
+                            f"ID {gid} hardware error 0x{hardware_error:02X}")
+                    positions[gid] = self._read_register(
+                        gid, ADDR_PRESENT_POSITION, 4,
+                        "gripper start position", signed=True)
+                for gid, goal in goals.items():
+                    self._write_register(
+                        gid, ADDR_GOAL_POSITION, 4, goal & 0xFFFFFFFF,
+                        f"gripper ratio {ratio:.4f} goal")
+
+            now = time.monotonic()
+            last_progress = {gid: now for gid in self.gripper_ids}
+            deadline = now + self.end_effector_motion_timeout
+            while time.monotonic() < deadline:
+                reached = True
+                with self._bus_lock:
+                    for gid in self.gripper_ids:
+                        position = self._read_register(
+                            gid, ADDR_PRESENT_POSITION, 4,
+                            "gripper present position", signed=True)
+                        current = self._read_register(
+                            gid, ADDR_PRESENT_LOAD, 2,
+                            "gripper present current", signed=True)
+                        hardware_error = self._read_register(
+                            gid, ADDR_HARDWARE_ERROR_STATUS, 1,
+                            "gripper hardware error")
+                        if hardware_error:
+                            raise RuntimeError(
+                                f"ID {gid} hardware error 0x{hardware_error:02X}")
+                        if abs(current) >= self.end_effector_max_abs_current:
+                            raise RuntimeError(
+                                f"ID {gid} abs(current) {abs(current)} reached "
+                                f"limit {self.end_effector_max_abs_current}")
+                        error_ticks = abs(goals[gid] - position)
+                        if error_ticks > self.end_effector_goal_tolerance_ticks:
+                            reached = False
+                            if abs(position - positions[gid]) >= 2:
+                                positions[gid] = position
+                                last_progress[gid] = time.monotonic()
+                            elif (time.monotonic() - last_progress[gid]
+                                  >= self.end_effector_stall_timeout):
+                                raise RuntimeError(
+                                    f"ID {gid} position stalled")
+                if reached:
+                    self.get_logger().info(
+                        f"gripper ratio={ratio:.4f}, goals={goals} reached")
+                    return True
+                time.sleep(0.05)
+            raise RuntimeError("dual gripper motion timeout")
+        except Exception as exc:
+            self._torque_off_gripper(str(exc))
+            return False
 
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
@@ -812,6 +1927,7 @@ class MoveItDynamixelBridge(Node):
         # 한 모터라도 부하가 크면 파지로 보는 보수적(안전 측) 집계이며, FSM 이 이 effort 로
         # 파지/DROP 을 판정한다.
         gripper_samples = []
+        gripper_fault_reason = None
         for gid in self.gripper_ids:
             if gid not in self.active_ids:
                 fault = True
@@ -823,14 +1939,32 @@ class MoveItDynamixelBridge(Node):
             load_raw, tick, hw_error, velocity_raw = sample
             if hw_error != 0:
                 fault = True
+                gripper_fault_reason = (
+                    f"ID {gid} hardware error 0x{hw_error:02X}")
+            if abs(load_raw) >= self.end_effector_max_abs_current:
+                fault = True
+                gripper_fault_reason = (
+                    f"ID {gid} abs(current) {abs(load_raw)} reached "
+                    f"limit {self.end_effector_max_abs_current}")
             gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
+
+        if (gripper_fault_reason
+                and any(gid in self.torque_enabled_ids
+                        for gid in self.gripper_ids)):
+            with self._bus_lock:
+                self._torque_off_gripper(gripper_fault_reason)
 
         if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
             representative_tick = gripper_samples[0][1]
             representative_velocity_raw = gripper_samples[0][2]
             max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
-            finger_rad = self.gripper_tick_to_pos(representative_tick)
-            finger_vel = self.gripper_velocity_to_rad_s(representative_velocity_raw)
+            if self.end_effector_kind == "rotary":
+                finger_rad = representative_tick / TICKS_PER_RAD
+                finger_vel = representative_velocity_raw * VELOCITY_LSB_TO_RAD_S
+            else:
+                finger_rad = self.gripper_tick_to_pos(representative_tick)
+                finger_vel = self.gripper_velocity_to_rad_s(
+                    representative_velocity_raw)
             for jn in self.gripper_joints:
                 msg.name.append(jn)
                 msg.position.append(finger_rad)
@@ -885,11 +2019,14 @@ def main(args=None):
     rclpy.init(args=args)
     node = MoveItDynamixelBridge()
 
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

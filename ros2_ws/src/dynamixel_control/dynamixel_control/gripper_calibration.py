@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe two-motor XL430 gripper endpoint and gradual-grasp calibration."""
+"""Safe XL430 gripper endpoint, grasp, and temporary motion calibration."""
 
 import argparse
 import json
@@ -13,6 +13,8 @@ DEVICE = "/dev/ttyUSB0"
 BAUD_RATE = 1_000_000
 PROTOCOL_VERSION = 2.0
 DXL_IDS = (3, 4)
+CALIBRATION_ID = 5
+ARM_IDS = {12, 13, 14, 16}
 EXPECTED_MODEL = 1060
 
 ADDR_MODEL_NUMBER = 0
@@ -22,7 +24,9 @@ ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_PROFILE_ACCELERATION = 108
 ADDR_PROFILE_VELOCITY = 112
 ADDR_GOAL_POSITION = 116
+ADDR_MOVING_STATUS = 123
 ADDR_PRESENT_LOAD = 126
+ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_POSITION = 132
 
 TORQUE_OFF = 0
@@ -145,6 +149,25 @@ class Bus:
             raise CalibrationError(
                 f"sync goal write: {self.packet.getTxRxResult(result)}")
 
+    def write_goal(self, dxl_id, goal):
+        """Write one position goal without involving the two-motor path."""
+        self._write(dxl_id, ADDR_GOAL_POSITION, 4, goal, "goal position")
+
+    def motion_snapshot(self, dxl_id):
+        """Read feedback used by temporary low-level motion calibration."""
+        return {
+            "position": signed(self.read4(
+                dxl_id, ADDR_PRESENT_POSITION, "position"), 32),
+            "velocity": signed(self.read4(
+                dxl_id, ADDR_PRESENT_VELOCITY, "present velocity"), 32),
+            "current": signed(self.read2(
+                dxl_id, ADDR_PRESENT_LOAD, "present current"), 16),
+            "moving_status": self.read1(
+                dxl_id, ADDR_MOVING_STATUS, "moving status"),
+            "hardware_error": self.read1(
+                dxl_id, ADDR_HARDWARE_ERROR_STATUS, "hardware error"),
+        }
+
 
 def require_safe_read_state(bus, require_position_mode=False):
     snapshots = {dxl_id: bus.snapshot(dxl_id) for dxl_id in DXL_IDS}
@@ -266,6 +289,156 @@ def stage_configure_profile(args):
               "EEPROM was not changed.")
     finally:
         bus.close()
+
+
+def require_single_motor_safe_state(bus, dxl_id):
+    """Require the identified ID 5 XL430 to be safe for position motion."""
+    if dxl_id in ARM_IDS:
+        raise CalibrationError(f"ID {dxl_id} is an arm motor and is forbidden")
+    if dxl_id != CALIBRATION_ID:
+        raise CalibrationError(
+            f"temporary motion calibration permits only ID {CALIBRATION_ID}")
+    state = bus.snapshot(dxl_id)
+    if state["model"] != EXPECTED_MODEL:
+        raise CalibrationError(
+            f"ID {dxl_id}: model {state['model']} != {EXPECTED_MODEL}")
+    if state["operating_mode"] != POSITION_MODE:
+        raise CalibrationError(
+            f"ID {dxl_id}: Operating Mode must be 3, got "
+            f"{state['operating_mode']}")
+    if state["torque"] != TORQUE_OFF:
+        raise CalibrationError(
+            f"ID {dxl_id}: Torque must be OFF before calibration")
+    if state["hardware_error"] != 0:
+        raise CalibrationError(
+            f"ID {dxl_id}: hardware error 0x{state['hardware_error']:02X}")
+    return state
+
+
+def validate_motion_args(args):
+    if args.id in ARM_IDS:
+        raise CalibrationError(f"ID {args.id} is an arm motor and is forbidden")
+    if args.id != CALIBRATION_ID:
+        raise CalibrationError(
+            f"temporary motion calibration permits only ID {CALIBRATION_ID}")
+    if not 1 <= args.profile_acceleration <= 25:
+        raise CalibrationError("profile acceleration must be in [1, 25]")
+    if not 1 <= args.profile_velocity <= 80:
+        raise CalibrationError("profile velocity must be in [1, 80]")
+    if args.max_abs_current < 1:
+        raise CalibrationError("current limit must be positive")
+    if args.stall_timeout <= 0 or args.timeout <= 0 or args.sample_hz <= 0:
+        raise CalibrationError("timeouts and sample rate must be positive")
+    if args.goal_tolerance < 0:
+        raise CalibrationError("goal tolerance must be non-negative")
+
+
+def motion_goal(args, present_position):
+    """Calculate a Mode-3 goal using the current single-turn position."""
+    present_modulo = present_position % 4096
+    if args.stage == "move-relative":
+        goal = present_modulo + args.delta_ticks
+    else:
+        goal = args.goal_ticks
+    if not 0 <= goal <= 4095:
+        raise CalibrationError(
+            f"goal {goal} is outside Position Mode limits [0, 4095]")
+    return present_modulo, goal
+
+
+def stage_motion(args):
+    """Run one explicitly approved low-level ID 5 calibration movement."""
+    validate_motion_args(args)
+    bus = Bus()
+    bus.open()
+    execute = bool(args.execute)
+    try:
+        initial = require_single_motor_safe_state(bus, args.id)
+        present_modulo, goal = motion_goal(args, initial["position"])
+        print(
+            f"ID {args.id}: present_signed={initial['position']} "
+            f"present_modulo={present_modulo} goal={goal} "
+            f"delta={goal - present_modulo}")
+        if not execute:
+            print("DRY RUN: no profile, Goal Position, or Torque register was written")
+            return
+
+        bus.write_goal(args.id, present_modulo)
+        bus.set_profile(
+            args.id, args.profile_acceleration, args.profile_velocity)
+        profile_acceleration = bus.read4(
+            args.id, ADDR_PROFILE_ACCELERATION, "profile acceleration")
+        profile_velocity = bus.read4(
+            args.id, ADDR_PROFILE_VELOCITY, "profile velocity")
+        if (profile_acceleration != args.profile_acceleration or
+                profile_velocity != args.profile_velocity):
+            raise CalibrationError("profile readback verification failed")
+        print(
+            f"Profile readback: acceleration={profile_acceleration}, "
+            f"velocity={profile_velocity}")
+
+        bus.set_torque(args.id, True)
+        bus.write_goal(args.id, goal)
+        deadline = time.monotonic() + args.timeout
+        last_progress_time = time.monotonic()
+        last_progress_position = present_modulo
+        max_abs_current = 0
+        final = None
+        while time.monotonic() < deadline:
+            state = bus.motion_snapshot(args.id)
+            position_modulo = state["position"] % 4096
+            max_abs_current = max(
+                max_abs_current, abs(state["current"]))
+            print(
+                f"goal={goal} present_signed={state['position']} "
+                f"present_modulo={position_modulo} "
+                f"velocity={state['velocity']} current={state['current']} "
+                f"moving_status={state['moving_status']} "
+                f"hardware_error={state['hardware_error']}")
+            if state["hardware_error"]:
+                raise CalibrationError(
+                    f"hardware error 0x{state['hardware_error']:02X}")
+            if abs(state["current"]) >= args.max_abs_current:
+                raise CalibrationError(
+                    f"abs(current) {abs(state['current'])} reached limit "
+                    f"{args.max_abs_current}")
+            if abs(position_modulo - last_progress_position) >= 2:
+                last_progress_position = position_modulo
+                last_progress_time = time.monotonic()
+            elif (time.monotonic() - last_progress_time
+                  >= args.stall_timeout and
+                  abs(position_modulo - goal) > args.goal_tolerance):
+                raise CalibrationError(
+                    f"position stalled for {args.stall_timeout:.1f}s")
+            final = state
+            if (abs(position_modulo - goal) <= args.goal_tolerance and
+                    state["velocity"] == 0):
+                print(
+                    f"Reached goal: actual_delta="
+                    f"{position_modulo - present_modulo}, "
+                    f"max_abs_current={max_abs_current}")
+                return
+            time.sleep(1.0 / args.sample_hz)
+        final_position = None if final is None else final["position"] % 4096
+        raise CalibrationError(
+            f"motion timeout after {args.timeout:.1f}s; "
+            f"last_position={final_position}")
+    finally:
+        if execute:
+            try:
+                bus.set_torque(args.id, False)
+                torque = bus.read1(
+                    args.id, ADDR_TORQUE_ENABLE, "torque readback")
+                print(f"Final Torque Enable readback: {torque}")
+                if torque != TORQUE_OFF:
+                    raise CalibrationError(
+                        f"Torque OFF readback verification failed: {torque}")
+            except Exception as exc:
+                print(f"ERROR: failed to disable/read back torque: {exc}")
+                raise CalibrationError(
+                    "final Torque OFF could not be verified") from exc
+        bus.close()
+        print("Serial port closed")
 
 
 def load_endpoints(path):
@@ -491,6 +664,28 @@ def parser():
     grasp.add_argument("--initial-settle-seconds", type=float, default=1.0)
     grasp.add_argument("--extra-settle-seconds", type=float, default=0.5)
     grasp.set_defaults(func=stage_grasp)
+
+    def add_motion_arguments(command):
+        command.add_argument("--id", type=int, default=CALIBRATION_ID)
+        command.add_argument("--execute", action="store_true")
+        command.add_argument("--profile-acceleration", type=int, default=5)
+        command.add_argument("--profile-velocity", type=int, default=20)
+        command.add_argument("--max-abs-current", type=int, default=100)
+        command.add_argument("--stall-timeout", type=float, default=2.0)
+        command.add_argument("--timeout", type=float, default=10.0)
+        command.add_argument("--sample-hz", type=float, default=10.0)
+        command.add_argument("--goal-tolerance", type=int, default=2)
+        command.set_defaults(func=stage_motion)
+
+    relative = sub.add_parser(
+        "move-relative", help="temporary guarded ID 5 relative tick motion")
+    relative.add_argument("--delta-ticks", type=int, required=True)
+    add_motion_arguments(relative)
+
+    absolute = sub.add_parser(
+        "move-absolute", help="temporary guarded ID 5 absolute tick motion")
+    absolute.add_argument("--goal-ticks", type=int, required=True)
+    add_motion_arguments(absolute)
     return root
 
 

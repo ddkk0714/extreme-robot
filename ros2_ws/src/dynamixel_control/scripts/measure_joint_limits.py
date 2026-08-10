@@ -199,7 +199,7 @@ def main():
         print(f'    "{args.joint_name}": {{')
         print(f'        "lower": {safe_lower:+.4f},')
         print(f'        "upper": {safe_upper:+.4f},')
-        print(f'        "confidence": "measured",')
+        print('        "confidence": "measured",')
         print(f'        "source": "2026-08-07 하드스톱 실측 '
               f'(span {math.degrees(span):.1f}°, 마진 {args.margin:.1f}°)",')
         print("    },")
