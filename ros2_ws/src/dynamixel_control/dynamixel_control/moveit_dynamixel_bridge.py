@@ -263,10 +263,9 @@ class MoveItDynamixelBridge(Node):
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
         if self.gripper_disabled:
-            # Keep the logical gripper joint/MoveIt geometry, but remove every
-            # physical gripper ID before the serial port is opened.  All bus
-            # registration, feedback, torque, PWM and trajectory paths use
-            # this list as their hardware authority.
+            # 논리 그리퍼 관절과 MoveIt 형상은 유지하되 직렬 포트를 열기 전에 모든
+            # 물리 그리퍼 ID를 제거한다. 모든 버스 등록, 피드백, 토크, PWM, 궤적
+            # 경로는 이 목록을 하드웨어 대상의 기준으로 사용한다.
             self.gripper_ids = []
         self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
         self.gripper_close_rad = float(self.get_parameter("gripper_close_rad").value)
@@ -415,8 +414,8 @@ class MoveItDynamixelBridge(Node):
                     f"팔 {sorted(ARM_IDS)} + 그리퍼 {self.gripper_ids}"
                 )
         elif self.integrated_test_mode:
-            # Diagnostic integration mode owns the same bus but performs no
-            # startup writes. Actions enable only the motor currently tested.
+            # 진단 통합 모드는 같은 버스를 소유하지만 기동 시 쓰기를 수행하지 않는다.
+            # 액션은 현재 테스트하는 모터만 활성화한다.
             for dxl_id in ARM_ID_SEQUENCE + list(self.gripper_ids):
                 if self.group_sync_read.addParam(dxl_id):
                     self.active_ids.add(dxl_id)
@@ -433,10 +432,9 @@ class MoveItDynamixelBridge(Node):
                     self.active_ids.add(config["id"])
                     self.torque_enabled_ids.add(config["id"])
 
-            # Gripper startup writes require independently verified endpoints
-            # and the position-control mode expected by Goal Position.  Mode
-            # initialization belongs to an explicit commissioning utility; the
-            # production bridge never changes EEPROM/RAM control modes.
+            # 그리퍼 기동 쓰기에는 별도로 검증한 끝점과 Goal Position이 기대하는 위치
+            # 제어 모드가 필요하다. 모드 초기화는 명시적인 시운전 유틸리티가 담당하며,
+            # 운영 브리지는 EEPROM/RAM 제어 모드를 변경하지 않는다.
             if self._gripper_startup_torque_allowed():
                 for gid in self.gripper_ids:
                     if self._enable_torque(
@@ -705,13 +703,13 @@ class MoveItDynamixelBridge(Node):
         return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
 
     def gripper_pos_to_ratio(self, rad):
-        """Convert the logical joint position to close ratio (open=0, close=1)."""
+        """논리 관절 위치를 닫힘 비율(open=0, close=1)로 변환한다."""
         span = self.gripper_close_rad - self.gripper_open_rad
         ratio = 0.0 if span == 0.0 else (rad - self.gripper_open_rad) / span
         return max(0.0, min(1.0, ratio))
 
     def gripper_goals_for_ratio(self, ratio):
-        """Map one logical close ratio to independently calibrated motor goals."""
+        """논리 닫힘 비율 하나를 개별 캘리브레이션된 모터 목표로 매핑한다."""
         ratio = max(0.0, min(1.0, float(ratio)))
         if not self.gripper_motor_endpoints:
             return {gid: self.gripper_pos_to_tick(
@@ -764,7 +762,7 @@ class MoveItDynamixelBridge(Node):
         return GoalResponse.ACCEPT
 
     def _gripper_commands_allowed(self):
-        """Return true only for calibrated position-command operation."""
+        """캘리브레이션된 위치 명령 동작일 때만 참을 반환한다."""
         if not self.gripper_command_calibrated:
             return False
         if self.gripper_required_operating_modes:
@@ -776,12 +774,12 @@ class MoveItDynamixelBridge(Node):
                 == self.gripper_required_operating_mode)
 
     def _gripper_startup_torque_allowed(self):
-        """Only the dual gripper may retain its historical startup behavior."""
+        """듀얼 그리퍼에만 기존 기동 동작을 허용한다."""
         return self.end_effector_kind == "gripper" \
             and self._gripper_commands_allowed()
 
     def gripper_goal_callback(self, goal_request):
-        """Reject gripper motion until mode and endpoints are commissioned."""
+        """모드와 끝점의 시운전이 끝날 때까지 그리퍼 동작을 거부한다."""
         if (getattr(self, "gripper_disabled", False)
                 or self.end_effector_kind != "gripper" or self.read_only
                 or not self._gripper_commands_allowed()):
@@ -791,7 +789,7 @@ class MoveItDynamixelBridge(Node):
         return self.goal_callback(goal_request)
 
     def rotate_goal_callback(self, goal_request):
-        """Accept rotation only for the selected single-axis rotary preset."""
+        """선택한 단일축 회전 프리셋에 대해서만 회전을 수락한다."""
         if (self.read_only or self.end_effector_kind != "rotary"
                 or self.gripper_ids != [5]
                 or not self._gripper_commands_allowed()):
@@ -805,7 +803,7 @@ class MoveItDynamixelBridge(Node):
         return GoalResponse.ACCEPT
 
     def arm_test_goal_callback(self, goal_request):
-        """Accept only the explicitly approved four-axis tick sequence."""
+        """명시적으로 승인된 4축 tick 시퀀스만 수락한다."""
         requested = tuple(zip(goal_request.motor_ids, goal_request.delta_ticks))
         fixed_sequence = requested == ARM_TEST_SEQUENCE
         random_sequence = (
@@ -833,7 +831,7 @@ class MoveItDynamixelBridge(Node):
 
     @staticmethod
     def split_recorded_path_request(goal_request):
-        """Validate and split the flattened, signed recorded-path request."""
+        """평탄화된 signed 기록 경로 요청을 검증하고 분리한다."""
         motor_ids = tuple(int(v) for v in goal_request.motor_ids)
         counts = tuple(int(v) for v in goal_request.waypoint_counts)
         flat = tuple(int(v) for v in goal_request.signed_waypoints)
@@ -864,7 +862,7 @@ class MoveItDynamixelBridge(Node):
         return paths
 
     def arm_recorded_path_goal_callback(self, goal_request):
-        """Accept only the explicit three-axis signed recorded-path action."""
+        """명시적인 3축 signed 기록 경로 액션만 수락한다."""
         try:
             self.split_recorded_path_request(goal_request)
         except ValueError as exc:
@@ -1018,7 +1016,7 @@ class MoveItDynamixelBridge(Node):
 
     @staticmethod
     def recorded_direction_violation(delta, expected_direction, state):
-        """Track a sustained reverse episode while tolerating brief rebound."""
+        """짧은 반동은 허용하면서 지속되는 역방향 구간을 추적한다."""
         if delta * expected_direction < -2:
             state["samples"] += 1
             state["ticks"] += abs(delta)
@@ -1029,7 +1027,7 @@ class MoveItDynamixelBridge(Node):
         return False
 
     def execute_arm_test_move(self, goal_handle):
-        """Run the approved one-motor-at-a-time four-axis tick sequence."""
+        """승인된 4축 tick 시퀀스를 모터 하나씩 실행한다."""
         request = goal_handle.request
         result = ArmTestMove.Result()
         completed = 0
@@ -1063,8 +1061,8 @@ class MoveItDynamixelBridge(Node):
                 raise RuntimeError(
                     f"arm test sequence must be {ARM_TEST_SEQUENCE}")
 
-            # Fail closed unless every approved arm starts torque-free and
-            # fault-free. ID 5 is deliberately not touched by this action.
+            # 승인된 모든 팔 축이 torque-free 및 fault-free로 시작하지 않으면 안전
+            # 측으로 실패한다. 이 액션은 의도적으로 ID 5를 건드리지 않는다.
             with self._bus_lock:
                 starts = {}
                 for dxl_id in ARM_ID_SEQUENCE:
@@ -1232,8 +1230,8 @@ class MoveItDynamixelBridge(Node):
         except Exception as exc:
             reason = str(exc)
         finally:
-            # Once this diagnostic mode is selected, all arm exits explicitly
-            # disable and verify all four IDs, even those not yet reached.
+            # 이 진단 모드를 선택하면 아직 도달하지 않은 축을 포함해 모든 종료
+            # 경로에서 4개 ID를 명시적으로 비활성화하고 확인한다.
             if selected:
                 final_errors = []
                 for dxl_id in ARM_ID_SEQUENCE:
@@ -1282,7 +1280,7 @@ class MoveItDynamixelBridge(Node):
         return result
 
     def execute_arm_recorded_path(self, goal_handle):
-        """Replay a validated signed path without writing ID 16 or ID 5."""
+        """ID 16이나 ID 5에 쓰지 않고 검증된 signed 경로를 재생한다."""
         request = goal_handle.request
         result = ArmRecordedPath.Result()
         completed = 0
@@ -1305,7 +1303,7 @@ class MoveItDynamixelBridge(Node):
             step_timeout = float(request.step_timeout)
             tolerance = int(request.goal_tolerance)
 
-            # Read all five safety states, but never write ID 16 or ID 5.
+            # 안전 상태 5개를 모두 읽되 ID 16과 ID 5에는 절대 쓰지 않는다.
             starts = {}
             with self._bus_lock:
                 for dxl_id in (*RECORDED_PATH_IDS, 16, 5):
@@ -1338,8 +1336,8 @@ class MoveItDynamixelBridge(Node):
                         f"ID {dxl_id} start error {start_error} exceeds {allowed}")
 
             for dxl_id, waypoints in paths:
-                # Earlier joints can mechanically displace a torque-free later
-                # joint, so repeat the start gate immediately before each axis.
+                # 앞 관절이 torque-free 상태의 뒤 관절을 기계적으로 움직일 수 있으므로
+                # 각 축 실행 직전에 시작 게이트를 다시 확인한다.
                 with self._bus_lock:
                     phase_start = self._read_register(
                         dxl_id, ADDR_PRESENT_POSITION, 4,
@@ -1360,8 +1358,8 @@ class MoveItDynamixelBridge(Node):
                         f"ID {dxl_id} unsafe phase start torque={phase_torque} "
                         f"error={phase_error}")
                 try:
-                    # Synchronize once, then retain torque across every
-                    # waypoint for this axis to prevent gravity rebound.
+                    # 한 번 동기화한 뒤 중력 반동을 막도록 이 축의 모든 waypoint에서
+                    # 토크를 유지한다.
                     with self._bus_lock:
                         self._write_register(
                             dxl_id, ADDR_GOAL_POSITION, 4,
@@ -1498,8 +1496,8 @@ class MoveItDynamixelBridge(Node):
         finally:
             final_errors = []
             if selected:
-                # Only controlled arm IDs receive safety writes. ID 16 and ID 5
-                # are deliberately read-only throughout this action.
+                # 제어 대상 팔 ID에만 안전 쓰기를 수행한다. ID 16과 ID 5는 이 액션
+                # 전체에서 의도적으로 읽기 전용이다.
                 for dxl_id in RECORDED_PATH_IDS:
                     try:
                         with self._bus_lock:
@@ -1555,7 +1553,7 @@ class MoveItDynamixelBridge(Node):
 
     @staticmethod
     def rotation_goal(start, relative, ticks):
-        """Resolve a tick-space rotary request without wraparound surprises."""
+        """wraparound 문제 없이 tick 공간의 회전 요청을 계산한다."""
         goal = start + int(ticks) if relative else int(ticks)
         if not DXL_MINIMUM_POSITION_VALUE <= goal <= DXL_MAXIMUM_POSITION_VALUE:
             raise ValueError(
@@ -1563,7 +1561,7 @@ class MoveItDynamixelBridge(Node):
         return goal
 
     def execute_rotate(self, goal_handle):
-        """Execute one guarded tick-space move for the rotary ID 5 preset."""
+        """회전 ID 5 프리셋에 대해 보호된 tick 공간 이동을 한 번 실행한다."""
         request = goal_handle.request
         result = EndEffectorRotate.Result()
         dxl_id = 5
@@ -1690,8 +1688,8 @@ class MoveItDynamixelBridge(Node):
             reason = str(exc)
         finally:
             try:
-                # Never touch ID 5 when a different preset is selected.  Once
-                # rotary_id5 is selected, every exit path must leave it OFF.
+                # 다른 프리셋을 선택했을 때는 ID 5를 절대 건드리지 않는다.
+                # rotary_id5 선택 시 모든 종료 경로는 반드시 토크 OFF로 끝나야 한다.
                 if not selected:
                     raise RuntimeError(
                         "no Torque write: rotary_id5 preset is not active")
@@ -1773,7 +1771,7 @@ class MoveItDynamixelBridge(Node):
         return result
 
     def _torque_off_gripper(self, reason):
-        """Best-effort paired stop: a fault on either motor disables both."""
+        """최선 노력 방식의 동시 정지: 한 모터의 fault도 두 모터를 모두 끈다."""
         failures = []
         for gid in self.gripper_ids:
             try:

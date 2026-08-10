@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Hardware-free MoveIt controller endpoint for ROS graph validation.
+"""ROS 그래프 검증을 위한 하드웨어 없는 MoveIt 컨트롤러 엔드포인트.
 
-This module intentionally has no Dynamixel SDK import and never opens a serial
-device.  It mirrors only the arm FollowJointTrajectory interface used by
-MoveIt, publishes virtual joint feedback, and records every accepted command.
+이 모듈은 의도적으로 Dynamixel SDK를 import하지 않고 직렬 장치를 열지 않는다.
+MoveIt이 사용하는 팔 FollowJointTrajectory 인터페이스만 모사하고, 가상 관절
+피드백을 발행하며 수락한 모든 명령을 기록한다.
 """
 
 import threading

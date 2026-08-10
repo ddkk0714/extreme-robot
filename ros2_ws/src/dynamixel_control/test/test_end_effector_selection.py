@@ -1,4 +1,4 @@
-"""Preset isolation and mission compatibility tests (no serial hardware)."""
+"""직렬 하드웨어 없이 수행하는 프리셋 격리 및 미션 호환성 테스트."""
 
 import threading
 from types import SimpleNamespace
@@ -653,8 +653,8 @@ def test_random_goal_outside_baseline_range_aborts_and_disables_all_ids():
 
     bridge._read_register = read_register
     bridge._write_register = write_register
-    # Callback allows pose-to-pose deltas up to twice the baseline range;
-    # execution must still reject the resulting absolute baseline offset.
+    # 콜백은 기준 범위의 두 배까지 자세 간 변화량을 허용하지만, 실행 단계에서는
+    # 그 결과로 생긴 절대 기준 오프셋을 여전히 거부해야 한다.
     goal = arm_goal(
         random_demo=True,
         delta_ticks=[40, 10, 10, 10])

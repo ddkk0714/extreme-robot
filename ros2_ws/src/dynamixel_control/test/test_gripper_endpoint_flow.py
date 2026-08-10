@@ -1,4 +1,4 @@
-"""Integration tests for endpoint capture and load-calibration handoff."""
+"""끝점 캡처와 부하 캘리브레이션 전달 과정의 통합 테스트."""
 
 from types import SimpleNamespace
 
@@ -9,7 +9,7 @@ from dynamixel_control import gripper_load_calibration as load_tool
 
 
 class FakeEndpointBus:
-    """Record lifecycle calls without accessing serial hardware."""
+    """직렬 하드웨어에 접근하지 않고 생명주기 호출을 기록한다."""
 
     instances = []
 
@@ -27,7 +27,7 @@ class FakeEndpointBus:
 
 
 class FakeMotionBus:
-    """Single-ID fake for temporary relative/absolute motion tests."""
+    """임시 상대/절대 동작 테스트용 단일 ID 가짜 구현."""
 
     instances = []
 
@@ -105,7 +105,7 @@ def motion_args(stage="move-relative", execute=False, **overrides):
 
 def test_endpoint_capture_file_is_consumed_without_schema_translation(
         tmp_path, monkeypatch):
-    """Exercise the producer file and load-calibration parser together."""
+    """생성 파일과 부하 캘리브레이션 파서를 함께 검증한다."""
     output = tmp_path / "gripper_endpoints.json"
     captures = iter(({3: 739, 4: 2106}, {3: 1100, 4: 1700}))
     monkeypatch.setattr(endpoint_tool, "Bus", FakeEndpointBus)
@@ -139,7 +139,7 @@ def test_endpoint_capture_file_is_consumed_without_schema_translation(
 @pytest.mark.parametrize("samples,min_span", [(0, 50), (7, 0)])
 def test_invalid_capture_arguments_fail_before_opening_bus(
         tmp_path, samples, min_span):
-    """Reject unusable captures before acquiring the serial port."""
+    """직렬 포트를 획득하기 전에 사용할 수 없는 캡처를 거부한다."""
     FakeEndpointBus.instances.clear()
     with pytest.raises(endpoint_tool.CalibrationError):
         endpoint_tool.stage_endpoints(SimpleNamespace(

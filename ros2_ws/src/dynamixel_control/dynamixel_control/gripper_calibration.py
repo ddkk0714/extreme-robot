@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe XL430 gripper endpoint, grasp, and temporary motion calibration."""
+"""XL430 그리퍼 끝점, 파지 및 임시 동작을 안전하게 캘리브레이션한다."""
 
 import argparse
 import json
@@ -53,7 +53,7 @@ def le32(value):
 
 
 def goal_for_mode(goal, operating_mode):
-    """Convert a continuous tick goal only when Mode 3 requires wrapping."""
+    """모드 3에서 래핑이 필요할 때만 연속 tick 목표를 변환한다."""
     return goal % 4096 if operating_mode == POSITION_MODE else goal
 
 
@@ -150,11 +150,11 @@ class Bus:
                 f"sync goal write: {self.packet.getTxRxResult(result)}")
 
     def write_goal(self, dxl_id, goal):
-        """Write one position goal without involving the two-motor path."""
+        """2모터 경로를 거치지 않고 위치 목표 하나를 쓴다."""
         self._write(dxl_id, ADDR_GOAL_POSITION, 4, goal, "goal position")
 
     def motion_snapshot(self, dxl_id):
-        """Read feedback used by temporary low-level motion calibration."""
+        """임시 저수준 동작 캘리브레이션에 사용할 피드백을 읽는다."""
         return {
             "position": signed(self.read4(
                 dxl_id, ADDR_PRESENT_POSITION, "position"), 32),
@@ -252,7 +252,7 @@ def stage_endpoints(args):
 
 
 def stage_configure_profile(args):
-    """Explicitly configure and verify volatile motion-profile registers."""
+    """휘발성 모션 프로파일 레지스터를 명시적으로 설정하고 검증한다."""
     if not 1 <= args.profile_acceleration <= 32767:
         raise CalibrationError("profile acceleration must be in [1, 32767]")
     if not 1 <= args.profile_velocity <= 32767:
@@ -292,7 +292,7 @@ def stage_configure_profile(args):
 
 
 def require_single_motor_safe_state(bus, dxl_id):
-    """Require the identified ID 5 XL430 to be safe for position motion."""
+    """식별된 ID 5 XL430이 위치 동작에 안전한지 확인한다."""
     if dxl_id in ARM_IDS:
         raise CalibrationError(f"ID {dxl_id} is an arm motor and is forbidden")
     if dxl_id != CALIBRATION_ID:
@@ -334,7 +334,7 @@ def validate_motion_args(args):
 
 
 def motion_goal(args, present_position):
-    """Calculate a Mode-3 goal using the current single-turn position."""
+    """현재 단일 회전 위치를 사용해 모드 3 목표를 계산한다."""
     present_modulo = present_position % 4096
     if args.stage == "move-relative":
         goal = present_modulo + args.delta_ticks
@@ -347,7 +347,7 @@ def motion_goal(args, present_position):
 
 
 def stage_motion(args):
-    """Run one explicitly approved low-level ID 5 calibration movement."""
+    """명시적으로 승인된 저수준 ID 5 캘리브레이션 이동을 한 번 실행한다."""
     validate_motion_args(args)
     bus = Bus()
     bus.open()

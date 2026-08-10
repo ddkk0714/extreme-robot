@@ -1,4 +1,4 @@
-"""Launch the single bus owner with one explicitly selected end effector."""
+"""명시적으로 선택한 엔드이펙터 하나와 단일 버스 소유자를 실행한다."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -26,7 +26,7 @@ def _configured_nodes(context):
 
     common = {'end_effector_preset': preset_name}
     return [
-        # This is the only node in this launch file that opens /dev/ttyUSB0.
+        # 이 launch 파일에서 /dev/ttyUSB0을 여는 유일한 노드다.
         Node(
             package='dynamixel_control',
             executable='moveit_dynamixel_bridge',

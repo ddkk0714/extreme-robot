@@ -191,7 +191,7 @@ class State(Enum):
     END_EFFECTOR_ROTATE = auto()
     DONE = auto()
     FAILED = auto()
-    # Supervisor/safety states retained from the existing drivetrain contract.
+    # 기존 파워트레인 계약에서 유지하는 감독/안전 상태.
     GRIP_LOST = auto()
     LOWER_RELEASE = auto()
     STOWING = auto()
@@ -432,7 +432,7 @@ class ArmFsmNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # MoveIt path (ik_mode == 'moveit').
+        # MoveIt 경로(ik_mode == 'moveit').
         self._move = ActionClient(self, MoveGroup, 'move_action')
         self._grip = ActionClient(self, FollowJointTrajectory,
                                   '/gripper_controller/follow_joint_trajectory')
@@ -544,7 +544,7 @@ class ArmFsmNode(Node):
 
     @staticmethod
     def validate_mission_preset(mission_type, preset):
-        """Reject mismatched mission/end-effector combinations at startup."""
+        """기동 시 미션과 엔드이펙터 조합이 맞지 않으면 거부한다."""
         allowed = preset['allowed_mission']
         if mission_type not in (MISSION_PICK_PLACE, MISSION_ROTARY_TOOL):
             raise RuntimeError(f"unknown mission_type {mission_type!r}")
@@ -555,7 +555,7 @@ class ArmFsmNode(Node):
 
     @staticmethod
     def generate_random_poses(seed, count):
-        """Generate deterministic nonzero offsets inside temporary limits."""
+        """임시 제한 안에서 결정론적인 0이 아닌 오프셋을 생성한다."""
         limits = (20, 40, 40, 80)
         generator = random.Random(seed)
         poses = []
@@ -790,7 +790,7 @@ class ArmFsmNode(Node):
         self._planned_approach_xyz = None
 
     def _do_plan(self):
-        """Freeze one detection and derive separate approach and grasp targets."""
+        """검출 결과 하나를 고정하고 접근 목표와 파지 목표를 각각 계산한다."""
         self._set_status(ARM_PLANNING)
         if self.freeze_target_on_retry and self._has_frozen_target():
             # 같은 mission 안의 재시도 — 팔이 시야에 들어와 오염됐을 수 있는 새 관측 대신
@@ -815,7 +815,7 @@ class ArmFsmNode(Node):
         self._transition(State.APPROACH)
 
     def _do_approach(self):
-        """Move to a clearance pose above the planned object pose."""
+        """계획된 물체 자세 위쪽의 여유 자세로 이동한다."""
         self._set_status(ARM_EXECUTING)
         if self._motion_state == 'active':
             return
@@ -833,7 +833,7 @@ class ArmFsmNode(Node):
             self._fail('approach IK failed')
 
     def _do_descend(self):
-        """Descend from the clearance pose to the frozen grasp pose."""
+        """여유 자세에서 고정된 파지 자세로 하강한다."""
         self._set_status(ARM_EXECUTING)
         if self._motion_state == 'active':
             return
@@ -853,11 +853,11 @@ class ArmFsmNode(Node):
             self._fail('descend IK failed')
 
     def _do_descend_stopped(self):
-        """Latched arm-only test endpoint after a successful DESCEND."""
+        """DESCEND 성공 후 유지되는 팔 전용 테스트 종착 상태."""
         self._set_status(ARM_EXECUTING)
 
     def _do_grasp(self):
-        """Close the gripper; success evaluation belongs to GRASP_CHECK."""
+        """그리퍼를 닫는다. 성공 여부는 GRASP_CHECK에서 판정한다."""
         if getattr(self, 'gripper_change_mode', False):
             self._transition(State.DESCEND_STOPPED)
             return
@@ -874,7 +874,7 @@ class ArmFsmNode(Node):
             self._transition(State.GRASP_CHECK)
 
     def _do_grasp_check(self):
-        """Determine grasp success from the existing joint_states effort feedback."""
+        """기존 joint_states의 effort 피드백으로 파지 성공 여부를 판정한다."""
         if getattr(self, 'gripper_change_mode', False):
             self._transition(State.DESCEND_STOPPED)
             return
@@ -1015,7 +1015,7 @@ class ArmFsmNode(Node):
             self._transition(State.DONE)
 
     def _do_arm_test_move(self):
-        """Run the fixed guarded arm sequence exactly once in test mode."""
+        """테스트 모드에서 고정된 보호 팔 시퀀스를 정확히 한 번 실행한다."""
         if (not self.integrated_test_mode
                 or self.mission_type != MISSION_ROTARY_TOOL
                 or self.end_effector_kind != 'rotary'):
@@ -1028,7 +1028,7 @@ class ArmFsmNode(Node):
             if self._arm_test_ok:
                 self._transition(State.END_EFFECTOR_ROTATE)
             else:
-                # The rotate action is never sent on this branch.
+                # 이 분기에서는 회전 액션을 절대 보내지 않는다.
                 self._fail('guarded arm test action failed')
             return
         if self._arm_test_sent:
@@ -1036,7 +1036,7 @@ class ArmFsmNode(Node):
         self._send_arm_test_goal([5, 10, 10, 20], random_demo=False)
 
     def _do_random_arm_demo(self):
-        """Move to one deterministic bounded pose, then rotate ID 5."""
+        """결정론적인 제한 자세 하나로 이동한 뒤 ID 5를 회전한다."""
         if (not self.integrated_test_mode or not self.random_demo_enabled
                 or self.mission_type != MISSION_ROTARY_TOOL
                 or self.end_effector_kind != 'rotary'):
@@ -1081,7 +1081,7 @@ class ArmFsmNode(Node):
             self._on_arm_test_goal_response)
 
     def _do_end_effector_rotate(self):
-        """Run exactly one rotary-tool action; never translate it to grasp."""
+        """회전 공구 액션을 정확히 한 번 실행하며 파지 명령으로 변환하지 않는다."""
         if (self.mission_type != MISSION_ROTARY_TOOL
                 or self.end_effector_kind != 'rotary'):
             self._fail('END_EFFECTOR_ROTATE requires ROTARY_TOOL + rotary preset')
@@ -1123,14 +1123,14 @@ class ArmFsmNode(Node):
             self._on_rotate_goal_response)
 
     def _do_done(self):
-        """Mission sequence terminal state; stowing remains the contract finalizer."""
+        """미션 시퀀스 종착 상태이며, 계약상 최종 처리는 STOWING이 담당한다."""
         self._set_status(ARM_DONE)
         if self.integrated_test_mode:
             return
         self._transition(State.STOWING)
 
     def _do_failed(self):
-        """Latched failure; a fresh pickup handshake may start another attempt."""
+        """래치된 실패 상태이며 새 픽업 핸드셰이크로 다음 시도를 시작할 수 있다."""
         self._set_status(ARM_FAILED)
 
     def _do_stowing(self):
@@ -1309,7 +1309,7 @@ class ArmFsmNode(Node):
         return ps
 
     def _grasp_pose_in_base(self):
-        """Transform the selected perception pose into the MoveIt planning frame."""
+        """선택한 인식 자세를 MoveIt 계획 프레임으로 변환한다."""
         source = self._grasp_pose()
         if source is None:
             return None
@@ -1327,8 +1327,8 @@ class ArmFsmNode(Node):
 
     @staticmethod
     def _offset_pose_z(pose, offset):
-        # ROS messages are mutable; copy so the approach offset cannot alter the
-        # frozen grasp target used by DESCEND.
+        # ROS 메시지는 변경 가능하므로, 접근 오프셋이 DESCEND에서 사용할 고정 파지
+        # 목표를 바꾸지 않도록 복사한다.
         result = deepcopy(pose)
         result.pose.position.z += offset
         return result
@@ -1545,11 +1545,11 @@ class ArmFsmNode(Node):
         self._rotate_goal_handle = None
 
     def _send_gripper(self, position):
-        """Send GRASP/RELEASE through the preset-selected gripper driver.
+        """프리셋으로 선택한 그리퍼 드라이버를 통해 GRASP/RELEASE를 보낸다.
 
-        The bridge owns hardware ID, endpoint, and operating-mode safety.  It
-        rejects this action while the restored single-motor driver remains
-        uncalibrated or ID 5 is not verified in position-control mode.
+        하드웨어 ID, 끝점 및 운전 모드 안전성은 브리지가 담당한다. 복원된 단일 모터
+        드라이버가 캘리브레이션되지 않았거나 ID 5의 위치 제어 모드가 검증되지 않은
+        동안에는 브리지가 이 액션을 거부한다.
         """
         if self.gripper_disabled:
             self.get_logger().error(
@@ -1581,7 +1581,7 @@ class ArmFsmNode(Node):
         return (self.get_clock().now() - self._state_enter_t).nanoseconds * 1e-9
 
     def _on_grasp_failure(self):
-        """Single extension point for adding a future REGRASP policy/state."""
+        """향후 REGRASP 정책/상태를 추가하기 위한 단일 확장 지점."""
         self._fail(
             f'grasp effort {self._gripper_effort():.1f} below threshold '
             f'{self.grasp_thresh:.1f}')

@@ -1,4 +1,4 @@
-"""Safety and interface tests for the hardware-free MoveIt bridge."""
+"""하드웨어 없는 MoveIt 브리지의 안전 및 인터페이스 테스트."""
 
 from pathlib import Path
 

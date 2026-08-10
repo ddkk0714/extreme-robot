@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and optionally execute the guarded reverse path from fold_path.json."""
+"""fold_path.json에서 보호된 역방향 경로를 만들고 선택적으로 실행한다."""
 
 import argparse
 import json
@@ -12,18 +12,18 @@ MAX_WAYPOINT_STEP = 50
 
 
 def significant_reversals(values, expected_sign):
-    """Count sample deltas larger than encoder noise in the wrong direction."""
+    """잘못된 방향에서 인코더 노이즈보다 큰 샘플 변화량을 센다."""
     deltas = [b - a for a, b in zip(values, values[1:])]
     return sum(delta * expected_sign < -NOISE_TICKS for delta in deltas)
 
 
 def interpolate_signed(start, end, max_step=MAX_WAYPOINT_STEP):
-    """Return signed endpoints with no segment larger than max_step."""
+    """max_step보다 큰 구간 없이 signed 끝점을 반환한다."""
     distance = end - start
     if distance == 0:
         return [start]
     steps = int(math.ceil(abs(distance) / max_step))
-    # Integer interpolation preserves endpoints and monotonic signed direction.
+    # 정수 보간으로 끝점과 단조로운 signed 방향을 보존한다.
     values = [start + int(round(distance * index / steps))
               for index in range(steps + 1)]
     return [value for index, value in enumerate(values)
@@ -31,7 +31,7 @@ def interpolate_signed(start, end, max_step=MAX_WAYPOINT_STEP):
 
 
 def build_reverse_paths(payload):
-    """Validate the manual fold recording and return 14/13/12 reverse paths."""
+    """수동 접기 기록을 검증하고 14/13/12 역방향 경로를 반환한다."""
     samples = payload.get("samples") or []
     if len(samples) < 2 or payload.get("error"):
         raise ValueError("fold recording is empty or contains a communication error")
@@ -66,14 +66,14 @@ def build_reverse_paths(payload):
 
 
 def flatten_paths(paths):
-    """Flatten paths in the action's fixed ID order."""
+    """액션의 고정 ID 순서로 경로를 평탄화한다."""
     counts = [len(paths[dxl_id]) for dxl_id in ARM_IDS]
     flat = [value for dxl_id in ARM_IDS for value in paths[dxl_id]]
     return counts, flat
 
 
 def arm_result_allows_rotation(result):
-    """Fail closed: the end effector runs only after full arm success."""
+    """안전 측으로 실패하며, 팔 전체 성공 후에만 엔드이펙터를 실행한다."""
     return bool(result is not None and result.success)
 
 

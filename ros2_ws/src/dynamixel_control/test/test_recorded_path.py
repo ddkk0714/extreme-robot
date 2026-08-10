@@ -1,4 +1,4 @@
-"""Recorded signed-path validation and bridge safety tests (no hardware)."""
+"""하드웨어 없이 수행하는 signed 기록 경로 검증 및 브리지 안전 테스트."""
 
 import threading
 from types import SimpleNamespace
