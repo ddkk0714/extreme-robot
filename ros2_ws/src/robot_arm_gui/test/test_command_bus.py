@@ -115,6 +115,71 @@ def test_expired_token_triggers_a_stop():
     assert bus.take_jog(now=200.0)[0] == 'stop'
 
 
+# ------------------------------------------------------------ 정지 사유
+def test_release_jog_stops_once_and_is_not_a_watchdog_event():
+    """키를 떼는 정상 조작이 통신 두절과 같은 경고로 기록되면 안 된다."""
+    bus = make_bus(intent_timeout_s=0.3)
+    token, _ = bus.claim('tab-A', now=100.0)
+    bus.set_jog(token, {'arm_joint_2': 0.4}, now=100.0)
+    assert bus.take_jog(now=100.0)[0] == 'active'
+
+    assert bus.release_jog(token, now=100.05) is True
+    assert bus.take_jog(now=100.06)[0] == 'stop'
+    assert bus.last_stop_reason() == 'released'
+    # 정지는 한 번뿐 — 계속 쏘면 teleop_core 의 deadman 이 발동하지 못한다.
+    assert bus.take_jog(now=100.1)[0] == 'idle'
+
+
+def test_dropped_intent_is_still_a_watchdog_stop():
+    bus = make_bus(intent_timeout_s=0.3)
+    token, _ = bus.claim('tab-A', now=100.0)
+    bus.set_jog(token, {'arm_joint_2': 0.4}, now=100.0)
+    assert bus.take_jog(now=100.0)[0] == 'active'
+
+    assert bus.take_jog(now=100.5)[0] == 'stop'
+    assert bus.last_stop_reason() == 'watchdog'
+
+
+def test_release_jog_then_new_intent_is_a_watchdog_again():
+    """해제 플래그가 다음 정지까지 남아 진짜 두절을 가리면 안 된다."""
+    bus = make_bus(intent_timeout_s=0.3)
+    token, _ = bus.claim('tab-A', now=100.0)
+    bus.set_jog(token, {'arm_joint_2': 0.4}, now=100.0)
+    bus.take_jog(now=100.0)
+    bus.release_jog(token, now=100.05)
+    bus.take_jog(now=100.06)                       # released
+
+    bus.set_jog(token, {'arm_joint_2': 0.4}, now=100.2)
+    assert bus.take_jog(now=100.2)[0] == 'active'
+    assert bus.take_jog(now=100.7)[0] == 'stop'
+    assert bus.last_stop_reason() == 'watchdog'
+
+
+def test_release_jog_while_already_stopped_emits_nothing():
+    bus = make_bus()
+    token, _ = bus.claim('tab-A', now=100.0)
+    assert bus.release_jog(token, now=100.0) is True
+    assert bus.take_jog(now=100.0)[0] == 'idle'
+
+
+def test_release_jog_requires_the_token():
+    bus = make_bus()
+    bus.claim('tab-A', now=100.0)
+    assert bus.release_jog('bogus-token', now=100.0) is False
+
+
+def test_releasing_control_is_not_a_watchdog_stop():
+    """조종권 반납도 운영자의 정상 조작이다."""
+    bus = make_bus()
+    token, _ = bus.claim('tab-A', now=100.0)
+    bus.set_jog(token, {'arm_joint_2': 0.4}, now=100.0)
+    bus.take_jog(now=100.0)
+
+    bus.release(token, now=100.05)
+    assert bus.take_jog(now=100.06)[0] == 'stop'
+    assert bus.last_stop_reason() == 'released'
+
+
 def test_jog_without_token_is_rejected():
     bus = make_bus()
     bus.claim('tab-A', now=100.0)

@@ -435,6 +435,11 @@ class StateStore:
         with self._lock:
             self._teleop['jog_publishers'] = list(publishers)
 
+    def teleop_jog_publishers(self):
+        """`/arm/teleop_jog` 를 발행 중인 노드 이름 — 제어 획득 전 충돌 검사용."""
+        with self._lock:
+            return list(self._teleop['jog_publishers'])
+
     def set_teleop_cmd(self, cmd, now):
         with self._lock:
             self._note('/arm/teleop_cmd', now)

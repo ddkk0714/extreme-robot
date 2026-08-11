@@ -24,6 +24,14 @@ ROS 를 전혀 모르고(=하드웨어 없이 pytest 로 검증 가능), `state_
 `'stop'` 을 돌려준다. 브라우저가 죽거나 네트워크가 끊겨도 팔이 마지막 속도로 계속
 도는 일이 없어야 하기 때문이다(`joystick_teleop_node` 의 `_zeroed` 래치와 같은 모양 —
 0 을 계속 쏘지 않고 한 번만 쏘고 멈춘다).
+
+## 정지에는 두 가지 사유가 있고, 둘을 구분해야 한다
+
+키를 떼는 정상 조작도 "의도가 더 이상 안 온다"로 보면 워치독과 구별되지 않는다.
+그러면 **키를 뗄 때마다 경고가 감사 로그에 쌓여 진짜 두절 신호가 묻힌다.** 그래서
+브라우저가 `release_jog` 로 "내가 놓았다"를 명시하고, 정지의 사유를 `last_stop_reason`
+으로 남긴다 — `'released'`(정상 조작) 와 `'watchdog'`(의도가 끊김). 발행되는 것은
+어느 쪽이든 **전 관절 0 한 번**으로 똑같다. 다른 건 기록뿐이다.
 """
 
 import secrets
@@ -65,6 +73,8 @@ class CommandBus:
         self._jog_at = 0.0
         self._jog_seq = 0
         self._zeroed = True        # 부팅 직후엔 이미 정지 상태다 — 0 을 쏠 필요 없다
+        self._released = False     # 다음 정지가 '놓았다'인지 '끊겼다'인지
+        self._stop_reason = None   # 마지막으로 실제 발행된 정지의 사유
 
         # 이산 명령 / 비동기 작업
         self._cmds = deque(maxlen=max_queue)
@@ -109,10 +119,14 @@ class CommandBus:
             return True
 
     def release(self, token, now):
-        """조종권 반납 — 조그 의도도 함께 지워 워치독이 정지를 내게 한다."""
+        """조종권 반납 — 조그 의도도 함께 지워 다음 tick 이 정지를 내게 한다.
+
+        반납은 **정상 조작**이므로 그 정지는 워치독으로 기록하지 않는다.
+        """
         with self._lock:
             if token != self._token:
                 return False
+            self._released = not self._zeroed
             self._drop_token()
             return True
 
@@ -138,6 +152,23 @@ class CommandBus:
             self._jog = {str(k): float(v) for k, v in velocities.items()}
             self._jog_at = now
             self._jog_seq += 1
+            self._released = False
+            return True
+
+    def release_jog(self, token, now):
+        """"데드맨을 놓았다" — 다음 tick 이 0 을 한 번 쏘고 멈춘다.
+
+        의도 전송을 그냥 끊어도 워치독이 같은 일을 하지만, 그러면 정상 조작과
+        통신 두절이 로그에서 구별되지 않는다(모듈 docstring 참고).
+        """
+        with self._lock:
+            self._expire_token(now)
+            if token != self._token:
+                return False
+            self._seen_at = now
+            self._released = not self._zeroed
+            self._jog = {}
+            self._jog_at = 0.0
             return True
 
     def take_jog(self, now):
@@ -146,6 +177,8 @@ class CommandBus:
         `'stop'` 은 만료 직후 **한 번만** 나온다. 계속 0 을 쏘면 `teleop_core` 의
         deadman(0.5초 무입력이면 적분 정지)이 영원히 발동하지 못해, 오히려 정지
         상태를 흐리게 만든다.
+
+        `'stop'` 을 돌려준 직후 `last_stop_reason()` 이 그 사유를 말해준다.
         """
         with self._lock:
             self._expire_token(now)
@@ -158,8 +191,15 @@ class CommandBus:
             if not self._zeroed:
                 self._zeroed = True
                 self._jog = {}
+                self._stop_reason = 'released' if self._released else 'watchdog'
+                self._released = False
                 return 'stop', {}
             return 'idle', None
+
+    def last_stop_reason(self):
+        """마지막으로 발행된 정지의 사유 — `'released'` | `'watchdog'` | None."""
+        with self._lock:
+            return self._stop_reason
 
     def jog_age(self, now):
         with self._lock:
@@ -233,6 +273,7 @@ class CommandBus:
                 'jog_intent_age': age,
                 'jog_seq': self._jog_seq,
                 'stopped': self._zeroed,
+                'stop_reason': self._stop_reason,
                 'token_ttl_s': self.token_ttl_s,
                 'intent_timeout_s': self.intent_timeout_s,
                 'pending_tasks': len(self._tasks),

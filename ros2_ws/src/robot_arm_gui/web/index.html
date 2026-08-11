@@ -178,6 +178,84 @@
     <div id="limit-note" class="footnote"></div>
   </section>
 
+  <!-- G. 조종 (제어 모드 전용) -------------------------------------------- -->
+  <section class="panel panel-wide" aria-labelledby="h-drive" data-control-only hidden>
+    <div class="panel-head">
+      <h2 id="h-drive">조종 — 키보드 · 게임패드</h2>
+      <div class="btn-row" style="margin:0">
+        <button id="teleop-claim" class="btn btn-primary" type="button">조종권 획득</button>
+        <button id="teleop-estop" class="btn btn-danger" type="button"
+                title="즉시 정지 + 전 관절 토크 차단 (space 와 같음)">■ 정지</button>
+      </div>
+    </div>
+
+    <div id="teleop-force-row" class="btn-row" hidden>
+      <button id="teleop-force" class="btn" type="button">강제 획득</button>
+      <span class="muted small">다른 발행자가 있어도 뚫습니다 — 이벤트에 기록됩니다.</span>
+    </div>
+
+    <div id="teleop-hint" class="muted small">—</div>
+
+    <div class="teleop-grid">
+      <div>
+        <dl class="kv" id="teleop-live"></dl>
+        <div id="teleop-bars" class="jog-bars"></div>
+      </div>
+
+      <div>
+        <div class="field-label">명령 <span class="muted">teleop_core 어휘</span></div>
+        <div id="teleop-cmds" class="btn-row"></div>
+        <details class="keymap">
+          <summary>키맵 (기존 curses TUI 와 동일)</summary>
+          <ul>
+            <li><kbd>1</kbd>–<kbd>6</kbd> 축 선택 · <kbd>↑</kbd>/<kbd>w</kbd>,
+              <kbd>↓</kbd>/<kbd>s</kbd> 조그(누르는 동안) · <kbd>[</kbd>/<kbd>]</kbd> 속도</li>
+            <li><kbd>space</kbd> 정지 · <kbd>t</kbd> 복귀 · <kbd>h</kbd> home</li>
+            <li><kbd>p</kbd> 자세 저장(토크 OFF → 슬롯 1-9) · <kbd>g</kbd> 자세 이동 ·
+              <kbd>Esc</kbd> 취소</li>
+            <li><kbd>r</kbd> 선택 축 reboot · <kbd>Shift</kbd>+<kbd>R</kbd> 전체 reboot</li>
+            <li><kbd>c</kbd>/<kbd>m</kbd>/<kbd>x</kbd> 리밋 측정 시작/기록/취소</li>
+          </ul>
+          <p class="footnote">
+            TUI 의 <kbd>e</kbd>/<kbd>l</kbd>/<kbd>y</kbd>(급변·리밋·트립 토글)는 키로 넣지
+            않았습니다 — 현재 on/off 상태를 화면이 알 수 없는 것(<code>limit</code>)이 섞여
+            있어 <strong>블라인드 토글은 실제 상태와 어긋납니다.</strong> 위 명령 버튼으로
+            <code>on</code>/<code>off</code> 를 명시적으로 보내세요.
+          </p>
+        </details>
+      </div>
+    </div>
+
+    <div class="panel-head" style="margin-top:12px">
+      <h2>게임패드</h2>
+      <div class="btn-row" style="margin:0">
+        <button id="pad-bind" class="btn" type="button">데드맨 버튼 바인딩</button>
+        <label class="inline"><span class="muted small">데드존</span>
+          <input id="pad-deadzone" class="btn num-in" type="number" step="0.01"
+                 min="0" max="0.8"></label>
+      </div>
+    </div>
+    <div id="pad-info" class="muted small">—</div>
+    <div id="pad-axes" class="pad-live"></div>
+    <div class="table-wrap">
+      <table class="tbl">
+        <caption class="sr-only">관절별 게임패드 축 매핑</caption>
+        <thead><tr>
+          <th scope="col">관절</th><th scope="col">축</th><th scope="col">스케일</th>
+          <th scope="col">반전</th><th scope="col">+버튼</th><th scope="col">−버튼</th>
+        </tr></thead>
+        <tbody id="pad-map-rows"></tbody>
+      </table>
+    </div>
+    <p class="footnote">
+      기본값은 <code>joystick_teleop</code> 의 실측 매핑입니다. ⚠️ <strong>브라우저
+      Gamepad API 의 인덱스가 Jetson 의 <code>/joy</code> 인덱스와 같다는 보장은
+      없습니다</strong> — 스틱은 표준 매핑이 우연히 일치하지만 버튼은 드라이버마다
+      다릅니다. 위 실시간 값(<code>a0…</code>/<code>b0…</code>)으로 직접 확인하고
+      데드맨은 눌러서 바인딩하세요. 설정은 이 브라우저에만 저장됩니다.
+    </p>
+  </section>
+
   <!-- D. 텔레옵 ---------------------------------------------------------- -->
   <section class="panel" aria-labelledby="h-teleop">
     <div class="panel-head"><h2 id="h-teleop">원격조종</h2></div>
@@ -208,6 +286,7 @@
 </main>
 
 <script src="/app.js"></script>
+<script src="/teleop.js"></script>
 <script src="/control.js"></script>
 </body>
 </html>

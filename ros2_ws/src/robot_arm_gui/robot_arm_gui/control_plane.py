@@ -31,10 +31,55 @@ from rcl_interfaces.srv import SetParametersAtomically
 from control_msgs.msg import JointJog
 from std_msgs.msg import String
 
+from . import teleop_vocab
 from .command_bus import CommandBus
 
 #: teleop_core 기본값과 같은 안전 상한. 파라미터 조회에 성공하면 그 값으로 대체된다.
 DEFAULT_MAX_VEL_RAD_S = 1.0
+
+#: 키보드 프론트엔드의 조그 속도 기본값(`keyboard_teleop_node` 의 같은 이름 파라미터).
+DEFAULT_JOG_VELOCITY_RAD_S = 0.7
+DEFAULT_JOG_VELOCITY_DELTA = 0.2
+
+
+def gamepad_defaults():
+    """게임패드 기본 매핑 — `joystick_teleop_node` 의 실측값을 **import 해서** 쓴다.
+
+    값을 프론트엔드에 복사해 두면 그쪽이 패드를 다시 재서 상수를 고쳤을 때 조용히
+    갈라진다(`contract.py` 를 import 하는 것과 같은 이유). 그 모듈은 import 만으로는
+    아무 부작용이 없다 — 상수와 클래스 정의뿐이다.
+
+    ⚠️ **브라우저 Gamepad API 의 인덱스가 저쪽 joydev 인덱스와 같다는 보장은 없다.**
+    스틱(0/1=왼쪽 XY, 2/3=오른쪽 XY)은 표준 매핑이 저쪽 실측 배치와 우연히 일치하지만
+    버튼은 드라이버/브라우저마다 다르다. 그래서 화면이 축·버튼 실시간 값을 그대로
+    띄우고 데드맨을 눌러서 다시 바인딩할 수 있게 한다 — 여기 값은 **출발점**이다.
+    """
+    try:
+        from dynamixel_control.joystick_teleop_node import (
+            DEFAULT_AXIS_IDS, DEFAULT_AXIS_INVERTED, DEFAULT_AXIS_SCALES,
+            DEFAULT_BUTTON_MINUS_IDS, DEFAULT_BUTTON_PLUS_IDS, DEFAULT_JOINT_NAMES,
+        )
+    except ImportError as exc:                                # pragma: no cover
+        return {'joints': [], 'reason': f'joystick_teleop 기본값을 못 읽었다: {exc}'}
+
+    joints = [
+        {
+            'name': name,
+            'axis': DEFAULT_AXIS_IDS[i],
+            'scale': DEFAULT_AXIS_SCALES[i],
+            'inverted': DEFAULT_AXIS_INVERTED[i],
+            'button_plus': DEFAULT_BUTTON_PLUS_IDS[i],
+            'button_minus': DEFAULT_BUTTON_MINUS_IDS[i],
+        }
+        for i, name in enumerate(DEFAULT_JOINT_NAMES)
+    ]
+    return {
+        'joints': joints,
+        # 이 둘만은 그쪽 declare_parameter 기본값이라 import 할 상수가 없다
+        # (joystick_teleop_node 의 `deadzone` · `deadman_button`).
+        'deadzone': 0.15,
+        'deadman_button': 9,
+    }
 
 
 class ControlPlane:
@@ -47,6 +92,8 @@ class ControlPlane:
         self.joint_names = list(joint_names)
         self.max_vel_rad_s = DEFAULT_MAX_VEL_RAD_S
         self.jog_step_rad = 0.05
+        self.publish_hz = float(publish_hz)
+        self.intent_timeout_s = float(intent_timeout_s)
 
         # ⚠️ 이 두 줄이 읽기 전용/제어 모드를 가르는 실제 경계다.
         self.pub_jog = node.create_publisher(JointJog, '/arm/teleop_jog', 10)
@@ -68,13 +115,19 @@ class ControlPlane:
         if state == 'active':
             self._publish_jog(velocities)
         elif state == 'stop':
-            # 워치독: 정확히 한 번 0 을 쏘고 멈춘다. 계속 쏘면 teleop_core 의
+            # 정확히 한 번 0 을 쏘고 멈춘다. 계속 쏘면 teleop_core 의
             # deadman(0.5초 무입력 → 적분 정지)이 영원히 발동하지 못한다.
             self._publish_jog({})
-            self.node.get_logger().warn(
-                '텔레옵 워치독: 조그 의도가 끊겨 전 관절 0 을 발행했다')
-            self.node.store.add_event('teleop', '워치독 정지 — 조그 의도 끊김',
-                                      'warning', now)
+            # 발행은 같지만 기록은 다르다 — 놓은 것과 끊긴 것을 섞으면 진짜
+            # 두절 신호가 정상 조작에 묻힌다.
+            if self.bus.last_stop_reason() == 'released':
+                self.node.store.add_event('teleop', '조그 해제 — 전 관절 0 발행',
+                                          'info', now)
+            else:
+                self.node.get_logger().warn(
+                    '텔레옵 워치독: 조그 의도가 끊겨 전 관절 0 을 발행했다')
+                self.node.store.add_event('teleop', '워치독 정지 — 조그 의도 끊김',
+                                          'warning', now)
         self._last_publish_state = state
 
         for cmd in self.bus.drain_cmds():
@@ -107,8 +160,31 @@ class ControlPlane:
         self.pub_jog.publish(msg)
 
     # ------------------------------------------------------------ 세션 훅
-    def on_claim(self, label, force):
+    def jog_publisher_conflict(self):
+        """다른 노드가 `/arm/teleop_jog` 를 발행 중이면 그 사유, 아니면 None.
+
+        `keyboard_teleop`/`joystick_teleop` 가 같이 떠 있으면 두 속도원이 서로를
+        덮어써서 **어느 쪽도 명령한 대로 움직이지 않는다.** 발행자 목록은 노드의
+        2Hz 조정 타이머가 이미 채워 두고 있어(`_reconcile_publishers`) 여기서는
+        읽기만 한다.
+
+        ⚠️ `fake_publisher` 도 이 토픽을 발행하므로 fake 검증에서도 걸린다 —
+        여기에 "가짜면 예외" 분기를 넣지 않는다(안전 게이트의 스킵 분기 금지).
+        뚫어야 하면 강제 획득으로 뚫고, 그 사실이 이벤트에 남는다.
+        """
+        mine = self.node.get_name()
+        others = [n for n in self.node.store.teleop_jog_publishers()
+                  if n.lstrip('/') != mine]
+        if not others:
+            return None
+        return ('다른 텔레옵 프론트엔드가 /arm/teleop_jog 를 발행 중입니다 '
+                f'({", ".join(sorted(others))}) — 두 속도원이 겹치면 어느 쪽도 '
+                '명령대로 움직이지 않습니다. 그 노드를 내리거나 강제로 획득하세요.')
+
+    def on_claim(self, label, force, conflict=None):
         note = f'조종권 획득: {label}' + (' (강제)' if force else '')
+        if force and conflict:
+            note += f' — 발행자 충돌을 무시함: {conflict}'
         self.node.get_logger().info(note)
         self.node.store.add_event('control', note,
                                   'warning' if force else 'info', time.monotonic())
@@ -198,12 +274,26 @@ class ControlPlane:
 
     # ------------------------------------------------------------ HTTP 쪽 인터페이스
     def describe(self):
-        """화면이 어떤 제어가 가능한지 판단할 근거."""
+        """화면이 어떤 제어가 가능한지 판단할 근거.
+
+        어휘·기본값을 프론트엔드에 복사해 두면 실제 게이트와 언젠가 어긋난다 —
+        `teleop_vocab` 과 `joystick_teleop` 의 값을 그대로 실어 보내고 화면은
+        읽기만 한다(계약 상수를 `contract.py` 에서 실어 보내는 것과 같은 사상).
+        """
         return {
             'joint_names': list(self.joint_names),
             'max_vel_rad_s': self.max_vel_rad_s,
             'jog_step_rad': self.jog_step_rad,
             'task_kinds': sorted(self._task_handlers),
+            'commands': teleop_vocab.all_commands(),
+            'publish_hz': self.publish_hz,
+            'intent_timeout_s': self.intent_timeout_s,
+            'keyboard': {
+                'jog_velocity_rad_s': DEFAULT_JOG_VELOCITY_RAD_S,
+                'jog_velocity_delta': DEFAULT_JOG_VELOCITY_DELTA,
+            },
+            'gamepad': gamepad_defaults(),
+            'jog_conflict': self.jog_publisher_conflict(),
         }
 
     def list_models(self):

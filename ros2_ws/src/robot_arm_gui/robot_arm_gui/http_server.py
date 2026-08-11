@@ -346,10 +346,16 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
         if path == '/api/control/claim':
             label = str(body.get('label') or 'browser')[:64]
-            token, reason = bus.claim(label, now, force=bool(body.get('force')))
+            force = bool(body.get('force'))
+            # 다른 텔레옵 프론트엔드가 이미 /arm/teleop_jog 를 밀고 있으면 두 속도원이
+            # 겹쳐 **어느 쪽도 명령대로 움직이지 않는다.** 강제로만 뚫을 수 있다.
+            conflict = control.jog_publisher_conflict()
+            if conflict is not None and not force:
+                return self._send_json({'error': conflict, 'conflict': True}, status=409)
+            token, reason = bus.claim(label, now, force=force)
             if token is None:
                 return self._send_json({'error': reason}, status=409)
-            control.on_claim(label, bool(body.get('force')))
+            control.on_claim(label, force, conflict)
             return self._send_json({'token': token, 'session': bus.snapshot(now)})
 
         if path == '/api/control/renew':
@@ -371,6 +377,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if not bus.set_jog(body.get('token'), velocities, now):
                 return self._send_json({'error': '조종권이 없습니다'}, status=409)
             return self._send_json({'ok': True, 'seq': bus.snapshot(now)['jog_seq']})
+
+        if path == '/api/teleop/release_jog':
+            # "데드맨을 놓았다" — 전송을 그냥 끊어도 워치독이 세우지만, 그러면
+            # 정상 조작이 통신 두절과 같은 경고로 기록된다.
+            if not bus.release_jog(body.get('token'), now):
+                return self._send_json({'error': '조종권이 없습니다'}, status=409)
+            return self._send_json({'ok': True})
 
         if path == '/api/teleop/cmd':
             from .teleop_vocab import validate as validate_cmd
