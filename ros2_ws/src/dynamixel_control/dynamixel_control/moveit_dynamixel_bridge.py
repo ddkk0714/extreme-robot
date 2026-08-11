@@ -615,7 +615,10 @@ class MoveItDynamixelBridge(Node):
                 goal_readback = self._read_register(
                     dxl_id, ADDR_GOAL_POSITION, 4,
                     "startup goal readback", signed=True)
-                if abs(goal_readback - present) > 1:
+                # Startup synchronization is a fail-closed safety gate: even a
+                # one-tick mismatch means the value written was not read back
+                # exactly, so torque must remain disabled.
+                if goal_readback != present:
                     raise RuntimeError(
                         f"Present->Goal readback mismatch: "
                         f"present={present}, goal={goal_readback}")
@@ -692,9 +695,10 @@ class MoveItDynamixelBridge(Node):
         return (tick - config["center"]) / (config["direction"] * ticks_per_joint_rad)
 
     def gripper_pos_to_tick(self, rad):
+        self._require_gripper_command_mapping()
         span = self.gripper_open_tick - self.gripper_close_tick
         denom = self.gripper_open_rad - self.gripper_close_rad
-        frac = 0.0 if denom == 0.0 else (rad - self.gripper_close_rad) / denom
+        frac = (rad - self.gripper_close_rad) / denom
         tick = int(round(self.gripper_close_tick + frac * span))
         # 다회전 그리퍼는 끝단 tick 이 0~4095 밖으로 나간다(2026-08-07 실측 close=-401)
         # — 단일회전으로 clamp 하면 완전 닫힘이 tick 0 에서 잘려 덜 닫힌 채 멈춘다.
@@ -704,12 +708,14 @@ class MoveItDynamixelBridge(Node):
 
     def gripper_pos_to_ratio(self, rad):
         """논리 관절 위치를 닫힘 비율(open=0, close=1)로 변환한다."""
+        self._require_gripper_command_mapping()
         span = self.gripper_close_rad - self.gripper_open_rad
-        ratio = 0.0 if span == 0.0 else (rad - self.gripper_open_rad) / span
+        ratio = (rad - self.gripper_open_rad) / span
         return max(0.0, min(1.0, ratio))
 
     def gripper_goals_for_ratio(self, ratio):
         """논리 닫힘 비율 하나를 개별 캘리브레이션된 모터 목표로 매핑한다."""
+        self._require_gripper_command_mapping()
         ratio = max(0.0, min(1.0, float(ratio)))
         if not self.gripper_motor_endpoints:
             return {gid: self.gripper_pos_to_tick(
@@ -763,7 +769,8 @@ class MoveItDynamixelBridge(Node):
 
     def _gripper_commands_allowed(self):
         """캘리브레이션된 위치 명령 동작일 때만 참을 반환한다."""
-        if not self.gripper_command_calibrated:
+        if (not self.gripper_command_calibrated
+                or self.gripper_open_rad == self.gripper_close_rad):
             return False
         if self.gripper_required_operating_modes:
             return (set(self.gripper_required_operating_modes)
@@ -772,6 +779,13 @@ class MoveItDynamixelBridge(Node):
                     == self.gripper_required_operating_modes)
         return (self.gripper_observed_operating_mode
                 == self.gripper_required_operating_mode)
+
+    def _require_gripper_command_mapping(self):
+        """안전성이 확인되지 않은 rad→tick 변환을 fail-closed로 차단한다."""
+        if not self.gripper_command_calibrated:
+            raise RuntimeError("gripper command calibration is not verified")
+        if self.gripper_open_rad == self.gripper_close_rad:
+            raise RuntimeError("gripper open/close rad endpoints are identical")
 
     def _gripper_startup_torque_allowed(self):
         """듀얼 그리퍼에만 기존 기동 동작을 허용한다."""

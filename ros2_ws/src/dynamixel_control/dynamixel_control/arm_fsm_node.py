@@ -228,14 +228,15 @@ class ArmFsmNode(Node):
         super().__init__('arm_fsm_node')
 
         # ── 파라미터 ──────────────────────────────
+        # 형상과 tip_link를 포함한 모든 엔드이펙터 기본값을 같은 preset에서 고른다.
+        self.declare_parameter('end_effector_preset', DEFAULT_GRIPPER)
+        gripper_type = self.get_parameter('end_effector_preset').value
+        gpreset = get_preset(gripper_type, self.get_logger())
+
         # MoveIt
         self.declare_parameter('planning_group', 'arm')          # SRDF group
-        # tip_link: 그리퍼가 실제로 물리 부착되는 링크(link_043, 구 "본체22_1" = 그리퍼 하우징).
-        # 2026-07-31 zip 전체(base_link~팔~그리퍼~손목카메라) 재생성으로 URDF 링크 번호가 전부
-        # 바뀌면서 갱신됨 — SRDF(robot_arm.srdf)의 arm 체인 tip_link/end_effector parent_link와
-        # 반드시 동기화 유지할 것. (이전 값 link_039 는 축약된 그리퍼 이식판의 "5축 모듈 연결부"였고,
-        # 그보다 더 옛날 값 link_051 은 이미 폐기된 평행4절 그리퍼 링크였다 — 둘 다 지금 URDF에 없다.)
-        self.declare_parameter('tip_link', 'link_043')            # 그리퍼 부모 링크
+        # SRDF의 arm chain tip/end_effector parent와 preset별로 동기화한다.
+        self.declare_parameter('tip_link', gpreset['tip_link'])   # preset별 그리퍼 부모 링크
         self.declare_parameter('base_frame', 'base_link')        # planning frame (리프트 기준)
         self.declare_parameter('lift_height', 0.10)              # LIFT 시 base_link +Z [m]
         self.declare_parameter('approach_height', 0.08)          # target 위 접근 오프셋 [m]
@@ -266,13 +267,12 @@ class ArmFsmNode(Node):
         self.declare_parameter('freeze_target_on_retry', False)
         self.declare_parameter('gripper_change_mode', False)
         self.declare_parameter('gripper_disabled', False)
+        self.declare_parameter(
+            'gripper_command_calibrated', gpreset['command_calibrated'])
         self.declare_parameter('stop_after_descend', False)
         self.declare_parameter('arm_move_speed', 0.5)   # [rad/s] 직접명령 시 소요시간 추정용
         # 그리퍼 — gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
         # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
-        self.declare_parameter('end_effector_preset', DEFAULT_GRIPPER)
-        gripper_type = self.get_parameter('end_effector_preset').value
-        gpreset = get_preset(gripper_type, self.get_logger())
         self.declare_parameter('mission_type', gpreset['allowed_mission'])
         mission_type = str(self.get_parameter('mission_type').value)
         self.validate_mission_preset(mission_type, gpreset)
@@ -361,8 +361,15 @@ class ArmFsmNode(Node):
         self.ik_accept_tol = g('ik_accept_tol').value
         self.freeze_target_on_retry = bool(g('freeze_target_on_retry').value)
         self.gripper_change_mode = bool(g('gripper_change_mode').value)
+        self.gripper_command_calibrated = bool(
+            g('gripper_command_calibrated').value)
+        # An uncalibrated preset must not even emit a gripper action goal.  The
+        # bridge has the same independent guard, so ID5 remains blocked if a
+        # caller bypasses this FSM.
         self.gripper_disabled = (
-            self.gripper_change_mode or bool(g('gripper_disabled').value))
+            self.gripper_change_mode
+            or bool(g('gripper_disabled').value)
+            or not self.gripper_command_calibrated)
         self.stop_after_descend = (
             self.gripper_change_mode or bool(g('stop_after_descend').value))
         self.arm_move_speed = g('arm_move_speed').value
@@ -1289,8 +1296,12 @@ class ArmFsmNode(Node):
 
         constraints = Constraints()
         constraints.position_constraints.append(pc)
-        # 4축 실기 팔 테스트: orientation constraint는 사용하지 않고
-        # tip_link 위치만 목표로 planning한다.
+        # KDL/OMPL은 off-axis TCP의 position-only goal에서 유효한 goal state를
+        # 샘플하지 못한다. single TCP에는 인식/TF로 변환된 자세를
+        # 함께 제약해 IK sampler가 실제 TCP chain을 풀게 한다. dual은
+        # 기존 4축 position-only 계약을 그대로 유지한다.
+        if self.tip_link == 'single_gripper_grasp_frame':
+            constraints.orientation_constraints.append(oc)
         req.goal_constraints.append(constraints)
 
         goal = MoveGroup.Goal()

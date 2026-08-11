@@ -112,12 +112,49 @@ GRIPPER_PRESETS = {
         "required_operating_mode": -1,
         "kind": "gripper",
         "allowed_mission": "PICK_PLACE",
+        "arm_tip_link": "link_043",
+        "tip_link": "link_043",
         "profile_acceleration": 25,
         "profile_velocity": 80,
         "max_abs_current": 300,
         "stall_timeout": 2.0,
         "motion_timeout": 10.0,
         "goal_tolerance_ticks": 10,
+    },
+    "single_motor_gripper": {
+        # HW-8 단일 서보 그리퍼의 복원 URDF/MoveIt 모델에서 실제 구동축은
+        # gripper_drive_joint(parent=link_051, child=link_055)였고 나머지 조 관절은
+        # 이 축을 mimic 했다. 현재 활성 랙피니언 URDF에는 이 단일모터 형상이 없지만,
+        # 잘못된 gripper_left_pinion_joint/end_effector_joint로 대체하지 않고 확인된
+        # 논리 축 이름을 보존한다. 형상 복원 전에도 FSM/preset 선택 계약은 검증 가능하다.
+        "gripper_joints": ["gripper_drive_joint"],
+        "gripper_ids": [5],
+        # 2026-08-11 ID5 Mode 3, Profile Acceleration=5/Velocity=20 실측.
+        # 52↔615 명령을 3-cycle씩 두 번 반복했을 때 매 cycle 실제 범위가 80↔588,
+        # stroke=508 tick(44.65°)으로 동일했고 Hardware Error/통신 오류가 없었다.
+        # 이 tick endpoint만 확정되었으며 위치-rad 매핑, operating mode/PWM/effort
+        # 임계값은 아직 sentinel이다. 파지 캘리브 전 command_calibrated=False 유지.
+        "gripper_open_tick": 80,
+        "gripper_close_tick": 588,
+        "gripper_open_rad": 0.0,
+        "gripper_close_rad": 0.0,
+        "grasp_effort_thresh": 1.0e9,
+        "drop_effort_thresh": -1.0,
+        "gripper_action_time": 0.0,
+        "gripper_goal_pwm": 0,
+        "command_calibrated": False,
+        "observed_operating_mode": -1,
+        "required_operating_mode": -1,
+        "kind": "gripper",
+        "allowed_mission": "PICK_PLACE",
+        "arm_tip_link": "link_051",
+        "tip_link": "single_gripper_grasp_frame",
+        "profile_acceleration": 0,
+        "profile_velocity": 0,
+        "max_abs_current": 0,
+        "stall_timeout": 0.0,
+        "motion_timeout": 0.0,
+        "goal_tolerance_ticks": 0,
     },
     "rotary_id5": {
         # PICK_PLACE에서는 선택되지 않는다. 기존 rotary workflow 보존용 별도 preset.
@@ -135,6 +172,8 @@ GRIPPER_PRESETS = {
         "required_operating_mode": 3,
         "kind": "rotary",
         "allowed_mission": "ROTARY_TOOL",
+        "arm_tip_link": "link_043",
+        "tip_link": "link_043",
         "profile_acceleration": 5,
         "profile_velocity": 20,
         "max_abs_current": 100,

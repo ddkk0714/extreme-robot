@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from dynamixel_control.mock_moveit_dynamixel_bridge import (
-    ALL_JOINTS, ARM_JOINTS, DEFAULT_POSITIONS,
+    ALL_JOINTS, ARM_JOINTS, DEFAULT_POSITIONS, GRIPPER_JOINT,
 )
 
 
@@ -11,7 +11,8 @@ def test_mock_defaults_cover_arm_and_virtual_gripper_geometry():
     assert ARM_JOINTS == (
         'arm_joint_1', 'arm_joint_2', 'arm_joint_3',
         'arm_joint_4', 'arm_joint_5')
-    assert ALL_JOINTS[-1] == 'gripper_left_pinion_joint'
+    assert GRIPPER_JOINT == 'gripper_drive_joint'
+    assert ALL_JOINTS[-1] == GRIPPER_JOINT
     assert len(DEFAULT_POSITIONS) == len(ALL_JOINTS)
 
 

@@ -22,7 +22,8 @@ from trajectory_msgs.msg import JointTrajectory
 
 ARM_JOINTS = (
     'arm_joint_1', 'arm_joint_2', 'arm_joint_3', 'arm_joint_4', 'arm_joint_5')
-ALL_JOINTS = ARM_JOINTS + ('gripper_left_pinion_joint',)
+GRIPPER_JOINT = 'gripper_drive_joint'
+ALL_JOINTS = ARM_JOINTS + (GRIPPER_JOINT,)
 DEFAULT_POSITIONS = (1.405, -0.1158041728290909, -0.11694705016553897,
                      0.3129320807286708, -0.007669903939428206, 0.0)
 
@@ -33,6 +34,7 @@ class MockMoveItDynamixelBridge(Node):
         self.declare_parameter('gripper_change_mode', True)
         self.declare_parameter('publish_rate', 20.0)
         self.declare_parameter('initial_positions', list(DEFAULT_POSITIONS))
+        self.declare_parameter('gripper_effort', 1.0e9)
         self.gripper_change_mode = bool(
             self.get_parameter('gripper_change_mode').value)
         initial = list(self.get_parameter('initial_positions').value)
@@ -43,6 +45,9 @@ class MockMoveItDynamixelBridge(Node):
         self._lock = threading.Lock()
         self._positions = dict(zip(ALL_JOINTS, map(float, initial)))
         self._velocities = {name: 0.0 for name in ALL_JOINTS}
+        self._efforts = {name: 0.0 for name in ALL_JOINTS}
+        self._efforts[GRIPPER_JOINT] = float(
+            self.get_parameter('gripper_effort').value)
 
         received_qos = QoSProfile(
             depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -52,6 +57,9 @@ class MockMoveItDynamixelBridge(Node):
             Bool, '/dynamixel/controller_fault', 10)
         self.received_pub = self.create_publisher(
             JointTrajectory, '/mock_bridge/received_trajectory', received_qos)
+        self.received_gripper_pub = self.create_publisher(
+            JointTrajectory, '/mock_bridge/received_gripper_trajectory',
+            received_qos)
 
         callback_group = ReentrantCallbackGroup()
         self.action_server = ActionServer(
@@ -59,6 +67,13 @@ class MockMoveItDynamixelBridge(Node):
             '/arm_controller/follow_joint_trajectory',
             execute_callback=self.execute_trajectory,
             goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=callback_group)
+        self.gripper_action_server = ActionServer(
+            self, FollowJointTrajectory,
+            '/gripper_controller/follow_joint_trajectory',
+            execute_callback=self.execute_gripper_trajectory,
+            goal_callback=self.gripper_goal_callback,
             cancel_callback=self.cancel_callback,
             callback_group=callback_group)
 
@@ -88,6 +103,16 @@ class MockMoveItDynamixelBridge(Node):
     def cancel_callback(_goal_handle):
         return CancelResponse.ACCEPT
 
+    def gripper_goal_callback(self, request):
+        if not request.trajectory.points:
+            return GoalResponse.REJECT
+        if tuple(request.trajectory.joint_names) != (GRIPPER_JOINT,):
+            self.get_logger().error(
+                'Rejecting mock gripper trajectory joints: '
+                f'{list(request.trajectory.joint_names)}')
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
     def execute_trajectory(self, goal_handle):
         trajectory = goal_handle.request.trajectory
         self.received_pub.publish(trajectory)
@@ -111,6 +136,23 @@ class MockMoveItDynamixelBridge(Node):
         result.error_string = 'Hardware-free trajectory accepted'
         return result
 
+    def execute_gripper_trajectory(self, goal_handle):
+        trajectory = goal_handle.request.trajectory
+        self.received_gripper_pub.publish(trajectory)
+        final = trajectory.points[-1]
+        with self._lock:
+            self._positions[GRIPPER_JOINT] = float(final.positions[0])
+            self._velocities[GRIPPER_JOINT] = 0.0
+        self.get_logger().info(
+            'Received single-motor gripper trajectory: '
+            f'{GRIPPER_JOINT}={float(final.positions[0]):.9f}')
+        self.publish_state()
+        goal_handle.succeed()
+        result = FollowJointTrajectory.Result()
+        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        result.error_string = 'Hardware-free gripper trajectory accepted'
+        return result
+
     def publish_state(self):
         now = self.get_clock().now().to_msg()
         with self._lock:
@@ -119,7 +161,7 @@ class MockMoveItDynamixelBridge(Node):
             msg.name = list(ALL_JOINTS)
             msg.position = [self._positions[name] for name in ALL_JOINTS]
             msg.velocity = [self._velocities[name] for name in ALL_JOINTS]
-            msg.effort = [0.0] * len(ALL_JOINTS)
+            msg.effort = [self._efforts[name] for name in ALL_JOINTS]
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=False))
 
