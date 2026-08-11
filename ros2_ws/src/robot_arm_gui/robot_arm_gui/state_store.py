@@ -108,6 +108,9 @@ class StateStore:
                             'estop_button': None, 'resolved': False}
 
         self._video = {'source': 'off', 'clients': 0, 'fps': None, 'at': None}
+        #: 제어 세션(조종권·워치독). 읽기 전용 모드에서는 영원히 None 이고,
+        #: 화면은 그걸로 '제어 미탑재'를 판정한다.
+        self._control = None
         self._system = {}
         # 계약 어휘(LOCK_MODES 등)와 표시 임계. 노드가 기동 시 한 번 심어두면
         # 프론트엔드가 "작업 허가/잠금" 같은 파생 판정을 자기 쪽에서 할 수 있다.
@@ -471,6 +474,11 @@ class StateStore:
         with self._lock:
             self._video = {'source': source, 'clients': clients, 'fps': fps, 'at': now}
 
+    def set_control(self, info):
+        """제어 평면의 세션 스냅샷. 제어 모드에서만 채워진다."""
+        with self._lock:
+            self._control = None if info is None else dict(info)
+
     def set_system(self, info):
         with self._lock:
             self._system = dict(info)
@@ -597,6 +605,7 @@ class StateStore:
                     'params_resolved': self._joy_params['resolved'],
                 },
                 'video': dict(self._video),
+                'control': None if self._control is None else dict(self._control),
                 'system': dict(self._system),
                 'contract': dict(self._contract),
                 'topics': {
@@ -628,6 +637,8 @@ class StateStore:
                     self._controller_fault,
                     age=self._age(self._controller_fault['at'], now)),
                 'hw_errors': self._hw_entries,
+                # 워치독 잔여 시간은 1Hz 로 보면 이미 늦다 — 조종 중 표시는 hot 에 싣는다.
+                'control': None if self._control is None else dict(self._control),
                 'topics': {
                     name: {'count': slot['count'], 'age': self._age(slot['last'], now)}
                     for name, slot in self._topics.items()

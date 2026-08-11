@@ -22,18 +22,35 @@ web_video_server 전부 미설치). 이 저장소는 시스템 의존성을 Dock
 단발 fetch 로 처리한다. 탭을 3개 이상 열면 고갈되므로 `/api/health` 가 접속 수를
 노출해 운영자가 인지하게 한다.
 
-## 읽기 전용
+## 두 가지 모드 — 기본은 여전히 읽기 전용
 
-**GET 만 처리한다.** POST/PUT/DELETE 는 405 다. 제어 경로는 이 파일에 존재하지
-않으며, 계약이 owner 를 정해 둔 토픽(`/arm_status` 등)을 발행할 방법이 없다.
+`control` 객체가 **없으면**(기본) 이 서버는 예전 그대로다. GET 만 처리하고
+POST 는 403, 노드는 퍼블리셔를 하나도 만들지 않는다.
+
+`control:=true` 로 띄우면 `control` 객체가 주입되고 `/api/control/*` 계열이 살아난다.
+그래도 **계약이 owner 를 정해 둔 토픽**(`/arm_status`·`/chassis_mode`·
+`/arrival_status`)과 `/dynamixel/goal_position` 은 어느 모드에서도 발행하지 않는다 —
+제어 모드가 미는 것은 owner 가 없는 `/arm/teleop_jog`·`/arm/teleop_cmd` 와
+다른 노드의 파라미터뿐이다.
+
+## POST 는 CSRF 를 막아야 한다
+
+`bind:=0.0.0.0` 이 곧 현장 네트워크 노출인 구조라(노드가 이미 경고한다), 브라우저의
+다른 탭이 이 서버로 요청을 밀어 넣을 수 있으면 안 된다. 두 겹으로 막는다:
+
+1. `Origin` 헤더가 있으면 `Host` 와 일치해야 한다.
+2. 커스텀 헤더 `X-Monitor-Control` 을 요구한다. 크로스오리진에서 커스텀 헤더를
+   붙이려면 preflight(OPTIONS)가 통과해야 하는데 **이 서버는 OPTIONS 를 구현하지
+   않는다** → 남의 페이지에서는 요청 자체가 성립하지 않는다.
 """
 
 import json
+import math
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .video_hub import SOURCES
 
@@ -47,6 +64,12 @@ MAX_VIDEO_CLIENTS = 4
 
 _MJPEG_BOUNDARY = 'frameboundary'
 
+#: POST 본문 상한. 제어 페이로드는 전부 작다(가장 큰 게 캘리브 실측점 목록).
+MAX_BODY_BYTES = 64 * 1024
+
+#: CSRF 방어용 커스텀 헤더 — 크로스오리진에서는 preflight 없이 붙일 수 없다.
+CONTROL_HEADER = 'X-Monitor-Control'
+
 _STATIC_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'application/javascript; charset=utf-8',
@@ -57,18 +80,56 @@ _STATIC_TYPES = {
 }
 
 
+#: 조그 한 건에 실을 수 있는 관절 수 / 속도 크기 상한(방어적 상한이며, 실제 제한은
+#: 노드가 `teleop_core` 의 `max_vel_rad_s` 와 같은 값으로 다시 clamp 한다).
+_MAX_JOG_JOINTS = 16
+_MAX_JOG_ABS = 10.0
+
+
+def _first_int(values, default):
+    try:
+        return int(values[0])
+    except (TypeError, ValueError, IndexError):
+        return default
+
+
+def _parse_velocities(raw):
+    """`{관절이름: rad/s}` 검증 → `(dict, None)` 또는 `(None, 사유)`."""
+    if not isinstance(raw, dict):
+        return None, 'velocities 는 {관절이름: rad/s} 객체여야 합니다'
+    if len(raw) > _MAX_JOG_JOINTS:
+        return None, f'관절이 너무 많습니다 ({len(raw)} > {_MAX_JOG_JOINTS})'
+    out = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name or len(name) > 64:
+            return None, f'관절 이름이 잘못되었습니다: {name!r}'
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, f'{name} 속도가 숫자가 아닙니다: {value!r}'
+        value = float(value)
+        if not math.isfinite(value):
+            return None, f'{name} 속도가 유한하지 않습니다'
+        if abs(value) > _MAX_JOG_ABS:
+            return None, f'{name} 속도가 상한을 넘습니다 (|{value}| > {_MAX_JOG_ABS})'
+        out[name] = value
+    return out, None
+
+
 class MonitorHTTPServer(ThreadingHTTPServer):
     """daemon_threads 필수 — 안 그러면 스트리밍 스레드가 종료를 막는다."""
 
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, handler, *, store, video_hub, web_root, logger=None):
+    def __init__(self, addr, handler, *, store, video_hub, web_root, logger=None,
+                 control=None):
         super().__init__(addr, handler)
         self.store = store
         self.video_hub = video_hub
         self.web_root = os.path.realpath(web_root)
         self.logger = logger
+        #: 제어 평면. None 이면 읽기 전용 모드(POST 전부 403).
+        #: 노드가 주입하며, HTTP 스레드는 이 객체를 통해서만 ROS 에 닿는다.
+        self.control = control
         self.sse_clients = 0
         self.video_clients = 0
         self.started_at = time.time()
@@ -107,6 +168,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_binary(self, payload, content_type='application/octet-stream',
+                     extra_headers=()):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-store')
+        for key, value in extra_headers:
+            self.send_header(key, str(value))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _begin_stream(self, content_type):
         """스트리밍 응답 시작 — Content-Length 없이 연결 종료로 끝낸다."""
         self.send_response(200)
@@ -116,9 +188,41 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+    # ------------------------------------------------------------ 요청 파싱
+    def _read_json(self):
+        """POST 본문 → dict. 실패하면 `(None, 사유)`."""
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            return None, 'Content-Length 가 숫자가 아닙니다'
+        if length <= 0:
+            return {}, None
+        if length > MAX_BODY_BYTES:
+            return None, f'본문이 너무 큽니다 ({length} > {MAX_BODY_BYTES})'
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return None, f'JSON 파싱 실패: {exc}'
+        if not isinstance(body, dict):
+            return None, 'JSON 최상위는 객체여야 합니다'
+        return body, None
+
+    def _csrf_reason(self):
+        """CSRF 검사 — 통과하면 None, 막히면 사유 문자열."""
+        if self.headers.get(CONTROL_HEADER) is None:
+            return f'{CONTROL_HEADER} 헤더가 없습니다'
+        origin = self.headers.get('Origin')
+        if origin:
+            host = self.headers.get('Host') or ''
+            if urlparse(origin).netloc != host:
+                return f'Origin({origin}) 이 Host({host}) 와 다릅니다'
+        return None
+
     # ------------------------------------------------------------ 라우팅
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         try:
             if path == '/api/state':
                 return self._api_state()
@@ -132,17 +236,36 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 return self._sse()
             if path.startswith('/video/'):
                 return self._mjpeg(path.rsplit('/', 1)[-1])
+            if path.startswith('/api/'):
+                return self._api_get(path, parse_qs(parsed.query))
             return self._static(path)
         except (BrokenPipeError, ConnectionResetError):
             # 브라우저가 탭을 닫으면 정상적으로 발생한다 — 에러가 아니다.
             self.close_connection = True
 
     def do_POST(self):
-        # 1단계는 읽기 전용이다. 제어 경로는 존재하지 않는다.
-        self._send_json({'error': '읽기 전용 모니터입니다 (제어 미탑재)'}, status=405)
+        path = urlparse(self.path).path
+        try:
+            control = self.server.control
+            if control is None:
+                return self._send_json(
+                    {'error': '읽기 전용 모드입니다 — control:=true 로 다시 띄우세요'},
+                    status=403)
+            reason = self._csrf_reason()
+            if reason is not None:
+                return self._send_json({'error': f'요청이 거부되었습니다: {reason}'},
+                                       status=403)
+            body, reason = self._read_json()
+            if body is None:
+                return self._send_json({'error': reason}, status=400)
+            return self._api_post(path, body, control)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
-    do_PUT = do_POST
-    do_DELETE = do_POST
+    def do_PUT(self):
+        self._send_json({'error': 'PUT 은 쓰지 않습니다'}, status=405)
+
+    do_DELETE = do_PUT
 
     # ------------------------------------------------------------ API
     def _api_state(self):
@@ -173,6 +296,102 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self._send_text('\n'.join(lines) + '\n',
                         content_type='application/x-ndjson; charset=utf-8',
                         filename=f'trace_{trace_id}.jsonl')
+
+    # ------------------------------------------------------------ 제어 API (GET)
+    def _api_get(self, path, query):
+        control = self.server.control
+        if path == '/api/control':
+            if control is None:
+                return self._send_json({'enabled': False,
+                                        'reason': '읽기 전용 모드 (control:=false)'})
+            payload = {'enabled': True}
+            payload.update(control.describe())
+            payload['session'] = control.bus.snapshot(time.monotonic())
+            return self._send_json(payload)
+
+        if control is None:
+            return self._send_json({'error': '읽기 전용 모드입니다'}, status=403)
+
+        if path == '/api/models':
+            return self._send_json({'models': control.list_models()})
+        if path == '/api/tasks':
+            since = _first_int(query.get('since'), 0)
+            return self._send_json({'results': control.bus.task_results(since)})
+        if path == '/api/cloud':
+            return self._api_cloud(control, _first_int(query.get('since'), -1))
+        return self._send_json({'error': 'not found', 'path': path}, status=404)
+
+    def _api_cloud(self, control, since):
+        """점구름 바이너리 — Float32 xyz 나열. 브라우저가 몇 Hz 로 폴링한다.
+
+        SSE 는 텍스트라 수만 점을 실을 수 없고, stdlib 로 WebSocket 을 짜는 비용은
+        정당화되지 않는다. 프레임이 안 바뀌었으면 204 로 즉시 끝낸다.
+        """
+        frame = control.cloud_frame(since)
+        if frame is None:
+            self.send_response(204)
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return
+        seq, payload, meta = frame
+        headers = [('X-Cloud-Seq', seq), ('X-Cloud-Points', len(payload) // 12)]
+        for key, value in meta.items():
+            headers.append((f'X-Cloud-{key}', value))
+        self._send_binary(payload, extra_headers=headers)
+
+    # ------------------------------------------------------------ 제어 API (POST)
+    def _api_post(self, path, body, control):
+        now = time.monotonic()
+        bus = control.bus
+
+        if path == '/api/control/claim':
+            label = str(body.get('label') or 'browser')[:64]
+            token, reason = bus.claim(label, now, force=bool(body.get('force')))
+            if token is None:
+                return self._send_json({'error': reason}, status=409)
+            control.on_claim(label, bool(body.get('force')))
+            return self._send_json({'token': token, 'session': bus.snapshot(now)})
+
+        if path == '/api/control/renew':
+            ok = bus.renew(body.get('token'), now)
+            if not ok:
+                return self._send_json({'error': '토큰이 만료되었거나 무효합니다'},
+                                       status=409)
+            return self._send_json({'session': bus.snapshot(now)})
+
+        if path == '/api/control/release':
+            bus.release(body.get('token'), now)
+            control.on_release()
+            return self._send_json({'session': bus.snapshot(now)})
+
+        if path == '/api/teleop/jog':
+            velocities, reason = _parse_velocities(body.get('velocities'))
+            if velocities is None:
+                return self._send_json({'error': reason}, status=400)
+            if not bus.set_jog(body.get('token'), velocities, now):
+                return self._send_json({'error': '조종권이 없습니다'}, status=409)
+            return self._send_json({'ok': True, 'seq': bus.snapshot(now)['jog_seq']})
+
+        if path == '/api/teleop/cmd':
+            from .teleop_vocab import validate as validate_cmd
+            cmd, reason = validate_cmd(body.get('cmd'))
+            if cmd is None:
+                return self._send_json({'error': reason}, status=400)
+            if not bus.push_cmd(body.get('token'), cmd, now):
+                return self._send_json({'error': '조종권이 없습니다'}, status=409)
+            return self._send_json({'ok': True, 'cmd': cmd})
+
+        if path == '/api/task':
+            kind = str(body.get('kind') or '')
+            payload, reason = control.validate_task(kind, body.get('payload') or {})
+            if payload is None:
+                return self._send_json({'error': reason}, status=400)
+            task_id, reason = bus.push_task(body.get('token'), kind, payload, now)
+            if task_id is None:
+                return self._send_json({'error': reason}, status=409)
+            return self._send_json({'task_id': task_id})
+
+        return self._send_json({'error': 'not found', 'path': path}, status=404)
 
     # ------------------------------------------------------------ SSE
     def _sse(self):
@@ -278,15 +497,18 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
 
 def serve_forever_in_thread(*, store, video_hub, web_root, bind='127.0.0.1',
-                            port=8088, logger=None):
+                            port=8088, logger=None, control=None):
     """서버를 daemon 스레드에서 띄우고 (server, thread) 를 돌려준다.
 
     메인 스레드는 `rclpy.spin()` 이 가져간다 — 블록하는 쪽(HTTP)을 스레드로
     빼는 게 더 단순하고, `spin_once(0.0)` 바쁜 대기의 CPU 낭비도 없다.
     (`vision_test_node` 가 반대로 한 건 cv2.imshow 가 메인 스레드를 요구해서다.)
+
+    `control` 이 None 이면 읽기 전용 모드다(POST 전부 403).
     """
     server = MonitorHTTPServer((bind, port), MonitorHandler, store=store,
-                               video_hub=video_hub, web_root=web_root, logger=logger)
+                               video_hub=video_hub, web_root=web_root, logger=logger,
+                               control=control)
     thread = threading.Thread(target=server.serve_forever, name='monitor-http',
                               daemon=True)
     thread.start()

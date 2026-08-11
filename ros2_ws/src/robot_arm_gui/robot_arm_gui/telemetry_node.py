@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-"""관제 GUI 텔레메트리 노드 — **읽기 전용**.
+"""관제 GUI 텔레메트리 노드 — 기본은 **읽기 전용**, `control:=true` 면 제어 모드.
 
 브라우저 한 페이지에서 서보 진단(전류·온도·트립 여유)·관절 상태·FSM/계약
 상태·YOLO 인식·텔레옵 현황을 동시에 보기 위한 노드다. 지금은 이 정보들이
 서로 다른 터미널 로그에 흩어져 있어서, 현장에서 "왜 안 움직이지?"를 찾는 데
 매번 여러 창을 뒤져야 한다.
 
-## ⚠️ 이 노드는 퍼블리셔를 하나도 만들지 않는다
+## ⚠️ 읽기 전용 모드에서는 퍼블리셔를 하나도 만들지 않는다
 
-계약이 owner 를 못 박아 둔 토픽들(`/arm_status`·`/chassis_mode`·
-`/arrival_status`·`/detected_objects`·`/joint_states`)은 물론, 하드웨어 상태를
-바꾸는 어떤 토픽도 발행하지 않는다. 특히 `/arm_status` 는 발행 경로가 둘이 되면
+`control_enabled:=false`(기본)면 `ControlPlane` 객체를 **생성하지 않으며**, 퍼블리셔는
+그 생성자에서만 만들어지므로 존재 자체를 하지 않는다. 노드 코드에 "제어 모드면
+건너뛰기" 같은 런타임 분기를 두지 않은 이유다 — 안전 게이트에 스킵 분기가 있으면
+실기에서 켜진 채 도는 사고가 난다.
+
+`ros2 node info /robot_arm_monitor` 의 Publishers 가 `/rosout`·`/parameter_events`
+뿐인 것이 그 회귀 시험이다.
+
+## 제어 모드에서도 계약 토픽은 발행하지 않는다
+
+계약이 owner 를 못 박아 둔 토픽들(`/arm_status`·`/chassis_mode`·`/arrival_status`·
+`/detected_objects`·`/joint_states`)과 계약이 금지하는 `/dynamixel/goal_position` 은
+어느 모드에서도 발행하지 않는다. 특히 `/arm_status` 는 발행 경로가 둘이 되면
 header.stamp 가 역행할 수 있고, 그러면 파워트레인이 **영구 latch** 를 건다
 (프로세스 재시작 전까지 해제 불가).
+
+제어 모드가 미는 것은 owner 가 없는 `/arm/teleop_jog`·`/arm/teleop_cmd` 둘과,
+다른 노드의 파라미터뿐이다(→ `control_plane.py`).
 
 `/dynamixel/goal_position` 은 **구독**한다 — 계약이 금지하는 건 발행이지 구독이
 아니고, 목표 대비 오차를 관측할 유일한 정직한 경로다.
 
-파라미터도 **읽기만** 한다. 특히 `teleop_core.publish_rate_hz` 는 타이머 주기가
-생성자에서 고정되는데 dt 계산만 런타임에 다시 읽으므로, `ros2 param set` 하면
-조그 속도가 통째로 틀어진다 — 절대 건드리지 않는다.
+⚠️ `teleop_core.publish_rate_hz` 는 제어 모드에서도 **절대 set 하지 않는다**. 타이머
+주기가 생성자에서 고정되는데 dt 계산만 런타임에 다시 읽으므로, 바꾸면 조그 속도가
+통째로 틀어진다.
 
 ## 스레드 배치
 
@@ -125,11 +138,24 @@ class TelemetryNode(Node):
         # ── 관측 대상 노드 이름(파라미터 읽기용) ──
         self.declare_parameter('driver_node', 'dynamixel_position_node')
         self.declare_parameter('joystick_node', 'joystick_teleop')
+        self.declare_parameter('teleop_node', 'teleop_core')
+        self.declare_parameter('perception_node', 'perception_node')
+
+        # ── 제어 모드 ─────────────────────────────
+        # false(기본)면 ControlPlane 을 만들지 않는다 → 퍼블리셔가 존재하지 않는다.
+        self.declare_parameter('control_enabled', False)
+        self.declare_parameter('control_token_ttl_s', 5.0)
+        self.declare_parameter('teleop_intent_timeout_s', 0.3)
+        self.declare_parameter('teleop_publish_hz', 20.0)
+        self.declare_parameter('models_dir', '')       # 빈값 = 워크스페이스 기본 위치
+        self.declare_parameter('manage_perception', False)
 
         self.warn_temp_c = float(self.get_parameter('warn_temp_c').value)
         self.warn_current_ratio = float(self.get_parameter('warn_current_ratio').value)
         self._driver_node = self.get_parameter('driver_node').value
         self._joystick_node = self.get_parameter('joystick_node').value
+        self._teleop_node = self.get_parameter('teleop_node').value
+        self._perception_node = self.get_parameter('perception_node').value
 
         self.store = StateStore()
         self.video = VideoHub(fps=float(self.get_parameter('video_fps').value),
@@ -137,6 +163,7 @@ class TelemetryNode(Node):
         self._video_subs = {}          # source -> Subscription (동적으로 생성/파괴)
         self._motor_names_resolved = False
         self._joy_params_resolved = False
+        self._teleop_params_resolved = False
         self._param_clients = {}
 
         try:
@@ -155,8 +182,27 @@ class TelemetryNode(Node):
         self.store.set_motor_names(dict(zip(FALLBACK_MOTOR_IDS, FALLBACK_JOINT_NAMES)))
         self.store.set_joy_params(**FALLBACK_JOY_BUTTONS, resolved=False)
 
+        self.control = self._make_control_plane()
+
         self._server = None
         self._start_http()
+
+    def _make_control_plane(self):
+        """제어 모드일 때만 쓰기 경로를 만든다. 아니면 None(=읽기 전용)."""
+        if not bool(self.get_parameter('control_enabled').value):
+            return None
+        from .control_plane import ControlPlane
+        plane = ControlPlane(
+            self,
+            joint_names=FALLBACK_JOINT_NAMES,
+            publish_hz=float(self.get_parameter('teleop_publish_hz').value),
+            token_ttl_s=float(self.get_parameter('control_token_ttl_s').value),
+            intent_timeout_s=float(self.get_parameter('teleop_intent_timeout_s').value),
+        )
+        self.get_logger().warn(
+            '제어 모드로 기동한다 — /arm/teleop_jog·/arm/teleop_cmd 를 발행한다. '
+            '계약 토픽과 /dynamixel/goal_position 은 여전히 발행하지 않는다.')
+        return plane
 
     # ------------------------------------------------------------ 구독
     def _subscribe_all(self):
@@ -312,11 +358,12 @@ class TelemetryNode(Node):
         self.store.set_teleop_publishers(jog)
 
     def _reconcile_params(self):
-        """다른 노드의 파라미터를 **읽기만** 한다 (set 은 절대 안 한다).
+        """다른 노드의 파라미터 조회.
 
         `call_async` + done 콜백으로만 처리한다 — 타이머 콜백 안에서 결과를
         기다리며 spin 하면 재진입으로 데드락이 난다(`arm_fsm` 의 FK 클라이언트가
-        같은 이유로 별도 노드를 쓴다).
+        같은 이유로 별도 노드를 쓴다). 쓰기(SetParameters)는 제어 모드에서만,
+        그것도 `control_plane` 을 통해서만 일어난다.
         """
         if not self._motor_names_resolved:
             self._fetch_params(self._driver_node, ['motor_ids', 'joint_names'],
@@ -325,6 +372,12 @@ class TelemetryNode(Node):
             self._fetch_params(self._joystick_node,
                                ['deadman_button', 'turbo_button', 'estop_button'],
                                self._apply_joy_params)
+        if self.control is not None and not self._teleop_params_resolved:
+            # 조그 계약의 권위는 teleop_core 다 — 그쪽 joint_names 순서/집합과
+            # 어긋나면 엉뚱한 축이 움직인다. 추측하지 않고 직접 물어본다.
+            self._fetch_params(self._teleop_node,
+                               ['joint_names', 'max_vel_rad_s', 'jog_step_rad'],
+                               self._apply_teleop_params)
 
     def _fetch_params(self, node_name, names, done):
         client = self._param_clients.get(node_name)
@@ -355,6 +408,22 @@ class TelemetryNode(Node):
         self._motor_names_resolved = True
         self.get_logger().info(f'모터 이름 매핑 확인: {dict(zip(ids, names))}')
 
+    def _apply_teleop_params(self, values):
+        if self.control is None or len(values) < 3:
+            return
+        names = list(values[0].string_array_value)
+        if not names:
+            return
+        self.control.joint_names = names
+        if values[1].double_value > 0.0:
+            self.control.max_vel_rad_s = float(values[1].double_value)
+        if values[2].double_value > 0.0:
+            self.control.jog_step_rad = float(values[2].double_value)
+        self._teleop_params_resolved = True
+        self.get_logger().info(
+            f'teleop_core 조그 계약 확인: joints={names} '
+            f'max_vel={self.control.max_vel_rad_s} step={self.control.jog_step_rad}')
+
     def _apply_joy_params(self, values):
         if len(values) < 3:
             return
@@ -381,16 +450,17 @@ class TelemetryNode(Node):
         root = self._web_root()
         self._server, _ = serve_forever_in_thread(
             store=self.store, video_hub=self.video, web_root=root,
-            bind=bind, port=port, logger=self.get_logger())
+            bind=bind, port=port, logger=self.get_logger(), control=self.control)
 
         # 화면이 계약 어휘를 파생할 수 있도록 상수를 그대로 실어 보낸다.
         # (2Hz 로 갱신되는 system 과 분리해 둔다 — 덮이면 안 된다.)
         self.store.set_contract(self.contract_constants())
-        self.store.add_event('boot', f'모니터 시작 — http://{bind}:{port} (읽기 전용)',
+        mode = '제어' if self.control is not None else '읽기 전용'
+        self.store.add_event('boot', f'모니터 시작 — http://{bind}:{port} ({mode})',
                              'info', time.monotonic())
         self.get_logger().info(
             f'robot_arm_monitor 시작 — http://{bind}:{port} '
-            f'(읽기 전용, web_root={root})')
+            f'({mode}, web_root={root})')
         if bind not in ('127.0.0.1', 'localhost'):
             self.get_logger().warn(
                 f'bind_address={bind} — network_mode: host 라 현장 네트워크에 '
@@ -413,6 +483,7 @@ class TelemetryNode(Node):
             'warn_current_ratio': self.warn_current_ratio,
             'video_default_source': self.get_parameter('video_default_source').value,
             'stale_after': stale,
+            'control_enabled': self.control is not None,
         }
 
     def destroy_node(self):

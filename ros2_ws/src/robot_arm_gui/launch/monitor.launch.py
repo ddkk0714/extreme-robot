@@ -1,4 +1,4 @@
-"""관제 GUI 런치 — 읽기 전용 모니터.
+"""관제 GUI 런치 — 기본은 읽기 전용 모니터, `control:=true` 면 제어 콘솔.
 
 기동 대상:
   - monitor        : 텔레메트리 노드 + HTTP 서버 (항상)
@@ -14,11 +14,18 @@
   # 하드웨어 없이 화면만 검증
   ros2 launch robot_arm_gui monitor.launch.py fake:=true
 
+  # 실습/시연 — 모델 교체·텔레옵·캘리브까지 브라우저에서 (⚠️ 실제로 팔이 움직인다)
+  ros2 launch robot_arm_gui monitor.launch.py control:=true
+
   # 현장 Wi-Fi 의 아무 기기에서 보기 (⚠️ 포트가 그대로 노출된다)
   ros2 launch robot_arm_gui monitor.launch.py bind:=0.0.0.0
 
-⚠️ 이 노드는 퍼블리셔를 하나도 만들지 않는다(읽기 전용). 계약이 owner 를 정해 둔
-   토픽을 발행할 경로가 코드에 존재하지 않는다.
+⚠️ `control:=false`(기본)면 노드는 퍼블리셔를 하나도 만들지 않는다. 제어 경로는
+   `ControlPlane` 객체 생성자 안에만 있고 그 객체를 만들지 않기 때문이다 —
+   런타임 분기가 아니라 구조로 막혀 있다.
+⚠️ `control:=true` 여도 계약이 owner 를 정해 둔 토픽(`/arm_status` 등)과
+   `/dynamixel/goal_position` 은 발행하지 않는다. 늘어나는 퍼블리셔는
+   `/arm/teleop_jog`·`/arm/teleop_cmd` 정확히 둘뿐이다.
 """
 
 from launch import LaunchDescription
@@ -65,6 +72,30 @@ def generate_launch_description():
             'fake', default_value='false',
             description='true 면 가짜 토픽 발행자도 기동 (하드웨어 없는 검증 전용)',
         ),
+        DeclareLaunchArgument(
+            'control', default_value='false',
+            description=('true 면 제어 모드 — /arm/teleop_jog·/arm/teleop_cmd 를 발행하고 '
+                         '모델 교체·캘리브 마법사가 열린다. 기본은 읽기 전용'),
+        ),
+        DeclareLaunchArgument(
+            'teleop_publish_hz', default_value='20.0',
+            description='조그 재발행 주기. teleop_core 의 deadman(0.5초)보다 충분히 빨라야 한다',
+        ),
+        DeclareLaunchArgument(
+            'teleop_intent_timeout_s', default_value='0.3',
+            description=('브라우저 조그 의도의 신선도 한계. 넘으면 워치독이 전 관절 0 을 '
+                         '한 번 발행하고 멈춘다'),
+        ),
+        DeclareLaunchArgument(
+            'models_dir', default_value='',
+            description=('YOLO 가중치 스캔 위치. 빈값이면 워크스페이스의 '
+                         'src/robot_arm_perception/models'),
+        ),
+        DeclareLaunchArgument(
+            'manage_perception', default_value='false',
+            description=('true 면 GUI 가 perception_node 프로세스를 직접 띄우고 재시작까지 '
+                         '맡는다. false 면 핫스왑만 가능하다'),
+        ),
 
         Node(
             package='robot_arm_gui', executable='monitor', name='robot_arm_monitor',
@@ -76,6 +107,11 @@ def generate_launch_description():
                 'video_quality': LaunchConfiguration('video_quality'),
                 'video_default_source': LaunchConfiguration('video_default_source'),
                 'web_root': LaunchConfiguration('web_root'),
+                'control_enabled': LaunchConfiguration('control'),
+                'teleop_publish_hz': LaunchConfiguration('teleop_publish_hz'),
+                'teleop_intent_timeout_s': LaunchConfiguration('teleop_intent_timeout_s'),
+                'models_dir': LaunchConfiguration('models_dir'),
+                'manage_perception': LaunchConfiguration('manage_perception'),
             }],
         ),
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 관제 GUI(읽기 전용) 실행 래퍼.
+# 관제 GUI 실행 래퍼 (기본 읽기 전용, control:=true 면 제어 콘솔).
 #
 # 환경 준비를 대신 해준다 — run_calib.sh 와 같은 이유로 만들었다. 이 저장소에서
 # 아래 둘은 각각 여러 번 시간을 잡아먹은 실패 모드다:
@@ -9,6 +9,7 @@
 # 사용법 (컨테이너 안, 아무 터미널):
 #   bash src/robot_arm_gui/scripts/run_monitor.sh
 #   bash src/robot_arm_gui/scripts/run_monitor.sh fake:=true      # 하드웨어 없이 검증
+#   bash src/robot_arm_gui/scripts/run_monitor.sh control:=true   # ⚠️ 실제로 팔이 움직인다
 #   bash src/robot_arm_gui/scripts/run_monitor.sh bind:=0.0.0.0   # 현장 네트워크 노출
 #
 # 원격 PC 에서 보기(권장 — 포트를 열지 않는다):
@@ -44,5 +45,11 @@ fi
 
 cd "${WS_ROOT}"
 echo "[run_monitor] ROS_DOMAIN_ID=${ROS_DOMAIN_ID} / 워크스페이스=${WS_ROOT}"
-echo "[run_monitor] 읽기 전용 모니터입니다 — 이 노드는 어떤 토픽도 발행하지 않습니다."
+if [[ " $* " == *"control:=true"* ]]; then
+  echo "[run_monitor] ⚠️ 제어 모드 — /arm/teleop_jog·/arm/teleop_cmd 를 발행합니다."
+  echo "[run_monitor]    teleop_core 가 떠 있으면 브라우저 조작으로 팔이 실제로 움직입니다."
+  echo "[run_monitor]    계약 토픽(/arm_status 등)과 /dynamixel/goal_position 은 발행하지 않습니다."
+else
+  echo "[run_monitor] 읽기 전용 모니터입니다 — 이 노드는 어떤 토픽도 발행하지 않습니다."
+fi
 exec ros2 launch robot_arm_gui monitor.launch.py "$@"
