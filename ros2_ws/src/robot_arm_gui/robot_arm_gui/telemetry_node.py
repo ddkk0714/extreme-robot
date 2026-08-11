@@ -192,6 +192,9 @@ class TelemetryNode(Node):
         if not bool(self.get_parameter('control_enabled').value):
             return None
         from .control_plane import ControlPlane
+        from .model_catalog import resolve_models_dir, workspace_root
+        from .perception_control import PerceptionControl
+
         plane = ControlPlane(
             self,
             joint_names=FALLBACK_JOINT_NAMES,
@@ -199,9 +202,28 @@ class TelemetryNode(Node):
             token_ttl_s=float(self.get_parameter('control_token_ttl_s').value),
             intent_timeout_s=float(self.get_parameter('teleop_intent_timeout_s').value),
         )
+
+        from ament_index_python.packages import get_package_share_directory
+        root = workspace_root(get_package_share_directory('robot_arm_gui'))
+        models_dir = resolve_models_dir(
+            self.get_parameter('models_dir').value, root)
+
+        supervisor = None
+        if bool(self.get_parameter('manage_perception').value):
+            from .perception_supervisor import PerceptionSupervisor
+            supervisor = PerceptionSupervisor(workspace_root=root,
+                                              logger=self.get_logger())
+        self.perception = PerceptionControl(
+            self, plane,
+            perception_node_name=self._perception_node,
+            models_dir=models_dir, workspace_root=root, supervisor=supervisor)
+
         self.get_logger().warn(
             '제어 모드로 기동한다 — /arm/teleop_jog·/arm/teleop_cmd 를 발행한다. '
             '계약 토픽과 /dynamixel/goal_position 은 여전히 발행하지 않는다.')
+        self.get_logger().info(
+            f'모델 카탈로그: 워크스페이스={root} models_dir={models_dir} '
+            f'재시작 관리={"켬" if supervisor else "끔"}')
         return plane
 
     # ------------------------------------------------------------ 구독
@@ -229,6 +251,8 @@ class TelemetryNode(Node):
         n.create_subscription(DetectedObjectArray, '/detected_objects',
                               self._on_detections, 10)
         n.create_subscription(DetectedObject, '/pick_target', self._on_pick_target, LATCHED)
+        n.create_subscription(String, '/perception/model_status',
+                              self._on_model_status, LATCHED)
         # 텔레옵 (프론트엔드가 보내는 것을 엿보기만 한다)
         n.create_subscription(JointJog, '/arm/teleop_jog', self._on_jog, 10)
         n.create_subscription(String, '/arm/teleop_cmd', self._on_cmd, 10)
@@ -288,6 +312,15 @@ class TelemetryNode(Node):
 
     def _on_pick_target(self, msg):
         self.store.set_pick_target(_obj_to_dict(msg), time.monotonic())
+
+    def _on_model_status(self, msg):
+        """`perception_node` 의 모델 로드 결과(JSON). 실패 사유와 소요 시간이 온다."""
+        import json
+        try:
+            info = json.loads(msg.data)
+        except (ValueError, TypeError):
+            info = {'state': 'unknown', 'detail': msg.data}
+        self.store.set_model_status(info, time.monotonic())
 
     def _on_jog(self, msg):
         self.store.set_teleop_jog(list(msg.joint_names), list(msg.velocities),
@@ -490,6 +523,15 @@ class TelemetryNode(Node):
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
+        # ⚠️ GUI 가 띄운 perception_node 는 별도 프로세스 그룹이라(정확히 killpg 하려고
+        # 그렇게 뒀다) 우리를 죽여도 살아남는다. 남으면 RealSense 를 계속 물고 있어서
+        # 다음 기동이 'device busy' 로 실패한다 — 이 저장소가 반복해 밟은 유령
+        # 프로세스 함정이라 여기서 확실히 내린다.
+        supervisor = getattr(getattr(self, 'perception', None), 'supervisor', None)
+        if supervisor is not None:
+            ok, reason = supervisor.stop()
+            if not ok:
+                self.get_logger().error(f'perception_node 정리 실패: {reason}')
         return super().destroy_node()
 
 

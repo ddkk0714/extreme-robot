@@ -26,7 +26,7 @@ HTTP 스레드는 `CommandBus` 에 의도만 적는다. 여기 `tick()` 은 **�
 import time
 
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import SetParametersAtomically
 
 from control_msgs.msg import JointJog
 from std_msgs.msg import String
@@ -54,6 +54,7 @@ class ControlPlane:
 
         self._set_param_clients = {}
         self._task_handlers = {}
+        self._model_source = None
         self._last_publish_state = 'idle'
 
         period = 1.0 / max(float(publish_hz), 1.0)
@@ -121,9 +122,16 @@ class ControlPlane:
         """단계별 기능이 자기 작업 종류를 여기에 등록한다.
 
         `validator(payload) -> (정규화된 payload, None)` 또는 `(None, 사유)`
-        `runner(payload) -> (state, detail)`  # state: 'done' | 'error'
+        `runner(payload) -> (state, detail)`
+            state: `'done'` | `'error'` | `'async'`.
+            `'async'` 는 "결과가 나중에 콜백으로 온다"는 뜻이며, 그때는 runner 가
+            `bus.finish_task` 를 직접 부를 책임을 진다(`payload['_task_id']` 에
+            작업 번호가 들어 있다).
         """
         self._task_handlers[kind] = (validator, runner)
+
+    def register_model_source(self, fn):
+        self._model_source = fn
 
     def validate_task(self, kind, payload):
         handler = self._task_handlers.get(kind)
@@ -138,21 +146,30 @@ class ControlPlane:
             self.bus.finish_task(task['id'], 'error', '핸들러가 사라졌습니다', now)
             return
         self.bus.finish_task(task['id'], 'running', '', now)
+        payload = task['payload']
+        payload['_task_id'] = task['id']
         try:
-            state, detail = handler[1](task['payload'])
+            state, detail = handler[1](payload)
         except Exception as exc:                              # noqa: BLE001
             state, detail = 'error', f'{type(exc).__name__}: {exc}'
             self.node.get_logger().error(f'작업 실패 ({task["kind"]}): {detail}')
-        self.bus.finish_task(task['id'], state, detail, time.monotonic())
+        if state != 'async':
+            self.bus.finish_task(task['id'], state, detail, time.monotonic())
         self.node.store.add_event(
             'task', f'{task["kind"]}: {detail or state}',
             'critical' if state == 'error' else 'info', time.monotonic())
 
     # ------------------------------------------------------------ 파라미터 쓰기
     def set_remote_params(self, node_name, values, done=None):
-        """다른 노드의 파라미터를 설정한다 (읽기 전용 모드에는 이 경로가 없다).
+        """다른 노드의 파라미터를 **원자적으로** 설정한다.
 
-        ⚠️ `spin_until_future_complete` 를 쓰지 않는다 — 타이머 콜백 안에서 결과를
+        ⚠️ `set_parameters`(비원자) 를 쓰면 안 된다 — 그쪽은 파라미터를 **한 개씩**
+        대상 노드의 콜백에 넘긴다. 서로 의존하는 값들(`model_name` + `model_path` 같은)이
+        따로 도착하면 각각이 불완전한 상태로 검증돼 거절되거나, 더 나쁘게는 절반만
+        적용된다. 실제로 모델 교체가 "경로는 바뀌었는데 이름은 안 바뀐" 상태로
+        끝나는 것을 이 방식으로 확인했다.
+
+        ⚠️ `spin_until_future_complete` 도 쓰지 않는다 — 타이머 콜백 안에서 결과를
         기다리며 spin 하면 재진입으로 데드락이 난다(`arm_fsm` 의 FK 클라이언트가
         같은 이유로 별도 노드를 쓴다). 결과는 done 콜백으로 받는다.
 
@@ -161,7 +178,7 @@ class ControlPlane:
         client = self._set_param_clients.get(node_name)
         if client is None:
             client = self.node.create_client(
-                SetParameters, f'/{node_name}/set_parameters')
+                SetParametersAtomically, f'/{node_name}/set_parameters_atomically')
             self._set_param_clients[node_name] = client
         if not client.service_is_ready():
             return False, f'{node_name} 의 파라미터 서비스가 준비되지 않았습니다'
@@ -173,7 +190,8 @@ class ControlPlane:
                 return False, f'{name}: 지원하지 않는 파라미터 타입 {type(value).__name__}'
             params.append(Parameter(name=name, value=converted))
 
-        future = client.call_async(SetParameters.Request(parameters=params))
+        future = client.call_async(
+            SetParametersAtomically.Request(parameters=params))
         if done is not None:
             future.add_done_callback(done)
         return True, None
@@ -189,7 +207,9 @@ class ControlPlane:
         }
 
     def list_models(self):
-        return []
+        if self._model_source is None:
+            return {'models': [], 'reason': '모델 제어가 등록되지 않았습니다'}
+        return self._model_source()
 
     def cloud_frame(self, since_seq):
         return None

@@ -97,6 +97,8 @@ class StateStore:
         self._detections = {'objects': [], 'at': None, 'hz': None}
         self._detect_times = deque(maxlen=30)
         self._pick_target = None
+        #: perception_node 의 모델 로드 결과(/perception/model_status).
+        self._model_status = None
 
         self._teleop = {
             'jog_at': None, 'jog_joints': [], 'jog_velocities': [],
@@ -474,6 +476,28 @@ class StateStore:
         with self._lock:
             self._video = {'source': source, 'clients': clients, 'fps': fps, 'at': now}
 
+    def set_model_status(self, info, now):
+        """모델 교체 결과. 상태가 바뀔 때만 이벤트를 남긴다(로그 도배 방지)."""
+        with self._lock:
+            self._note('/perception/model_status', now)
+            prev = self._model_status
+            self._model_status = dict(info, at=now)
+            key = (info.get('state'), info.get('name'), info.get('path'))
+            prev_key = (None if prev is None else
+                        (prev.get('state'), prev.get('name'), prev.get('path')))
+            if key == prev_key:
+                return
+            state = info.get('state')
+            if state == 'loaded':
+                seconds = info.get('seconds')
+                took = '' if seconds is None else f' ({seconds}초)'
+                self._add_event('model', f'모델 로드: {info.get("name")}{took}',
+                                'info', now)
+            elif state == 'error':
+                self._add_event('model',
+                                f'모델 로드 실패: {info.get("name")} — '
+                                f'{info.get("detail")}', 'critical', now)
+
     def set_control(self, info):
         """제어 평면의 세션 스냅샷. 제어 모드에서만 채워진다."""
         with self._lock:
@@ -584,6 +608,9 @@ class StateStore:
                 },
                 'pick_target': (None if self._pick_target is None else dict(
                     self._pick_target, age=self._age(self._pick_target.get('at'), now))),
+                'model': (None if self._model_status is None else dict(
+                    self._model_status,
+                    age=self._age(self._model_status.get('at'), now))),
                 'teleop': {
                     'jog_age': self._age(self._teleop['jog_at'], now),
                     'jog_joints': self._teleop['jog_joints'],

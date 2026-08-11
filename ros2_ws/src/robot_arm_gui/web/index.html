@@ -14,6 +14,7 @@
     <span class="badge badge-ro" title="이 모니터는 어떤 토픽도 발행하지 않습니다">읽기 전용</span>
   </div>
   <div class="topbar-right">
+    <span id="control-chip" class="chip chip-muted">읽기 전용</span>
     <span id="conn" class="chip chip-muted">연결 중…</span>
     <span id="clients" class="chip chip-muted">접속 —</span>
     <button id="theme-toggle" class="btn" type="button" title="라이트/다크 전환">◑</button>
@@ -115,6 +116,52 @@
     <ul id="detections" class="detlist"></ul>
   </section>
 
+  <!-- F. 인식 모델 (제어 모드 전용) --------------------------------------- -->
+  <section class="panel" aria-labelledby="h-model" data-control-only hidden>
+    <div class="panel-head">
+      <h2 id="h-model">인식 모델</h2>
+      <button id="model-refresh" class="btn" type="button" title="목록 다시 스캔">↻</button>
+    </div>
+
+    <label class="field">
+      <span class="field-label">가중치</span>
+      <select id="model-select" class="btn"></select>
+    </label>
+    <div id="model-source-hint" class="muted small"></div>
+
+    <div class="field-row">
+      <label class="field">
+        <span class="field-label">task</span>
+        <select id="model-task" class="btn">
+          <option value="segment">segment (마스크 → markerless pose 전체)</option>
+          <option value="detect">detect (bbox 중심 depth 만)</option>
+        </select>
+      </label>
+    </div>
+    <label class="field">
+      <span class="field-label">classes <span class="muted">쉼표 구분, 비우면 전체</span></span>
+      <input id="model-classes" class="btn" type="text" autocomplete="off">
+    </label>
+    <label class="field">
+      <span class="field-label">pick_classes <span class="muted">비우면 픽 후보 없음</span></span>
+      <input id="model-pick" class="btn" type="text" autocomplete="off">
+    </label>
+
+    <div class="btn-row">
+      <button id="model-swap" class="btn btn-primary" type="button">핫스왑</button>
+      <button id="model-restart" class="btn" type="button">노드 재시작</button>
+    </div>
+    <div id="model-result" class="muted small">—</div>
+    <div id="model-dir-note" class="footnote"></div>
+
+    <dl class="kv" id="model-status"></dl>
+    <div id="model-stale-warn" class="unobservable" hidden>
+      ⚠ <code>/pick_target</code> 은 transient_local(latched) 이라 <strong>이전 모델의
+      마지막 타깃이 그대로 남아 있습니다.</strong> 새 모델이 아직 아무것도 못 찾았어도
+      <code>arm_fsm</code> 은 그 값을 봅니다 — 픽을 시키기 전에 새 검출을 확인하세요.
+    </div>
+  </section>
+
   <!-- B. 관절 ------------------------------------------------------------ -->
   <section class="panel" aria-labelledby="h-joints">
     <div class="panel-head"><h2 id="h-joints">관절</h2>
@@ -161,5 +208,6 @@
 </main>
 
 <script src="/app.js"></script>
+<script src="/control.js"></script>
 </body>
 </html>

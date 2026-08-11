@@ -37,6 +37,14 @@ YOLO 추론과 무관하게 발행한다(`stream_node`가 SRT :5002로 송출). 
 끼운다(그리퍼 preset과 동일 패턴). seg 모델(box)은 markerless pose 전체가, detect 전용
 모델(traffic_light)은 bbox 중심 depth translation만 활성화되는 기존 `_get_binmask` 폴백
 구조가 그대로 이 다중 모델 전환을 뒷받침한다.
+
+2026-08-11: 그 "재시작"을 없앴다 — `model_name`/`model_path`/`task`/`backend` 를
+`ros2 param set`(또는 관제 GUI)으로 바꾸면 **프로세스를 살린 채** 모델이 교체된다.
+파라미터 콜백은 검증만 하고(존재하지 않는 경로는 여기서 거절 — 예전엔 그대로
+프로세스가 죽었다), 실제 로드는 `self.model` 의 유일한 소비자인 추론 스레드가
+프레임 사이에서 한다. 결과와 소요 시간은 `/perception/model_status`(JSON, latched)로
+나간다. ⚠️ `/pick_target` 은 latched 라 교체 후에도 **이전 모델의 타깃이 남는다** —
+그 사실도 model_status 에 실어 보낸다.
 """
 import math
 import os
@@ -51,11 +59,13 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
 from geometry_msgs.msg import Pose, Point, Quaternion
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import (
     RegionOfInterest, Image as ImageMsg, PointCloud2, PointField)
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 from robot_arm_msgs.msg import DetectedObject, DetectedObjectArray
-from robot_arm_perception.model_presets import DEFAULT_MODEL, get_preset
+from robot_arm_perception.model_presets import DEFAULT_MODEL, MODEL_PRESETS, get_preset
 from .perception_quality import is_usable_bbox, robust_depth_m
 
 D435_SERIAL = "250222071245"
@@ -64,13 +74,27 @@ D435_SERIAL = "250222071245"
 # TensorRT 엔진 캐시 (yolo_depth_3d.py resolve_model 포팅)
 # ──────────────────────────────────────────────
 
+def _weight_stamp(path: str) -> str:
+    """가중치 파일의 내용을 대표하는 짧은 지문(크기+mtime).
+
+    ⚠️ 엔진 캐시 이름에 이게 없으면 **같은 경로에 새 `best.pt` 를 덮어써도 낡은
+    `.engine` 이 조용히 재사용된다.** 모델을 갈아끼우며 결과를 비교하는 실습에서
+    가장 찾기 어려운 실패 모드라, 캐시 키에 파일 지문을 포함시킨다.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 'nofile'
+    return f'{st.st_size:x}-{int(st.st_mtime):x}'
+
+
 def _resolve_model(path: str, backend: str, height: int, width: int) -> str:
     if backend == 'pt' or path.endswith('.engine'):
         return path
     h32 = ((height + 31) // 32) * 32
     w32 = ((width + 31) // 32) * 32
     base = os.path.splitext(path)[0]
-    cached = f'{base}_{h32}x{w32}_fp16.engine'
+    cached = f'{base}_{h32}x{w32}_{_weight_stamp(path)}_fp16.engine'
     if os.path.exists(cached):
         print(f'[perception] reusing cached engine: {cached}')
         return cached
@@ -80,6 +104,15 @@ def _resolve_model(path: str, backend: str, height: int, width: int) -> str:
     if engine != cached and os.path.exists(str(engine)):
         os.rename(str(engine), cached)
     return cached
+
+
+def _load_yolo(path: str, backend: str, task: str, height: int, width: int):
+    """`(model, 실제로 연 경로, 로드 초)`. 로드 시간은 화면에 그대로 표시된다."""
+    from ultralytics import YOLO
+    t0 = time.time()
+    resolved = _resolve_model(path, backend, height, width)
+    model = YOLO(resolved, task=task)
+    return model, resolved, time.time() - t0
 
 
 # ──────────────────────────────────────────────
@@ -246,12 +279,28 @@ class PerceptionNode(Node):
         # task를 명시적으로 넘긴다 — TensorRT .engine은 task 메타데이터를 보존하지 않아
         # ultralytics가 자동 추정 시 seg 모델도 'detect'로 오판하고 r0.masks가 조용히
         # None이 되는 문제가 있었다(2026-07-22 실측, model_presets.py 모듈 docstring 참고).
-        from ultralytics import YOLO
-        resolved = _resolve_model(model_path, backend, self._h, self._w)
         task = self.get_parameter('task').value
-        self.model = YOLO(resolved, task=task)
+        self.model, resolved, load_s = _load_yolo(model_path, backend, task,
+                                                  self._h, self._w)
         self.get_logger().info(
-            f"YOLO loaded: model_name={self._model_name} path={resolved} task={self.model.task}")
+            f"YOLO loaded: model_name={self._model_name} path={resolved} "
+            f"task={self.model.task} ({load_s:.2f}s)")
+
+        # ── 런타임 모델 교체 (실습/구간 전환용) ──
+        # 파라미터 콜백은 spin 스레드에서 돌기 때문에 **여기서 로드하지 않는다**
+        # (로드가 길면 파라미터 서비스가 그 동안 통째로 막힌다). 검증만 하고
+        # 요청을 적어 두면, self.model 의 유일한 소비자인 추론 스레드가 프레임
+        # 사이에서 교체한다 — in-flight predict() 와 경합할 수 없다.
+        self._pending_lock = threading.Lock()
+        self._pending_model = None
+        self._applying_params = False    # set_parameters 재진입 가드
+        self._pick_target_published = False
+        self.pub_model_status = self.create_publisher(
+            String, '/perception/model_status',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._publish_model_status('loaded', name=self._model_name, path=resolved,
+                                   task=str(self.model.task), seconds=round(load_s, 2))
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # 카메라 초기화 (realsense 모드면 DepthCal 생성)
         self._rs = None
@@ -321,20 +370,150 @@ class PerceptionNode(Node):
         self._test_img = np.zeros((self._h, self._w, 3), dtype=np.uint8)
         self.get_logger().warn('camera_mode=test: 빈 프레임 사용 (test_image_path 미지정)')
 
+    # ── 런타임 모델 교체 ───────────────────────
+
+    def _on_set_parameters(self, params):
+        """모델 관련 파라미터 변경 요청을 **검증만** 하고 예약한다.
+
+        지금까지는 모델이 생성자에서 한 번만 로드돼 구간이 바뀔 때마다 프로세스를
+        재시작해야 했다. 실습에서 `best.pt` 를 바꿔가며 결과를 비교하려면 그 재시작이
+        그대로 시연의 병목이 된다.
+
+        ⚠️ 여기서 `YOLO()` 를 부르면 안 된다 — 이 콜백은 rclpy spin 스레드에서 돌고,
+        로드가 걸리는 동안 이 노드의 파라미터 서비스 전체가 응답을 멈춘다.
+        """
+        if self._applying_params:
+            return SetParametersResult(successful=True)
+
+        watched = {p.name: p.value for p in params
+                   if p.name in ('model_name', 'model_path', 'task', 'backend')}
+        if not watched:
+            return SetParametersResult(successful=True)
+
+        name = watched.get('model_name', self._model_name)
+        derived = 'model_name' in watched and 'model_path' not in watched
+        if derived and name not in MODEL_PRESETS:
+            # 경로를 preset 에서 뽑아야 하는데 그 preset 이 없다. get_preset 은 이걸
+            # 조용히 box 로 폴백하는데, 화면에서 고른 값이 말없이 다른 모델로 바뀌면
+            # "왜 결과가 그대로지?"가 된다 — 여기서는 거절한다.
+            # (model_path 를 같이 주면 name 은 표시용 라벨일 뿐이라 자유롭게 쓴다 —
+            #  프리셋에 없는 `best.pt` 를 실습 중에 얹는 경로가 그렇다.)
+            return SetParametersResult(
+                successful=False,
+                reason=f'모르는 model_name: {name} (가능: {", ".join(sorted(MODEL_PRESETS))})')
+
+        preset = MODEL_PRESETS.get(name, {})
+        path = watched.get('model_path')
+        if path is None:
+            path = preset.get('model_path') if derived \
+                else self.get_parameter('model_path').value
+        task = watched.get('task')
+        if task is None:
+            task = preset.get('task') if derived else self.get_parameter('task').value
+        backend = watched.get('backend', self.get_parameter('backend').value)
+
+        if task not in ('segment', 'detect'):
+            return SetParametersResult(
+                successful=False, reason=f'task 는 segment|detect 만 됩니다: {task!r}')
+        if backend not in ('pt', 'trt'):
+            return SetParametersResult(
+                successful=False, reason=f'backend 는 pt|trt 만 됩니다: {backend!r}')
+        if not path or not os.path.exists(path):
+            # 지금까지 이 검증이 없어서 잘못된 경로 하나로 **프로세스가 죽었다**
+            # (vision_test_node 는 이미 존재 확인을 한다 — 그 패턴을 가져왔다).
+            return SetParametersResult(
+                successful=False,
+                reason=(f'모델 파일이 없습니다: {path!r} '
+                        f'(상대경로면 노드의 CWD 기준 — 워크스페이스 루트에서 띄웠는지 확인)'))
+
+        request = {'name': name, 'path': path, 'task': task, 'backend': backend}
+        if derived:
+            # model_name 만 바꿨으면 클래스 필터도 그 preset 것으로 따라가야 한다.
+            # 안 그러면 _get_cls_filter 가 프레임마다 'Unknown class' 경고를 뿜고
+            # 필터가 조용히 "전체 통과"로 열화된다.
+            request['classes'] = preset.get('classes', '')
+            request['pick_classes'] = preset.get('pick_classes', '')
+        with self._pending_lock:
+            self._pending_model = request
+        self._publish_model_status('loading', name=name, path=path, task=task)
+        return SetParametersResult(successful=True)
+
+    def _apply_pending_model(self):
+        """추론 스레드 전용 — 프레임과 프레임 사이에서만 교체한다."""
+        with self._pending_lock:
+            request = self._pending_model
+            self._pending_model = None
+        if request is None:
+            return
+
+        try:
+            model, resolved, load_s = _load_yolo(
+                request['path'], request['backend'], request['task'],
+                self._h, self._w)
+        except Exception as exc:                              # noqa: BLE001
+            self.get_logger().error(f'모델 교체 실패: {exc}')
+            self._publish_model_status('error', name=request['name'],
+                                       path=request['path'], task=request['task'],
+                                       detail=f'{type(exc).__name__}: {exc}')
+            return
+
+        self.model = model
+        self._model_name = request['name']
+        self._warned_no_pick_classes = False
+        if 'classes' in request:
+            self._mirror_params({'classes': request['classes'],
+                                 'pick_classes': request['pick_classes']})
+        self.get_logger().info(
+            f'모델 교체 완료: {request["name"]} path={resolved} '
+            f'task={model.task} ({load_s:.2f}s)')
+        self._publish_model_status('loaded', name=request['name'], path=resolved,
+                                   task=str(model.task), seconds=round(load_s, 2))
+
+    def _mirror_params(self, values):
+        """preset 에서 파생된 값을 파라미터에도 반영(재진입 가드 필수)."""
+        from rclpy.parameter import Parameter
+        self._applying_params = True
+        try:
+            self.set_parameters([Parameter(k, Parameter.Type.STRING, v)
+                                 for k, v in values.items()])
+        finally:
+            self._applying_params = False
+
+    def _publish_model_status(self, state, *, name, path, task,
+                              seconds=None, detail=''):
+        """`/perception/model_status` (JSON, latched).
+
+        `stale_pick_target` 이 핵심이다 — `/pick_target` 은 latched 라 새 모델이
+        아직 아무것도 못 찾았어도 **이전 모델의 마지막 타깃이 그대로 남아 있다.**
+        지울 방법이 없으므로 화면이 경고할 수 있게 사실을 실어 보낸다.
+        """
+        import json
+        payload = {
+            'state': state,
+            'name': name,
+            'path': path,
+            'task': task,
+            'seconds': seconds,
+            'detail': detail,
+            'stale_pick_target': self._pick_target_published,
+        }
+        self.pub_model_status.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+
     # ── 클래스 필터 ────────────────────────────
 
-    def _get_cls_filter(self):
+    def _get_cls_filter(self, model):
         classes_str = self.get_parameter('classes').value
         if not classes_str.strip():
             return None
-        name_to_id = {v: k for k, v in self.model.names.items()}
+        name_to_id = {v: k for k, v in model.names.items()}
         ids = []
         for name in classes_str.split(','):
             name = name.strip()
             if name in name_to_id:
                 ids.append(name_to_id[name])
             else:
-                self.get_logger().warn(f'Unknown class "{name}" — 무시')
+                self.get_logger().warn(f'Unknown class "{name}" — 무시',
+                                       throttle_duration_sec=5.0)
         return ids or None
 
     # ── capture / latest-only 추론 ──────────────────────────────
@@ -434,24 +613,40 @@ class PerceptionNode(Node):
         self.pub_cloud.publish(msg)
 
     def _inference_loop(self):
-        """공유 슬롯의 최신 프레임만 소비 — 지연 프레임 큐가 쌓이지 않는다."""
+        """공유 슬롯의 최신 프레임만 소비 — 지연 프레임 큐가 쌓이지 않는다.
+
+        모델 교체도 여기서 한다(프레임과 프레임 사이). 이 루프가 `self.model` 의
+        유일한 소비자라, 교체가 진행 중인 `predict()` 와 경합할 수 없다.
+        """
         last_sequence = -1
         while self._running and rclpy.ok():
+            self._apply_pending_model()
             with self._latest_lock:
                 frame = self._latest_frame
             if frame is None or frame[0] == last_sequence:
                 time.sleep(0.002)
                 continue
             last_sequence, stamp, color_img, depth_frame, depth_img = frame
-            self._publish_detections(color_img, depth_frame, depth_img, stamp)
+            try:
+                self._publish_detections(color_img, depth_frame, depth_img, stamp)
+            except Exception as exc:                          # noqa: BLE001
+                # 이 스레드가 예외로 죽으면 프로세스는 멀쩡한데 검출만 영원히
+                # 멈춘다(가장 진단하기 나쁜 실패). 잡아서 로그로 남기고 계속 돈다.
+                self.get_logger().error(f'추론 루프 예외: {type(exc).__name__}: {exc}',
+                                        throttle_duration_sec=2.0)
+                time.sleep(0.05)
 
     def _publish_detections(self, color_img, depth_frame, depth_img, stamp):
+        # ⚠️ 모델 참조를 **한 번만** 스냅샷한다. self.model 을 두 번 따로 읽으면
+        # (predict 할 때 / names 를 볼 때) 그 사이에 교체가 끼어들어 A 모델의
+        # class_id 로 B 모델의 names 를 인덱싱하고 KeyError 가 난다.
+        model = self.model
         conf = self.get_parameter('conf_threshold').value
-        cls_filter = self._get_cls_filter()
+        cls_filter = self._get_cls_filter(model)
         frame_id = self.get_parameter('frame_id').value
 
         # ① YOLO segmentation 추론
-        results = self.model.predict(
+        results = model.predict(
             color_img, conf=conf, classes=cls_filter, verbose=False)
         r0 = results[0]
         # ``masks.data``는 모델/letterbox 래스터 좌표라 848x480 리사이즈 시
@@ -475,7 +670,7 @@ class PerceptionNode(Node):
 
             obj = DetectedObject()
             obj.class_id = int(box.cls[0])
-            obj.class_name = self.model.names[obj.class_id]
+            obj.class_name = model.names[obj.class_id]
             obj.confidence = float(box.conf[0])
             obj.pose = Pose()  # 기본값(position 0)
             obj.pose.orientation.w = 1.0  # 유효 단위 쿼터니언
@@ -502,6 +697,9 @@ class PerceptionNode(Node):
         pick = self._select_pick_target(array_msg.objects)
         if pick is not None:
             self.pub_pick.publish(pick)
+            # latched 라 모델을 바꿔도 이 값이 남는다 — model_status 가 그 사실을
+            # 실어 보내 화면이 "이전 모델의 타깃" 경고를 띄울 수 있게 한다.
+            self._pick_target_published = True
 
         # ④ debug 이미지 발행
         if self.pub_debug.get_subscription_count() > 0:

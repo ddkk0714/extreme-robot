@@ -90,6 +90,7 @@ code { font-size: 0.92em; color: var(--text-secondary); }
 }
 .chip-muted { color: var(--muted); }
 .chip-good { color: var(--good); border-color: var(--good); }
+.chip-warn { color: var(--warning); border-color: var(--warning); }
 .chip-critical { color: var(--critical); border-color: var(--critical); }
 
 .btn {
@@ -98,6 +99,19 @@ code { font-size: 0.92em; color: var(--text-secondary); }
   border: 1px solid var(--border); cursor: pointer; text-decoration: none;
 }
 .btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); }
+.btn-primary { border-color: var(--series-1); color: var(--series-1); }
+
+/* ── 폼 (제어 모드) ────────────────────────────────────── */
+.field { display: block; margin: 8px 0; }
+.field-label {
+  display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 3px;
+}
+.field .btn { width: 100%; box-sizing: border-box; text-align: left; }
+.field-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.field-row .field { flex: 1 1 160px; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 6px; }
 
 /* ── 배너 ─────────────────────────────────────────────── */
 .banner {

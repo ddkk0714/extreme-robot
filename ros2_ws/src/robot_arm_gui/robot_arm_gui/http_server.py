@@ -313,7 +313,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             return self._send_json({'error': '읽기 전용 모드입니다'}, status=403)
 
         if path == '/api/models':
-            return self._send_json({'models': control.list_models()})
+            return self._send_json(control.list_models())
         if path == '/api/tasks':
             since = _first_int(query.get('since'), 0)
             return self._send_json({'results': control.bus.task_results(since)})
