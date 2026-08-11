@@ -173,6 +173,18 @@ DXL_EXTENDED_MIN_TICK = calib_math.DXL_EXTENDED_MIN_TICK
 DXL_EXTENDED_MAX_TICK = calib_math.DXL_EXTENDED_MAX_TICK
 
 
+#: 캘리브 파라미터의 "비어 있음" 기본값.
+#:
+#: ⚠️ **`[]` 을 쓰면 안 된다.** rclpy 는 빈 리스트에서 타입을 추론하지 못해
+#: `BYTE_ARRAY` 로 선언해 버리고, 그러면 런타임 `set_parameters` 가
+#: *"Wrong parameter type, expected 'Type.BYTE_ARRAY' got 'Type.STRING_ARRAY'"* 로
+#: **거절된다**(2026-08-12 실기 확인). CLI `-p gear_ratios:=` 는 선언 시점에 값을
+#: 덮어써서 멀쩡히 동작하므로, **런타임에 처음 바꿔 볼 때까지 드러나지 않는다.**
+#: `ParameterDescriptor(type=...)` 로도 추론을 못 바꾼다 — 빈 문자열 하나가 답이다.
+#: 파서가 이름 없는 항목을 건너뛰므로 의미상으로는 "없음" 그대로다.
+EMPTY_STR_ARRAY = [""]
+
+
 # 캘리브 파라미터(`gear_ratios`·`centers`)의 파서. rclpy 에 dict 타입 파라미터가 없어
 # "<joint>:<값>" 문자열 배열로 받는다. 기동 시와 런타임 변경(파라미터 콜백)이 **같은
 # 검증**을 쓰도록 함수로 뺐다 — 한쪽만 느슨하면 기동은 되는데 변경은 거절되는 식이 된다.
@@ -279,7 +291,7 @@ class MoveItDynamixelBridge(Node):
         # 기어비 실측 반영용 — JOINT_CONFIG 의 gear_ratio 기본값을 런타임에 덮어쓴다.
         # "<joint>:<ratio>" 문자열 배열로 받는다(예: ["arm_joint_2:9.8"]). rclpy 는
         # dict 타입 파라미터가 없어서 이 형태를 쓴다.
-        self.declare_parameter("gear_ratios", [])
+        self.declare_parameter("gear_ratios", EMPTY_STR_ARRAY)
         self.gear_ratios, errors = _parse_gear_ratios(
             self.get_parameter("gear_ratios").value)
         for reason in errors:
@@ -292,7 +304,7 @@ class MoveItDynamixelBridge(Node):
         # (기어비·그리퍼 끝단은 파라미터로 바로 넣을 수 있는데 영점만 없었다).
         # ⚠️ 여기 값은 **관절각 도메인**의 center 다 — teleop_core 의 DEFAULT_CENTERS
         #    (서보축 도메인)와 숫자가 다르며 서로 복사하면 안 된다.
-        self.declare_parameter("centers", [])
+        self.declare_parameter("centers", EMPTY_STR_ARRAY)
         self.centers, errors = _parse_centers(self.get_parameter("centers").value)
         for reason in errors:
             self.get_logger().warn(f"centers: {reason} — 무시")
@@ -369,11 +381,23 @@ class MoveItDynamixelBridge(Node):
             # tick→rad 환산을 /joint_states 로 눈으로 검증하는 게 이 모드의 목적이라,
             # 그리퍼만 읽으면 정작 검증할 대상이 안 보인다. gripper-only 는 이름대로
             # 그리퍼만 본다(팔은 다른 노드가 잡고 있을 수 있어 건드리지 않음).
+            #
+            # ⚠️ **응답하는 ID만 등록한다.** SyncRead 는 한 번의 브로드캐스트라, 등록해
+            #    둔 ID 하나가 무응답이면 그 자리에서 응답 수신이 어긋나 **나머지 서보의
+            #    데이터까지 못 쓰게 된다.** 2026-08-12 실기에서 ID 14 하나가 죽은 채로
+            #    이 모드를 띄웠더니 /joint_states 에 팔 관절이 **하나도** 안 실렸고,
+            #    로그에는 아무 경고도 없어서 "브릿지가 안 떴나?" 로 보였다.
+            #    구동 경로(else 절)는 토크 인가 성공 여부로 이미 같은 필터를 갖고 있는데,
+            #    정작 **캘리브에 쓰는 이 모드에만** 그게 없었다.
             if not self.gripper_only_mode:
                 for joint_name, config in JOINT_CONFIG.items():
+                    if not self._ping(config["id"], joint_name):
+                        continue
                     if self.group_sync_read.addParam(config["id"]):
                         self.active_ids.add(config["id"])
             for gid in self.gripper_ids:
+                if not self._ping(gid, f"gripper(id {gid})"):
+                    continue
                 if self.group_sync_read.addParam(gid):
                     self.active_ids.add(gid)
             if self.gripper_only_mode:
@@ -545,6 +569,25 @@ class MoveItDynamixelBridge(Node):
             f"Operating Mode 교정: {label}, id={dxl_id}, {current} → {desired} "
             f"({'extended position' if extended else 'position'}). "
             "다른 도구가 모드를 바꿔놓은 상태였다.")
+        return True
+
+    def _ping(self, dxl_id, label):
+        """버스에 실제로 응답하는 서보인지 확인. 없으면 사유를 남기고 False.
+
+        읽기 전용/그리퍼 전용 모드가 SyncRead 등록 전에 쓴다. 구동 경로는 토크 인가
+        성공 여부가 같은 역할을 한다(모터가 없으면 인가가 실패한다).
+        """
+        _model, result, error = self.packet_handler.ping(self.port_handler, dxl_id)
+        if result != 0:
+            self.get_logger().warn(
+                f"서보 무응답 — {label} (id {dxl_id}): "
+                f"{self.packet_handler.getTxRxResult(result)}. "
+                "이 ID 는 읽기 대상에서 제외한다(등록해 두면 나머지 서보의 응답까지 "
+                "못 쓰게 된다). 전원·케이블·ID 를 확인할 것.")
+            return False
+        if error != 0:
+            self.get_logger().warn(
+                f"{label} (id {dxl_id}) 응답에 에러 플래그: {error}")
         return True
 
     def _enable_torque(self, dxl_id, label, extended=False):

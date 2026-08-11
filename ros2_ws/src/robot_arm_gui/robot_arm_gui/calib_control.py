@@ -86,16 +86,23 @@ class CalibControl:
         future.add_done_callback(done)
         return True, None
 
-    def _capture(self, joints):
-        """지금 `/joint_states` 에서 캡처 → `(값, 사유)`."""
+    def _capture(self, joints, allow_partial=False):
+        """지금 `/joint_states` 에서 캡처 → `(값, 사유)`.
+
+        `allow_partial` 이면 값이 안 오는 축은 **건너뛰고** 나머지로 계속한다.
+        서보 하나가 죽었다고 다른 축의 영점까지 못 재면 안 된다 —
+        `measure_zero_offset.py` 도 없는 축은 경고만 하고 넘어간다. 다만 하나도 없으면
+        측정 자체가 성립하지 않으므로 그때는 거절한다.
+        """
         now = time.monotonic()
         positions = self.node.store.joint_positions(max_age_s=MAX_SAMPLE_AGE_S, now=now)
         missing = [n for n in joints if n not in positions]
-        if missing:
+        captured = {n: positions[n] for n in joints if n in positions}
+        if missing and not (allow_partial and captured):
             return None, (f'{", ".join(missing)} 의 최신 /joint_states 가 없습니다 '
-                          f'({MAX_SAMPLE_AGE_S}초 이내 값 필요) — 브릿지가 떠 있는지 '
-                          '확인하세요')
-        return {n: positions[n] for n in joints}, None
+                          f'({MAX_SAMPLE_AGE_S}초 이내 값 필요) — 브릿지가 떠 있는지, '
+                          '그 서보가 버스에 응답하는지 확인하세요')
+        return captured, None
 
     def _finish(self, payload, state, detail):
         task_id = payload.get('_task_id')
@@ -131,9 +138,10 @@ class CalibControl:
 
     def _run_zero(self, payload):
         joints = list(self.joint_config)
-        sample, reason = self._capture(joints)
+        sample, reason = self._capture(joints, allow_partial=True)
         if sample is None:
             return 'error', reason
+        payload['_skipped'] = [n for n in joints if n not in sample]
 
         def done(future):
             try:
@@ -178,13 +186,23 @@ class CalibControl:
                 name, cfg['id'], center_new, cfg['direction'], ratio, cfg['extended']))
             applies.append(f'{name}:{int(round(center_new))}')
 
+        skipped = payload.get('_skipped') or []
+        if skipped:
+            # 건너뛴 축은 **영점이 갱신되지 않는다.** 그 사실이 화면에서 사라지면
+            # 나머지만 맞춰 놓고 다 됐다고 오해한다.
+            warnings.append(
+                f'{", ".join(skipped)} 는 /joint_states 가 없어 건너뛰었습니다 — '
+                '그 축의 영점은 그대로입니다(서보 응답을 먼저 확인하세요).')
+
         self.node.store.set_calib_result({
             'kind': 'zero', 'rows': rows, 'warnings': warnings,
+            'skipped': skipped,
             'block': '\n'.join(block), 'apply_target': 'centers',
             'apply_values': applies, 'at': time.time(),
         })
         self._finish(payload, 'done',
                      f'{len(rows)}개 축 영점 계산 완료'
+                     + (f', {len(skipped)}개 축 건너뜀' if skipped else '')
                      + (f' — 경고 {len(warnings)}건' if warnings else ''))
 
     # ------------------------------------------------------------ 기어비

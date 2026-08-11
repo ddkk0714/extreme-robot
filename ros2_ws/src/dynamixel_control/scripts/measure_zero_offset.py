@@ -237,7 +237,8 @@ def main():
                 ratio_of(name), config["extended"]))
 
         # 재빌드 없이 그 자리에서 시험해 볼 수 있는 경로도 같이 알려준다.
-        centers = " ".join(f"'{n}:{round(c)}'" for n, c in results.items())
+        # 항목 구분자는 **쉼표**다 — 공백으로 붙이면 ROS 가 배열로 파싱하지 못한다.
+        centers = ",".join(f"'{n}:{round(c)}'" for n, c in results.items())
         print("\n재빌드 없이 브릿지에 바로 넣어 시험:\n")
         print(f'    -p centers:="[{centers}]"')
 

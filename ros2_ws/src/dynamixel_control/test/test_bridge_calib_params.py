@@ -10,7 +10,8 @@
 from types import SimpleNamespace
 
 from dynamixel_control.moveit_dynamixel_bridge import (
-    JOINT_CONFIG, MoveItDynamixelBridge, _parse_centers, _parse_gear_ratios,
+    EMPTY_STR_ARRAY, JOINT_CONFIG, MoveItDynamixelBridge, _parse_centers,
+    _parse_gear_ratios,
 )
 
 import pytest
@@ -53,6 +54,17 @@ def test_empty_default_is_not_an_error():
     assert _parse_centers(['']) == ({}, [])
     assert _parse_gear_ratios(['']) == ({}, [])
     assert _parse_centers([]) == ({}, [])
+
+
+def test_empty_default_must_stay_a_string_array():
+    """⚠️ `[]` 로 되돌리면 rclpy 가 BYTE_ARRAY 로 추론해 **런타임 설정이 거절된다.**
+
+    CLI `-p centers:=...` 는 선언 시점에 값을 덮어써서 멀쩡히 동작하므로, 이 회귀는
+    "즉시 적용" 을 실제로 눌러 보기 전까지 드러나지 않는다(2026-08-12 실기에서 그렇게
+    발견했다). 값이 아니라 **타입 추론**을 지키는 테스트다.
+    """
+    assert EMPTY_STR_ARRAY, '빈 리스트면 타입 추론이 BYTE_ARRAY 로 떨어진다'
+    assert all(isinstance(v, str) for v in EMPTY_STR_ARRAY)
 
 
 def test_parsers_read_the_pair_format():
