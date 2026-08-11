@@ -198,6 +198,24 @@ def test_hot_snapshot_has_no_events():
     assert hot['arm']['status'] == 'EXECUTING'
 
 
+def test_calib_status_keeps_the_raw_text_next_to_the_parse():
+    """파서가 형식을 못 알아봐도 운영자는 원문을 볼 수 있어야 한다."""
+    s = make_store()
+    s.set_calib_status('active,arm_joint_2,lower,1,4', now=1.0)
+    teleop = s.snapshot(now=1.0)['teleop']
+    assert teleop['calib'] == 'active,arm_joint_2,lower,1,4'
+    assert teleop['calib_info']['joint'] == 'arm_joint_2'
+    assert teleop['calib_info']['step_label'] == '하한'
+
+
+def test_calib_event_is_readable_not_raw():
+    """이벤트 로그에 'active,arm_joint_2,lower,1,4' 가 남으면 아무도 안 읽는다."""
+    s = make_store()
+    s.set_calib_status('done,3,1', now=1.0)
+    event = [e for e in s.snapshot(now=1.0)['events'] if e['kind'] == 'calib'][-1]
+    assert '거절' in event['text']
+
+
 def test_hot_snapshot_carries_everything_the_motor_table_needs():
     """회귀 — thresholds 를 빼뒀더니 화면이 5Hz 갱신마다 예외로 죽었다.
 

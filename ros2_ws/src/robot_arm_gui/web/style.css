@@ -294,6 +294,22 @@ kbd {
 }
 .pad-cell-on { border-color: var(--good); color: var(--good); }
 
+/* ── 캘리브 마법사 ────────────────────────────────────── */
+.calib-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px; margin-top: 10px;
+}
+.calib-card {
+  padding: 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--plane);
+}
+.calib-result { margin-top: 12px; }
+.calib-block {
+  margin: 4px 0; padding: 8px 10px; overflow-x: auto; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--plane);
+  font-family: ui-monospace, monospace; font-size: 12px; white-space: pre;
+}
+
 @media (max-width: 640px) {
   .strip-card-wide { grid-column: span 1; }
   .tbl th, .tbl td { padding: 5px 6px; }

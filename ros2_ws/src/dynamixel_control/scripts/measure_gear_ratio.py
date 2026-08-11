@@ -43,6 +43,19 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
+try:
+    from dynamixel_control import calib_math
+except ImportError:
+    # 2026-08-12: 이 스크립트도 이제 공용 측정식을 쓴다 — 예전엔 패키지를 전혀 import
+    # 하지 않아 오버레이 없이도 돌았지만, 관제 GUI 의 기어비 마법사와 **같은 식**을
+    # 쓰는 쪽이 더 중요하다(식이 갈라지면 어느 값이 맞는지 알 수 없게 된다).
+    sys.stderr.write(
+        "dynamixel_control 패키지를 import 할 수 없습니다 — 워크스페이스 오버레이가\n"
+        "소싱되지 않은 셸로 보입니다. 다음을 먼저 실행하세요:\n\n"
+        "    source /root/ros2_ws/install/setup.bash\n"
+    )
+    sys.exit(1)
+
 
 class GearRatioMeasurer(Node):
     def __init__(self, joint_name):
@@ -113,7 +126,9 @@ def main():
         print(f"   서보축 회전량 = {servo_delta:+.4f} rad "
               f"({math.degrees(servo_delta):+.2f}°, {servo_delta / (2 * math.pi):+.3f} 회전)")
 
-        if abs(servo_delta) < 0.05:
+        # 임계는 calib_math 가 갖고 있다(아래 gear_ratio_from_span 도 같은 값으로 막는다).
+        # 여기서 미리 거르는 건 관절 각도를 물어보기 **전에** 끝내려는 것뿐이다.
+        if abs(servo_delta) < calib_math.MIN_SERVO_DELTA_RAD:
             print("\n서보가 거의 안 움직였습니다 — 관절을 실제로 돌렸는지 확인하세요.",
                   file=sys.stderr)
             return 1
@@ -124,22 +139,21 @@ def main():
         except ValueError:
             print(f"숫자가 아닙니다: {raw!r}", file=sys.stderr)
             return 1
-        if abs(joint_deg) < 1e-6:
-            print("관절 각도가 0 이면 기어비를 계산할 수 없습니다.", file=sys.stderr)
+        try:
+            ratio, inverted = calib_math.gear_ratio_from_span(servo_delta, joint_deg)
+        except ValueError as exc:
+            print(f"\n{exc}", file=sys.stderr)
             return 1
 
-        joint_delta = math.radians(joint_deg)
-        ratio = servo_delta / joint_delta
-
         print("\n" + "=" * 58)
-        print(f"  {args.joint_name} 기어비 = {abs(ratio):.3f} : 1")
+        print(f"  {args.joint_name} 기어비 = {ratio:.3f} : 1")
         print("=" * 58)
-        if ratio < 0:
+        if inverted:
             print("  ⚠️ 부호가 음수다 — 서보와 관절이 반대로 돈다는 뜻이다.")
             print("     JOINT_CONFIG 의 direction 부호를 뒤집어야 할 수 있다")
             print("     (기어비 자체는 절대값을 쓴다).")
         print("\n  브릿지에 반영:")
-        print(f"    -p gear_ratios:=\"['{args.joint_name}:{abs(ratio):.3f}']\"")
+        print(f"    -p gear_ratios:=\"['{args.joint_name}:{ratio:.3f}']\"")
         print()
         return 0
     except KeyboardInterrupt:

@@ -101,6 +101,7 @@ class ControlPlane:
 
         self._set_param_clients = {}
         self._task_handlers = {}
+        self._info_sources = {}
         self._model_source = None
         self._last_publish_state = 'idle'
 
@@ -209,6 +210,10 @@ class ControlPlane:
     def register_model_source(self, fn):
         self._model_source = fn
 
+    def register_info(self, key, fn):
+        """단계별 기능이 `describe()` 에 실을 정보를 등록한다(화면이 UI 를 그릴 근거)."""
+        self._info_sources[key] = fn
+
     def validate_task(self, kind, payload):
         handler = self._task_handlers.get(kind)
         if handler is None:
@@ -294,6 +299,7 @@ class ControlPlane:
             },
             'gamepad': gamepad_defaults(),
             'jog_conflict': self.jog_publisher_conflict(),
+            **{key: fn() for key, fn in self._info_sources.items()},
         }
 
     def list_models(self):

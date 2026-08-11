@@ -11,7 +11,10 @@ from std_msgs.msg import Bool, Int32MultiArray
 from control_msgs.action import FollowJointTrajectory
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
 
+from rcl_interfaces.msg import SetParametersResult
+
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+from dynamixel_control import calib_math
 from dynamixel_control import joint_limits
 
 
@@ -56,12 +59,15 @@ PROTOCOL_VERSION = 2.0
 BAUDRATE = 1000000
 DEVICENAME = "/dev/ttyUSB0"
 
-DXL_MINIMUM_POSITION_VALUE = 0
-DXL_MAXIMUM_POSITION_VALUE = 4095
-DXL_CENTER_POSITION = 2048
+# tick 상수와 캘리브 측정식의 단일 출처는 calib_math 다(ROS 비의존 → pytest 로 고정).
+# 여기서 재노출하는 이유는 `scripts/measure_*.py` 와 외부 코드가 예전부터 이 모듈에서
+# 가져다 쓰고 있어서다 — import 경로를 깨지 않으면서 정의는 한 곳으로 모은다.
+DXL_MINIMUM_POSITION_VALUE = calib_math.DXL_MINIMUM_POSITION_VALUE
+DXL_MAXIMUM_POSITION_VALUE = calib_math.DXL_MAXIMUM_POSITION_VALUE
+DXL_CENTER_POSITION = calib_math.DXL_CENTER_POSITION
 
-TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
-DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Present Velocity 환산용
+TICKS_PER_RAD = calib_math.TICKS_PER_RAD
+DXL_TICKS_PER_REV = calib_math.DXL_TICKS_PER_REV  # Present Velocity 환산용
 
 
 # 팔 관절 ↔ 다이나믹셀 ID 매핑.
@@ -86,6 +92,8 @@ DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Pr
 # ⚠️ 실측 정밀도는 관절각을 얼마나 정확히 쟀는지에 달려 있다(90° 를 ±9° 오차로 재면
 #    기어비도 약 ±10% 흔들린다). 파지 위치가 계통적으로 어긋나면 이 값부터 의심할 것.
 #    재측정 없이 시험할 땐 `gear_ratios` 파라미터로 덮어쓸 수 있다.
+#    `center`(영점)도 같은 방식으로 `centers` 파라미터가 덮어쓴다
+#    (`scripts/measure_zero_offset.py` 또는 관제 GUI 의 영점 마법사 결과를 바로 시험).
 #
 # 🔒 **모를 때는 낮은 값을 쓴다.** 기어비를 실제보다 낮게 잡으면 관절이 명령보다 덜
 #    움직여(언더슈트) 안전하지만, 높게 잡으면 그 배수만큼 과주행해 구조물을 때린다.
@@ -161,8 +169,57 @@ STATIC_JOINTS = {
 }
 
 # X 시리즈 Extended Position Control Mode 의 raw tick 한계(약 ±256회전).
-DXL_EXTENDED_MIN_TICK = -1_048_575
-DXL_EXTENDED_MAX_TICK = 1_048_575
+DXL_EXTENDED_MIN_TICK = calib_math.DXL_EXTENDED_MIN_TICK
+DXL_EXTENDED_MAX_TICK = calib_math.DXL_EXTENDED_MAX_TICK
+
+
+# 캘리브 파라미터(`gear_ratios`·`centers`)의 파서. rclpy 에 dict 타입 파라미터가 없어
+# "<joint>:<값>" 문자열 배열로 받는다. 기동 시와 런타임 변경(파라미터 콜백)이 **같은
+# 검증**을 쓰도록 함수로 뺐다 — 한쪽만 느슨하면 기동은 되는데 변경은 거절되는 식이 된다.
+def _parse_gear_ratios(entries):
+    """`["arm_joint_2:9.034", …]` → `({이름: 비}, [오류 사유])`."""
+    out, errors = {}, []
+    for entry in entries or []:
+        name, _, value = str(entry).partition(":")
+        if not name:
+            continue                       # 빈 문자열은 "없음" 으로 본다(기본값 [""])
+        if name not in JOINT_CONFIG:
+            errors.append(f"모르는 관절 '{name}'")
+            continue
+        try:
+            ratio = float(value)
+        except ValueError:
+            errors.append(f"'{entry}' 파싱 실패")
+            continue
+        if ratio <= 0.0:
+            errors.append(f"'{entry}' 은 양수여야 함")
+            continue
+        out[name] = ratio
+    return out, errors
+
+
+def _parse_centers(entries):
+    """`["arm_joint_2:1627", …]` → `({이름: tick}, [오류 사유])`."""
+    out, errors = {}, []
+    for entry in entries or []:
+        name, _, value = str(entry).partition(":")
+        if not name:
+            continue
+        if name not in JOINT_CONFIG:
+            errors.append(f"모르는 관절 '{name}'")
+            continue
+        try:
+            center = int(round(float(value)))
+        except ValueError:
+            errors.append(f"'{entry}' 파싱 실패")
+            continue
+        reason = calib_math.center_out_of_range(center, JOINT_CONFIG[name]["extended"])
+        if reason is not None:
+            errors.append(f"{name}: {reason}")
+            continue
+        out[name] = center
+    return out, errors
+
 
 # Profile Acceleration(108) / Velocity(112). 기본값 0 은 "최고속 즉시 이동" 이라
 # 그리퍼가 움직일 때마다 순간 과전류로 토크가 풀린다(HW-8 실기, 재현율 100%,
@@ -223,22 +280,29 @@ class MoveItDynamixelBridge(Node):
         # "<joint>:<ratio>" 문자열 배열로 받는다(예: ["arm_joint_2:9.8"]). rclpy 는
         # dict 타입 파라미터가 없어서 이 형태를 쓴다.
         self.declare_parameter("gear_ratios", [])
-        self.gear_ratios = {}
-        for entry in self.get_parameter("gear_ratios").value:
-            name, _, value = str(entry).partition(":")
-            if name not in JOINT_CONFIG:
-                self.get_logger().warn(f"gear_ratios: 모르는 관절 '{name}' 무시")
-                continue
-            try:
-                ratio = float(value)
-            except ValueError:
-                self.get_logger().warn(f"gear_ratios: '{entry}' 파싱 실패 — 무시")
-                continue
-            if ratio <= 0.0:
-                self.get_logger().warn(f"gear_ratios: '{entry}' 은 양수여야 함 — 무시")
-                continue
-            self.gear_ratios[name] = ratio
+        self.gear_ratios, errors = _parse_gear_ratios(
+            self.get_parameter("gear_ratios").value)
+        for reason in errors:
+            self.get_logger().warn(f"gear_ratios: {reason} — 무시")
+        for name, ratio in self.gear_ratios.items():
             self.get_logger().info(f"gear_ratio 덮어쓰기: {name} = {ratio}")
+
+        # 영점(center tick) 실측 반영용 — gear_ratios 와 **완전히 대칭**이다.
+        # 이게 없어서 `measure_zero_offset.py` 결과는 소스를 고쳐 재빌드해야만 반영됐다
+        # (기어비·그리퍼 끝단은 파라미터로 바로 넣을 수 있는데 영점만 없었다).
+        # ⚠️ 여기 값은 **관절각 도메인**의 center 다 — teleop_core 의 DEFAULT_CENTERS
+        #    (서보축 도메인)와 숫자가 다르며 서로 복사하면 안 된다.
+        self.declare_parameter("centers", [])
+        self.centers, errors = _parse_centers(self.get_parameter("centers").value)
+        for reason in errors:
+            self.get_logger().warn(f"centers: {reason} — 무시")
+        for name, center in self.centers.items():
+            self.get_logger().info(f"center 덮어쓰기: {name} = {center} tick")
+
+        # ⚠️ 이 콜백이 없으면 `set_parameters` 는 **값만** 바꾸고 브릿지는 기동 시
+        #    파싱해 둔 dict 를 계속 쓴다 — 호출자에게는 성공으로 보이는데 실제
+        #    변환식은 그대로다. 캘리브 결과를 재빌드 없이 시험하려면 여기서 받아야 한다.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         geared = {n: self._joint_gear_ratio(n) for n, c in JOINT_CONFIG.items()
                   if c["extended"]}
@@ -505,6 +569,69 @@ class MoveItDynamixelBridge(Node):
         """실측으로 덮어쓸 수 있는 기어비(`gear_ratios` 파라미터 > JOINT_CONFIG 기본값)."""
         return self.gear_ratios.get(joint_name, JOINT_CONFIG[joint_name]["gear_ratio"])
 
+    def _joint_center(self, joint_name):
+        """실측으로 덮어쓸 수 있는 영점(`centers` 파라미터 > JOINT_CONFIG 기본값)."""
+        return self.centers.get(joint_name, JOINT_CONFIG[joint_name]["center"])
+
+    def _on_set_parameters(self, params):
+        """캘리브 값(영점·기어비·그리퍼 끝단)의 **런타임 반영**.
+
+        캘리브 도구(`scripts/measure_*.py`, 관제 GUI 마법사)가 잰 값을 재빌드 없이
+        그 자리에서 시험할 수 있어야 한다. 검증에 실패하면 이유와 함께 거절한다 —
+        조용히 무시하면 "적용했는데 왜 그대로지?" 가 된다.
+
+        ⚠️ 원자적 설정(`set_parameters_atomically`)으로 보내야 한다. 비원자 설정은
+        파라미터를 하나씩 넘겨서, 그리퍼 개폐 tick 처럼 **짝으로만 의미가 있는 값**이
+        중간 상태로 검증된다.
+
+        ⚠️ 이 값이 바뀌면 rad↔tick 변환이 통째로 달라진다. 측정은 `read_only:=true`
+        (토크 OFF)에서 하는 것이 전제이고, 토크가 살아 있는 상태에서 바꾸면 다음
+        명령부터 팔이 다른 위치를 목표로 삼는다 — 그 경우 경고를 남긴다.
+        """
+        centers, ratios = None, None
+        gripper = {}
+        for param in params:
+            if param.name == "centers":
+                centers, errors = _parse_centers(param.value)
+                if errors:
+                    return SetParametersResult(
+                        successful=False, reason=f"centers: {'; '.join(errors)}")
+            elif param.name == "gear_ratios":
+                ratios, errors = _parse_gear_ratios(param.value)
+                if errors:
+                    return SetParametersResult(
+                        successful=False, reason=f"gear_ratios: {'; '.join(errors)}")
+            elif param.name in ("gripper_open_tick", "gripper_close_tick"):
+                gripper[param.name] = int(param.value)
+
+        if gripper:
+            open_tick = gripper.get("gripper_open_tick", self.gripper_open_tick)
+            close_tick = gripper.get("gripper_close_tick", self.gripper_close_tick)
+            if abs(open_tick - close_tick) < calib_math.MIN_GRIPPER_SPAN_TICK:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(f"그리퍼 개폐 tick 차이가 {abs(open_tick - close_tick)} "
+                            "밖에 안 됩니다 — 잘못 측정된 값입니다"))
+
+        changed = []
+        if centers is not None:
+            self.centers = centers
+            changed.append(f"centers={centers}")
+        if ratios is not None:
+            self.gear_ratios = ratios
+            changed.append(f"gear_ratios={ratios}")
+        for name, value in gripper.items():
+            setattr(self, name, value)
+            changed.append(f"{name}={value}")
+
+        if changed:
+            self.get_logger().info("캘리브 런타임 반영: " + ", ".join(changed))
+            if not self.read_only:
+                self.get_logger().warn(
+                    "⚠️ 토크가 살아 있는 상태에서 캘리브가 바뀌었다 — 다음 명령부터 "
+                    "rad↔tick 변환이 달라진다. 측정은 read_only:=true 에서 할 것.")
+        return SetParametersResult(successful=True)
+
     def rad_to_tick(self, joint_name, rad):
         """관절 rad → 서보 tick. 안전 리밋 clamp 후 기어비를 곱해 서보축 도메인으로 올린다.
 
@@ -520,18 +647,18 @@ class MoveItDynamixelBridge(Node):
                 f"{joint_name}: 목표각이 안전 범위를 벗어나 clamp 됨 "
                 f"→ {rad:+.4f} rad (범위 [{lower:+.4f}, {upper:+.4f}])"
             )
-        ticks_per_joint_rad = TICKS_PER_RAD * self._joint_gear_ratio(joint_name)
-        tick = config["center"] + config["direction"] * rad * ticks_per_joint_rad
-        tick = int(round(tick))
+        tick = int(round(calib_math.rad_to_tick(
+            self._joint_center(joint_name), config["direction"],
+            self._joint_gear_ratio(joint_name), rad)))
         if config["extended"]:
             return max(DXL_EXTENDED_MIN_TICK, min(DXL_EXTENDED_MAX_TICK, tick))
         return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
 
     def tick_to_rad(self, joint_name, tick):
         """서보 tick → 관절 rad. rad_to_tick 의 역변환."""
-        config = JOINT_CONFIG[joint_name]
-        ticks_per_joint_rad = TICKS_PER_RAD * self._joint_gear_ratio(joint_name)
-        return (tick - config["center"]) / (config["direction"] * ticks_per_joint_rad)
+        return calib_math.tick_to_rad(
+            self._joint_center(joint_name), JOINT_CONFIG[joint_name]["direction"],
+            self._joint_gear_ratio(joint_name), tick)
 
     def gripper_pos_to_tick(self, rad):
         span = self.gripper_open_tick - self.gripper_close_tick

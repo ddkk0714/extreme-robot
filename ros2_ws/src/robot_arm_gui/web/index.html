@@ -266,6 +266,94 @@
     </div>
   </section>
 
+  <!-- H. 캘리브 (제어 모드 전용) ------------------------------------------ -->
+  <section class="panel panel-wide" id="calib-panel" aria-labelledby="h-calib"
+           data-control-only hidden>
+    <div class="panel-head"><h2 id="h-calib">관절 캘리브레이션</h2></div>
+    <div id="calib-unavailable" class="banner banner-serious" hidden></div>
+
+    <p class="footnote">
+      순서는 <strong>기어비 → 영점 → 가동범위</strong>입니다. 기어비가 틀리면 영점
+      역산이 같이 틀어지고, 둘 중 하나라도 바뀌면 기존 가동범위는 전부 무효입니다.
+      ⚠️ 여기 값은 전부 <strong>관절각 도메인</strong>(<code>JOINT_CONFIG</code>·
+      <code>joint_limits</code>)입니다 — <code>teleop_core</code> 의
+      <code>DEFAULT_CENTERS</code>/<code>DEFAULT_*_RADS</code>(서보축 도메인)와 숫자가
+      무관하니 <strong>서로 복사하지 마세요.</strong>
+      브릿지는 <code>read_only:=true</code> 로 띄워 두세요(토크가 꺼져 있어야 손으로 움직입니다).
+    </p>
+    <div id="calib-order-warn" class="banner banner-serious" hidden></div>
+
+    <div class="calib-grid">
+      <!-- 기어비 -->
+      <div class="calib-card">
+        <div class="field-label">① 기어비</div>
+        <label class="field"><span class="field-label">축</span>
+          <select id="calib-gear-joint" class="btn"></select></label>
+        <div class="btn-row">
+          <button id="calib-gear-start" class="btn" type="button">시작 캡처</button>
+          <button id="calib-gear-end" class="btn" type="button">끝 캡처</button>
+        </div>
+        <dl class="kv" id="calib-gear-captures"></dl>
+        <label class="field"><span class="field-label">실제로 돌린 관절 각도 [deg]</span>
+          <input id="calib-gear-deg" class="btn num-in" type="number" step="0.1" value="90"></label>
+        <button id="calib-gear-run" class="btn btn-primary" type="button">계산</button>
+        <div id="calib-gear-result" class="muted small">—</div>
+        <p class="footnote">
+          시작 캡처 → 관절을 크게(90° 권장) 손으로 돌림 → 끝 캡처 → 실제 각도 입력.
+          각도계 오차가 그대로 기어비 오차가 됩니다.
+        </p>
+      </div>
+
+      <!-- 영점 -->
+      <div class="calib-card">
+        <div class="field-label">② 영점 (center tick)</div>
+        <p class="footnote" style="margin-top:0">
+          팔을 <strong>기준 자세</strong>(기본 URDF home = 전 축 0)로 세운 뒤 계산을
+          누르세요. 구조상 0 으로 못 세우는 축은 아래에 기준각을 넣습니다.
+        </p>
+        <div id="calib-zero-refs"></div>
+        <button id="calib-zero-run" class="btn btn-primary" type="button">지금 자세로 계산</button>
+        <div id="calib-zero-result" class="muted small">—</div>
+      </div>
+
+      <!-- 그리퍼 -->
+      <div class="calib-card">
+        <div class="field-label">③ 그리퍼 끝단</div>
+        <div class="btn-row">
+          <button id="calib-gripper-closed" class="btn" type="button">완전 닫힘 캡처</button>
+          <button id="calib-gripper-open" class="btn" type="button">완전 열림 캡처</button>
+        </div>
+        <dl class="kv" id="calib-gripper-captures"></dl>
+        <label class="field"><span class="field-label">안전 마진 [tick]</span>
+          <input id="calib-gripper-margin" class="btn num-in" type="number" step="1"
+                 min="0" value="0"></label>
+        <button id="calib-gripper-run" class="btn btn-primary" type="button">계산</button>
+        <div id="calib-gripper-result" class="muted small">—</div>
+        <p class="footnote">⚠️ 랙 끝단에 억지로 밀어 넣지 마세요 — 그 지점이 끝단으로
+          박히면 운용 중 매번 거기까지 가려 들고, 그리퍼는 과전류 트립이 잘 납니다.</p>
+      </div>
+
+      <!-- 가동범위 -->
+      <div class="calib-card">
+        <div class="field-label">④ 가동범위 (리밋)</div>
+        <p class="footnote" style="margin-top:0">
+          이 절차는 <code>teleop_core</code> 가 수행하고 결과를
+          <code>~/ros2_ws/dynamixel_arm_joint_limits.json</code> 에 <strong>자동
+          저장</strong>합니다. 시작하면 팔 토크가 꺼집니다 — 축을 손으로 하한까지 밀고
+          [기록], 상한까지 밀고 [기록]을 축마다 반복하세요.
+        </p>
+        <div class="btn-row">
+          <button id="calib-range-start" class="btn btn-primary" type="button">측정 시작</button>
+          <button id="calib-range-mark" class="btn" type="button">기록 (m)</button>
+          <button id="calib-range-cancel" class="btn" type="button">취소 (x)</button>
+        </div>
+        <div id="calib-range-status" class="small">—</div>
+      </div>
+    </div>
+
+    <div id="calib-result" class="calib-result"></div>
+  </section>
+
   <!-- E. 이벤트 ---------------------------------------------------------- -->
   <section class="panel panel-wide" aria-labelledby="h-events">
     <div class="panel-head"><h2 id="h-events">이벤트 · 트립 블랙박스</h2>
@@ -287,6 +375,7 @@
 
 <script src="/app.js"></script>
 <script src="/teleop.js"></script>
+<script src="/calib.js"></script>
 <script src="/control.js"></script>
 </body>
 </html>

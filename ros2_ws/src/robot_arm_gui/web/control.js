@@ -307,6 +307,7 @@ async function init() {
     if (snap.control) { C.session = snap.control; renderSession(); }
   });
   if (window.Teleop) window.Teleop.init();
+  if (window.Calib) window.Calib.init();
   renderSession();
 }
 

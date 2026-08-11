@@ -149,6 +149,9 @@ class TelemetryNode(Node):
         self.declare_parameter('teleop_publish_hz', 20.0)
         self.declare_parameter('models_dir', '')       # 빈값 = 워크스페이스 기본 위치
         self.declare_parameter('manage_perception', False)
+        # 캘리브 마법사가 파라미터를 읽고 쓸 대상(브릿지). read_only:=true 로 띄운
+        # 브릿지가 대상이다 — 이 GUI 는 서보 버스를 직접 잡지 않는다.
+        self.declare_parameter('bridge_node', 'moveit_dynamixel_bridge')
 
         self.warn_temp_c = float(self.get_parameter('warn_temp_c').value)
         self.warn_current_ratio = float(self.get_parameter('warn_current_ratio').value)
@@ -218,6 +221,8 @@ class TelemetryNode(Node):
             perception_node_name=self._perception_node,
             models_dir=models_dir, workspace_root=root, supervisor=supervisor)
 
+        self._setup_calib(plane)
+
         self.get_logger().warn(
             '제어 모드로 기동한다 — /arm/teleop_jog·/arm/teleop_cmd 를 발행한다. '
             '계약 토픽과 /dynamixel/goal_position 은 여전히 발행하지 않는다.')
@@ -225,6 +230,35 @@ class TelemetryNode(Node):
             f'모델 카탈로그: 워크스페이스={root} models_dir={models_dir} '
             f'재시작 관리={"켬" if supervisor else "끔"}')
         return plane
+
+    def _setup_calib(self, plane):
+        """캘리브 마법사 등록.
+
+        `JOINT_CONFIG` 는 브릿지 모듈이 단일 출처라 그대로 import 한다(계약 어휘를
+        복사하지 않는 것과 같은 이유). 다만 그 모듈은 `dynamixel_sdk` 를 끌고 오므로,
+        없는 환경에서도 **GUI 의 나머지는 살아 있어야 한다** — 실패하면 마법사만 빠진다.
+        """
+        try:
+            from dynamixel_control.moveit_dynamixel_bridge import JOINT_CONFIG
+        except ImportError as exc:                            # pragma: no cover
+            self.get_logger().warn(
+                f'캘리브 마법사 비활성 — JOINT_CONFIG 를 못 읽었다: {exc}')
+            plane.register_info('calib', lambda: {
+                'available': False,
+                'reason': 'dynamixel_control.moveit_dynamixel_bridge 를 import 할 수 '
+                          '없습니다(dynamixel_sdk 미설치?)',
+            })
+            return
+
+        from .calib_control import CalibControl
+        bridge = self.get_parameter('bridge_node').value
+        self.calib = CalibControl(self, plane, bridge_node_name=bridge,
+                                  joint_config=JOINT_CONFIG)
+        plane.register_info('calib', lambda: dict(self.calib.describe(),
+                                                  available=True))
+        self.get_logger().info(
+            f'캘리브 마법사 등록 — 대상 브릿지 노드 /{bridge} '
+            f'(축 {len(JOINT_CONFIG)}개)')
 
     # ------------------------------------------------------------ 구독
     def _subscribe_all(self):
