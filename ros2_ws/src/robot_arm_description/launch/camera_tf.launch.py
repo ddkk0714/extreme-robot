@@ -32,23 +32,43 @@ OPTICAL_YAW = -math.pi / 2.0
 def generate_launch_description():
     args = [
         # ── 전방 RGB-D 카메라 ──
-        # 2026-08-07 실측값 (camera_tf_tuner 로 RViz 에서 정렬).
-        #   뒤로 55.3cm, 오른쪽 44.7cm, 높이 16.5cm / yaw +27.0°
+        # 2026-08-09 실측값 (camera_tf_tuner 로 RViz 에서 정렬).
+        #   앞으로 20.2cm, 오른쪽 62.7cm, 높이 14.0cm / yaw +93.2°
         # ⚠️ 이건 **카메라를 책상에 올려둔 벤치 배치**다 — 차체에 정식 장착하면
-        #    반드시 다시 재야 한다(cam_x 가 음수인 것도 그래서다: 카메라가 로봇
-        #    베이스보다 뒤에 있다).
+        #    반드시 다시 재야 한다.
         # 근거: RViz 에서 depth 포인트클라우드와 YOLO 검출 큐브가 실제 상자 위치에
         #    겹치는 것을 눈으로 확인(전 6-DOF 를 한 번에 검증하는 방식). 다점
         #    최소자승(calibrate_camera_pose.py / 튜너의 Solve)은 이 배치에서
         #    오히려 부정확해 채택하지 않았다.
+        #
+        # ⚠️ **책상 위 카메라는 세션 사이에 밀린다 — 매번 재캘리브할 것.**
+        #    2026-08-09 에 08-07 값을 그대로 믿고 픽을 시도했다가, 검출된 박스가
+        #    base_link 기준 방위각 -122° / 반경 0.52m 라는 **도달 불가 좌표**로
+        #    찍혔다. 박스를 잘못 놓은 게 아니라 그 사이 카메라가 움직인 것이었고
+        #    (x 가 +75.5cm, yaw 가 +66° 이동), 재캘리브 후 같은 박스가 방위각
+        #    -6.8° / 반경 0.37m 로 정상 복귀했다(YOLO confidence 도 0.81→0.94).
+        #    "인식은 되는데 IK 가 이상한 데를 가리킨다" 면 여기부터 의심할 것.
+        #
+        # 📌 **캘리브 품질 판정 기준(2026-08-09 확립):** 숫자만 보고는 잘 맞췄는지 알 수 없다.
+        #    `/pick_target` 을 base_link 로 변환해 **방위각**을 보라 — `arm_joint_1`(베이스
+        #    요축)에 모터가 없어 팔이 +x 평면에서만 움직이므로, 방위각 차이가 그대로 파지
+        #    오차로 남는다. 실측 대응:
+        #      -10.3° → analytic IK 잔차 2.13cm (ik_tol 미수렴, 3cm 로 겨우 수용)
+        #       -4.4° → analytic IK 잔차 0.96cm (수렴)
+        #    ±5° 안쪽을 목표로 할 것. 그래도 안 줄면 캘리브가 아니라 **박스가 실제로 팔
+        #    정면에서 벗어나 있는** 것이므로 박스를 옮겨야 한다(둘을 혼동하지 말 것).
+        #
+        # 이전 값(2026-08-09 1차): x=0.2022 y=-0.6269 z=0.1402
+        # 이전 값(2026-08-07 벤치): x=-0.5526 y=-0.4469 z=0.1654
+        #    roll=0.0267 pitch=0.0210 yaw=0.4718
         # 이전 값(차체 장착 CAD 추정, 실기 검증 전): x=0.123 y=0.0 z=0.082
         #    roll=0.0 pitch=-0.26 yaw=0.0 — 정식 장착 시 출발점으로 참고.
-        DeclareLaunchArgument('cam_x',     default_value='-0.5526'),
-        DeclareLaunchArgument('cam_y',     default_value='-0.4469'),
-        DeclareLaunchArgument('cam_z',     default_value='0.1654'),
-        DeclareLaunchArgument('cam_roll',  default_value='0.0267'),
-        DeclareLaunchArgument('cam_pitch', default_value='0.0210'),
-        DeclareLaunchArgument('cam_yaw',   default_value='0.4718'),
+        DeclareLaunchArgument('cam_x',     default_value='0.2022'),
+        DeclareLaunchArgument('cam_y',     default_value='-0.5957'),
+        DeclareLaunchArgument('cam_z',     default_value='0.1272'),
+        DeclareLaunchArgument('cam_roll',  default_value='-0.0619'),
+        DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
+        DeclareLaunchArgument('cam_yaw',   default_value='1.6265'),
     ]
 
     # ── 전방 RGB-D: base_link → camera_link ──

@@ -105,22 +105,41 @@ class Collector(Node):
         self.tf_listener = TransformListener(self.buf, self)
         self.create_subscription(DetectedObject, "/pick_target", self._cb, LATCHED)
 
-    def gripper_xyz(self, base_frame, tip_link, timeout_s=5.0):
+    def gripper_xyz(self, base_frame, tip_link, timeout_s=5.0,
+                    settle_s=2.0, drift_tol=0.005):
         """base_link 기준 그리퍼 위치 — 줄자 대신 쓰는 '진짜 좌표'.
 
         팔의 FK 는 이미 기어비·영점을 실측해 맞춰둔 상태라, 손으로 재는 것보다
         정확하고 반복성도 좋다. 그리퍼를 박스에 맞대고 이 값을 읽으면 그 지점의
         base_link 좌표를 얻는다.
+
+        ⚠️ **드리프트 검사가 붙어 있다.** 토크를 끄면 직결축(arm_joint_4/5)이 중력으로
+           흘러내리므로, 손을 뗀 채 찍으면 '떨어지는 도중'의 좌표가 기록된다. 2026-08-09
+           영점 캘리브에서 실제로 이 때문에 1차 측정을 통째로 버렸다(joint_4 가 18° 어긋난
+           값이 나왔다). 그래서 `settle_s` 동안 관측해 흔들림이 `drift_tol` 을 넘으면
+           경고하고 그 점을 버릴 수 있게 한다.
+
+        반환: (xyz, drift) — 드리프트[m] 를 같이 돌려주므로 호출부가 판단한다.
         """
         end = self.get_clock().now().nanoseconds * 1e-9 + timeout_s
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.buf.can_transform(base_frame, tip_link, rclpy.time.Time()):
-                tr = self.buf.lookup_transform(
-                    base_frame, tip_link, rclpy.time.Time()).transform.translation
-                return np.array([tr.x, tr.y, tr.z])
+                break
             if self.get_clock().now().nanoseconds * 1e-9 > end:
-                return None
+                return None, None
+
+        got = []
+        end = self.get_clock().now().nanoseconds * 1e-9 + settle_s
+        while rclpy.ok() and self.get_clock().now().nanoseconds * 1e-9 < end:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            tr = self.buf.lookup_transform(
+                base_frame, tip_link, rclpy.time.Time()).transform.translation
+            got.append([tr.x, tr.y, tr.z])
+        arr = np.array(got)
+        mean = arr.mean(axis=0)
+        drift = float(np.max(np.linalg.norm(arr - mean, axis=1)))
+        return mean, drift
 
     def _cb(self, msg):
         p = msg.pose.position
@@ -152,6 +171,9 @@ def main():
     ap.add_argument("--base-frame", default="base_link")
     ap.add_argument("--tip-link", default="link_043",
                     help="그리퍼 링크 (arm_fsm 의 tip_link 파라미터와 같아야 함)")
+    ap.add_argument("--drift-tol", type=float, default=0.005,
+                    help="--from-gripper 에서 허용할 자세 흔들림 [m]. "
+                         "토크가 꺼져 있으면 직결축이 처지므로 이걸 넘으면 경고한다")
     args = ap.parse_args()
 
     rclpy.init()
@@ -189,13 +211,21 @@ def main():
                         break
                     print(f"  아직 {len(obs)}점입니다 — 최소 3점 필요.")
                     continue
-                xyz_arr = node.gripper_xyz(args.base_frame, args.tip_link)
+                print("  자세 안정 확인 중(2초) — 계속 붙잡고 계세요...")
+                xyz_arr, drift = node.gripper_xyz(args.base_frame, args.tip_link,
+                                                  drift_tol=args.drift_tol)
                 if xyz_arr is None:
                     print(f"  {args.base_frame}→{args.tip_link} TF 를 못 받았습니다 "
                           "(robot_state_publisher 와 브릿지가 떠 있나요?)")
                     continue
                 print(f"  그리퍼 위치 = ({xyz_arr[0]:+.4f}, {xyz_arr[1]:+.4f}, "
-                      f"{xyz_arr[2]:+.4f}) m")
+                      f"{xyz_arr[2]:+.4f}) m   흔들림 {drift * 1000:.1f}mm")
+                if drift > args.drift_tol:
+                    print(f"  ⚠️ 흔들림이 허용치({args.drift_tol * 1000:.0f}mm)를 넘습니다 — "
+                          "팔이 처지는 중일 수 있습니다(직결축 j4/j5).")
+                    if input("     그래도 이 점을 쓸까요? (y/그 외=버림): ").strip().lower() != "y":
+                        print("     버렸습니다. 다시 잡고 시도하세요.")
+                        continue
             else:
                 if not raw:
                     if len(obs) >= 3:

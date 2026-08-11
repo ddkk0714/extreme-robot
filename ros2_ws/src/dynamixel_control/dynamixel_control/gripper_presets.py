@@ -68,7 +68,44 @@ GRIPPER_PRESETS = {
         #    파지에 성공했는데 FSM 이 실패로 보면 grasp 값을 먼저 낮춰볼 것.
         "grasp_effort_thresh": 250.0,  # 빈손 상한(119) 과 접촉(290) 사이
         "drop_effort_thresh": 200.0,   # 빈손 상한 위 — 물체가 빠지면 즉시 빈손 수준으로 떨어진다
-        "gripper_action_time": 1.0,
+        # FSM 이 개폐 명령을 낸 뒤 effort 를 읽기까지 기다리는 시간 [s].
+        #
+        # ⚠️ 2026-08-09 실기: 1.0 이면 **닫히는 도중에 판정**해서 grasp effort 가 0.0 으로
+        #    읽히고 파지가 무조건 실패한다. 서보 프로파일로 계산한 완전 개폐 시간은
+        #      스트로크 1484 tick (open 1083 → close -401)
+        #      Profile Velocity 80 = 18.3 rev/min = 1251 tick/s
+        #      Profile Acceleration 25 = 1.49 rev/s^2 → 가감속 각 0.20s(128 tick)
+        #      → 2*0.20 + (1484-256)/1251 = **1.39 s**
+        #    물체에 닿으면 감속해 더 걸리므로 여유를 둬 2.5 로 잡는다.
+        #
+        # 이 값은 gripper_open_tick/gripper_close_tick 이나 브릿지의 PROFILE_VELOCITY/
+        # PROFILE_ACCELERATION 을 바꾸면 같이 다시 계산해야 한다.
+        "gripper_action_time": 2.5,
+        # 파지 시 서보가 낼 수 있는 최대 토크 상한 (Goal PWM, 주소 100). 0~885(=PWM Limit).
+        #
+        # ⚠️ 2026-08-09 실기: 이 상한이 없으면(기본 885=100%) **파지 4~5초 뒤 Overload 로
+        #    토크가 끊긴다.** FSM 은 `gripper_close`=0.0 rad(완전 닫힘)을 명령하는데 물체가
+        #    중간에서 막으므로 서보는 목표에 영영 도달하지 못하고 최대 전류로 계속 민다.
+        #    실측: 물체를 문 순간 effort 773(≈최대의 77%) → 3.5초 유지 → Hardware Error
+        #    0x20(Overload) 래치 + 토크 차단. 그 뒤엔 REBOOT 전까지 응답하지 않는다.
+        #    FSM 은 gripper_action_time(2.5s) 시점엔 "파지 성공"으로 보므로, 들어올리다
+        #    떨어뜨리는 형태로 터진다.
+        #
+        # 정공법은 Current-based Position Control(모드 5)이지만 **XL430-W250 은 전류 센싱이
+        # 없어 지원하지 않는다**(모드 5 쓰기가 조용히 무시되고 Goal Current/Current Limit
+        # 레지스터도 없음 — 2026-08-09 실기 확인). XM/XH 로 교체하면 그쪽이 낫다.
+        #
+        # 2026-08-09 실기 스윕(박스를 문 채 유지 시간 측정):
+        #   PWM 885(무제한) → 유지 effort 773 → 3.5초 만에 트립
+        #   PWM 400         → 유지 effort 452 → 17초 만에 트립
+        #   PWM 280         → 유지 effort 317 → **40초+ 트립 없음** (position 변동 0)
+        # XL430 의 Overload 는 부하를 시간에 대해 누적 판정하므로 "조금 낮추면 조금 오래
+        # 버티는" 게 아니라 어느 선 아래로 내려가야 무한정 버틴다. 317 은 파지 임계
+        # (grasp_effort_thresh=250)보다 위여서 FSM 이 파지로 인식하면서 트립은 피하는 구간.
+        #
+        # 조정 방향: 물체가 미끄러지면 올리고, 트립이 재발하면 내린다. 올릴 때는 **유지
+        # 시간을 반드시 30초 이상 확인할 것** — 400 도 17초까지는 멀쩡해 보였다.
+        "gripper_goal_pwm": 280,
     },
 }
 
