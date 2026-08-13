@@ -12,6 +12,9 @@
  */
 'use strict';
 
+/* 파일 스코프 IIFE — 이유는 teleop.js 상단 주석 참고(전역 렉시컬 스코프 공유). */
+(() => {
+
 const C = {
   enabled: false,
   token: null,
@@ -275,7 +278,19 @@ C.escapeHtml = escapeHtml;
 /* ── 초기화 ────────────────────────────────────────────── */
 async function init() {
   let info;
-  try { info = await get('/api/control'); } catch (err) { return; }
+  try {
+    info = await get('/api/control');
+  } catch (err) {
+    // 조용히 돌아가면 '읽기 전용으로 뜬 것'과 구별이 안 된다 — 실제로 이 둘을
+    // 헷갈려 한참을 잃었다(서버가 죽은 뒤 캐시된 페이지를 보고 있었다).
+    const b = el('control-banner');
+    if (b) {
+      b.hidden = false;
+      b.textContent = `■ 제어 계층을 확인하지 못했습니다 (${err.message}) — `
+        + '모니터 노드가 떠 있는지 확인하세요. 화면의 모든 값이 낡았을 수 있습니다.';
+    }
+    return;
+  }
   C.enabled = !!info.enabled;
   if (!C.enabled) { renderSession(); return; }
   C.describe = info;
@@ -312,3 +327,5 @@ async function init() {
 }
 
 init();
+
+})();

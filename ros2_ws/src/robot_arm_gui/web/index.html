@@ -24,6 +24,9 @@
 <!-- HW 에러가 있을 때만 나타나는 전폭 배너. 색만으로 알리지 않는다(아이콘+라벨 동반). -->
 <div id="hw-banner" class="banner banner-critical" hidden></div>
 <div id="js-banner" class="banner banner-serious" hidden></div>
+<!-- 제어 계층 초기화 실패. 이게 없으면 서버가 죽어 있어도 화면은 그냥
+     '읽기 전용'으로 보여서, 모드 설정을 의심하며 시간을 버리게 된다. -->
+<div id="control-banner" class="banner banner-serious" hidden></div>
 
 <section class="strip" aria-label="상태 스트립">
   <div class="strip-card">

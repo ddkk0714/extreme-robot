@@ -22,6 +22,9 @@
  */
 'use strict';
 
+/* 파일 스코프 IIFE — 이유는 teleop.js 상단 주석 참고(전역 렉시컬 스코프 공유). */
+(() => {
+
 const K = {
   desc: null,          // describe().calib
   joints: [],
@@ -318,3 +321,5 @@ function init() {
 }
 
 K.init = init;
+
+})();

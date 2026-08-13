@@ -32,6 +32,16 @@
  */
 'use strict';
 
+/* 파일 스코프 IIFE — 이 네 스크립트(app/teleop/calib/control)는 모듈이 아니라
+ * classic script 라 최상위 `const`/`let` 이 **전역 렉시컬 스코프를 공유**한다.
+ * 같은 이름을 두 파일이 선언하면 나중 파일이 통째로
+ * `SyntaxError: Identifier 'x' has already been declared` 로 죽는데, 전역
+ * 에러 핸들러가 없어서 **화면상으로는 그냥 제어 UI 가 안 나타날 뿐**이라
+ * 원인을 찾기가 매우 어렵다(실제로 `el` 중복으로 calib/control 이 둘 다 죽어
+ * "제어 모드인데 읽기 전용으로 보인다"를 두 세션에 걸쳐 디버깅했다).
+ * 파일 간 참조는 전부 `window.*` 를 거치므로 가둬도 안전하다. */
+(() => {
+
 const T = {
   desc: null,
   joints: [],
@@ -588,3 +598,5 @@ function init() {
 }
 
 T.init = init;
+
+})();
