@@ -3,8 +3,11 @@ from robot_arm_perception.wrist_metrics import (
     apparent_size_to_distance_m,
     border_contacts,
     clamp_correction,
+    classify_grasp,
     distance_to_apparent_size_px,
     fit_distance_curve,
+    GRASP_FILL_MAX,
+    GRASP_REFERENCE,
     mask_fill_ratio,
     normalized_centroid,
     pixel_to_meter_scale,
@@ -201,6 +204,34 @@ def test_usable_drops_unmeasurable_frames():
     clipped = {**base, 'border_contacts': 3}
     assert usable(clipped) is False
     assert usable(clipped, allow_clipped=True) is True
+
+
+# ── 파지 검증 (2026-08-14 실측 기준) ──────────────
+
+
+def test_classify_grasp_uses_the_measured_band():
+    """실측값 그대로 고정한다 — 정상 0.0483~0.0511 / 실패 0.0714~0.0724."""
+    for fill in (0.0483, 0.0495, 0.0511):
+        assert classify_grasp({'detected': True, 'fill': fill}) == 'gripped'
+    for fill in (0.0714, 0.0724):
+        assert classify_grasp({'detected': True, 'fill': fill}) == 'misgripped'
+
+
+def test_classify_grasp_never_calls_a_miss_a_failure():
+    """미검출은 '실패' 가 아니라 '판정 불가' 다.
+
+    멀쩡히 물고 있는데도 프레임이 비는 일이 실기에서 실제로 있었다(어떤 롤에서 53%).
+    미검출을 실패로 읽으면 성공한 파지를 놓고 재시도를 반복한다.
+    """
+    assert classify_grasp({'detected': False, 'fill': 0.0}) == 'unknown'
+    assert classify_grasp({'detected': True}) == 'unknown'
+
+
+def test_grasp_threshold_sits_between_the_measured_states():
+    assert GRASP_REFERENCE['fill'] < GRASP_FILL_MAX < 0.0714
+    # 기준 자세의 산포(σ) 대비 임계가 충분히 떨어져 있어야 한다.
+    margin_sigma = (GRASP_FILL_MAX - GRASP_REFERENCE['fill']) / GRASP_REFERENCE['fill_sigma']
+    assert margin_sigma > 5.0
 
 
 def test_clamp_correction_preserves_sign():

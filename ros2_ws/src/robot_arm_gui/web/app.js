@@ -285,6 +285,14 @@ video.addEventListener('error', () => {
 
 function drawOverlay(snap) {
   if (overlay.hidden || !video.naturalWidth) return;
+  // ⚠️ 이 캔버스가 그리는 박스는 **전방 캠**(/detected_objects) 것이다. 손목 캠 영상 위에
+  // 겹쳐 그리면 다른 카메라의 좌표를 남의 그림에 얹는 셈이라 조용히 거짓말이 된다
+  // (GUI 는 /wrist/detected_objects 를 구독하지 않는다). 손목 소스면 그리지 않는다 —
+  // wrist_debug 는 노드가 이미 마스크·ROI 를 그려서 보내므로 아쉬울 것도 없다.
+  if ($('video-source').value.startsWith('wrist')) {
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    return;
+  }
   const w = video.clientWidth, h = video.clientHeight;
   if (overlay.width !== w || overlay.height !== h) { overlay.width = w; overlay.height = h; }
   const ctx = overlay.getContext('2d');

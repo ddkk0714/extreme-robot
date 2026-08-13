@@ -82,10 +82,15 @@ def generate_launch_description():
         # fill/u/v 등 나머지 지표는 그대로 나온다.
         # ⚠️ f_px 는 **가로 기준**이다(세로는 단축돼 2.7배 다르다).
         #    실측: scripts/measure_wrist_proximity.py
-        DeclareLaunchArgument('f_px', default_value='0.0',
-                              description='가로 기준 초점거리(px). 실측 2026-08-13: 412'),
-        DeclareLaunchArgument('box_size_m', default_value='0.0',
-                              description='대상의 **가로로 보이는 변** 실치수(m). 95mm 큐브면 0.095'),
+        #
+        # 2026-08-14 실측 확정: **360.7** (160/200/260mm 3점, 잔차 최대 1.4mm,
+        # 기준점 오프셋 -0.2mm). 같은 프레임의 독립적인 세 특징으로 교차검증됨 —
+        # 큐브 실루엣 95mm(+0.2%), 빨간 원판 50mm(-0.5%), 원판 구멍 25mm(-4.0%).
+        # ⚠️ 옛 값 412 는 폐기: 케이블이 붙어 부푼 마스크로 잰 단일점이라 14% 컸다.
+        DeclareLaunchArgument('f_px', default_value='360.7',
+                              description='가로 기준 초점거리(px). 2026-08-14 실측 확정'),
+        DeclareLaunchArgument('box_size_m', default_value='0.095',
+                              description='대상의 **가로로 보이는 변** 실치수(m). 95mm 큐브'),
         DeclareLaunchArgument('optical_tf', default_value='true',
                               description='wrist_camera_link → wrist_camera_optical_frame '
                                           'static TF 를 같이 띄운다(모듈 docstring 참고)'),

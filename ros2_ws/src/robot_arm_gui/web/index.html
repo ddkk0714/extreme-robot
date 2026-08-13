@@ -100,8 +100,10 @@
         <span class="muted small">소스</span>
         <select id="video-source" class="btn">
           <option value="off">끔</option>
-          <option value="raw">raw — 원본 (인식 노드 부하 없음)</option>
-          <option value="debug">debug — 마스크·거리 오버레이 (부하 있음)</option>
+          <option value="raw">raw — 전방 캠 원본 (인식 노드 부하 없음)</option>
+          <option value="debug">debug — 전방 캠 오버레이 (부하 있음)</option>
+          <option value="wrist">wrist — 손목 캠 원본</option>
+          <option value="wrist_debug">wrist_debug — 손목 캠 마스크·ROI 오버레이</option>
         </select>
       </label>
     </div>
@@ -113,6 +115,8 @@
         <strong>raw</strong> 는 인식 노드가 어차피 항상 발행하는 원본이라 켜도 그쪽 부하가 늘지 않습니다
         (검출 박스는 이 화면이 대신 그립니다).
         <strong>debug</strong> 는 켜는 동안에만 인식 노드가 마스크·거리 오버레이를 그립니다.
+        <strong>wrist</strong>·<strong>wrist_debug</strong> 는 손목 캠(`wrist_camera` 노드)입니다 —
+        노드가 안 떠 있으면 프레임이 안 올 뿐, 다른 소스에는 영향이 없습니다.
       </div>
     </div>
     <div id="detect-meta" class="muted small">—</div>
