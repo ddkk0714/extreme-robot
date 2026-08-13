@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -13,6 +14,7 @@ from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncR
 
 from rcl_interfaces.msg import SetParametersResult
 
+from dynamixel_control import bus_lock
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
 from dynamixel_control import calib_math
 from dynamixel_control import joint_limits
@@ -285,6 +287,28 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("gripper_extended", bool(preset.get("extended", False)))
         # 0 이면 쓰지 않는다(서보 기본 885=100% 유지). preset 주석에 값 근거 있음.
         self.declare_parameter("gripper_goal_pwm", int(preset.get("gripper_goal_pwm", 0)))
+        # 캘리브 범위 밖으로 미끄러진 그리퍼 자동 복구(_recover_gripper_range 참고).
+        # 종료 시 토크가 풀리면 그리퍼가 닫힘 끝단을 지나쳐 미끄러지는데, 그 상태에서는
+        # gripper_goal_pwm 의 힘으로 못 빠져나온다 — 재기동마다 재발하므로 기본 활성.
+        # 모션 프로파일. 단위는 데이터시트 기준 Profile Velocity = 0.229 rev/min,
+        # Profile Acceleration = 214.577 rev/min^2.
+        # ⚠️ 팔 속도는 **여기서만** 정해진다(_write_motion_profile 주석 참고).
+        #    2026-08-12: 40(절반)으로 낮췄다가 **80 으로 되돌렸다.** 느리게 하면
+        #    arm_fsm 의 모션 완료 판정과 어긋난다 — `_publish_joint_trajectory` 가
+        #    `arm_move_speed`(0.5 rad/s)로 duration 을 추정해 그만큼만 기다리는데,
+        #    서보가 그보다 느려지면 **도착 전에 다음 상태로 넘어간다**(하강 도중
+        #    파지 등). 속도를 정말 낮추려면 arm_fsm 의 `arm_move_speed` 를 같은
+        #    비율로 낮춰 둘을 함께 맞춰야 한다.
+        self.declare_parameter("arm_profile_velocity", 80)
+        self.declare_parameter("gripper_profile_velocity", 80)
+        self.declare_parameter("profile_acceleration", 25)
+        self.declare_parameter("gripper_auto_recover", True)
+        # ⚠️ 885(최대)로 두지 말 것. 2026-08-12 에 885 로 열림 끝단까지 밀어붙였다가
+        # **랙이 피니언에서 미끄러진** 것으로 보인다(직후 재캘리브에서 오프셋이 통째로
+        # ~1880 tick 이동). 실측상 500 이면 범위 밖에서 끌어내는 데 충분하다
+        # (PWM 500 으로 -938 → -434 를 1초). 끝단을 때리지 않는 것이 더 중요하다.
+        self.declare_parameter("gripper_recover_pwm", 500)
+        self.declare_parameter("gripper_recover_timeout", 6.0)
         self.declare_parameter("read_only", False)
         self.declare_parameter("gripper_only_mode", False)
 
@@ -296,6 +320,18 @@ class MoveItDynamixelBridge(Node):
         self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
         self.gripper_extended = bool(self.get_parameter("gripper_extended").value)
         self.gripper_goal_pwm = int(self.get_parameter("gripper_goal_pwm").value)
+        self.arm_profile_velocity = int(
+            self.get_parameter("arm_profile_velocity").value)
+        self.gripper_profile_velocity = int(
+            self.get_parameter("gripper_profile_velocity").value)
+        self.profile_acceleration = int(
+            self.get_parameter("profile_acceleration").value)
+        self.gripper_auto_recover = bool(
+            self.get_parameter("gripper_auto_recover").value)
+        self.gripper_recover_pwm = int(
+            self.get_parameter("gripper_recover_pwm").value)
+        self.gripper_recover_timeout = float(
+            self.get_parameter("gripper_recover_timeout").value)
         self.read_only = bool(self.get_parameter("read_only").value)
         self.gripper_only_mode = bool(
             self.get_parameter("gripper_only_mode").value)
@@ -357,6 +393,12 @@ class MoveItDynamixelBridge(Node):
                 f"(±{joint_limits.PROVISIONAL_HALF_RANGE} rad). 이 축이 거의 안 움직이면 "
                 "리밋 탓이다 — scripts/measure_joint_limits.py 로 실측할 것."
             )
+
+        # ⚠️ 포트를 열기 **전에** 배타 잠금. 이 브릿지와 position_node 는 같은
+        # /dev/ttyUSB0 을 잡으므로 "동시에 띄우지 말 것"이 계약인데, 지금까지는
+        # 규율로만 지켜졌고 어기면 축 하나만 조용히 빠지는 형태로 망가졌다
+        # (bus_lock 모듈 docstring 참고). fd 는 살려둬야 잠금이 유지된다.
+        self._bus_lock_fd = bus_lock.acquire(DEVICENAME, self.get_logger())
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -432,10 +474,12 @@ class MoveItDynamixelBridge(Node):
 
             # 그리퍼 서보: 토크 ON 성공한 ID만 SyncRead 등록
             for gid in self.gripper_ids:
-                if self._enable_torque(gid, f"gripper(id {gid})", self.gripper_extended):
+                if self._enable_torque(gid, f"gripper(id {gid})", self.gripper_extended,
+                                       self.gripper_profile_velocity):
                     # Operating Mode 변경이 일부 RAM 값을 초기화하므로 모드·토크가 확정된
                     # **뒤에** 쓴다.
                     self._write_gripper_goal_pwm(gid)
+                    self._check_gripper_in_calibrated_range(gid)
                     self.group_sync_read.addParam(gid)
                     self.active_ids.add(gid)
                     self.torque_enabled_ids.add(gid)
@@ -449,6 +493,17 @@ class MoveItDynamixelBridge(Node):
 
         # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
         # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
+        # 토크 on/off 요청 — `position_node` 와 **같은 토픽·같은 포맷**을 쓴다
+        # (`[enable, id...]`). 벤치 텔레옵 쪽에만 있던 인터페이스라 브릿지 경로에서는
+        # 팔을 손으로 만지려면 스택을 통째로 내리는 수밖에 없었다. 어휘를 새로 만들지
+        # 않고 기존 것을 그대로 받아, `teleop_core` 의 stop/freedrive 나 관제 GUI 버튼이
+        # 어느 런타임에서든 같은 뜻을 갖게 한다.
+        # 확장 한 가지: id 목록을 생략하면(`[enable]`) **등록된 전 축**에 적용한다 —
+        # 요청자가 서보 ID 를 몰라도 되게 하기 위함이다(mission_console 이 이걸 쓴다).
+        self.torque_request_sub = self.create_subscription(
+            Int32MultiArray, "/dynamixel/torque_request",
+            self.torque_request_callback, 10)
+
         self.teleop_goal_sub = self.create_subscription(
             Int32MultiArray,
             "/dynamixel/goal_position",
@@ -499,15 +554,27 @@ class MoveItDynamixelBridge(Node):
         )
 
     # ------------------------------------------------------------------ helpers
-    def _write_motion_profile(self, dxl_id, label):
+    def _write_motion_profile(self, dxl_id, label, velocity=None):
         """Profile Acceleration/Velocity 설정 — 토크 인가 **전에** 호출한다.
 
         기본값 0(=최고속 즉시 이동)이면 그리퍼가 움직일 때마다 순간 과전류로 토크가
         풀린다(HW-8 실기 검증, 재현율 100%). 팔 축도 같은 이유로 완만하게 둔다.
+
+        ⚠️ **여기가 팔의 실제 속도를 정하는 유일한 곳이다.** `trajectory_callback` 은
+        `time_from_start` 를 쓰지 않고 goal tick 만 SyncWrite 하므로, 궤적의 duration
+        (arm_fsm 의 `arm_move_speed`)은 FSM 내부 타임아웃 추정에만 쓰이고 서보 속도에는
+        영향이 없다. 속도를 바꾸려면 `arm_profile_velocity` 를 조정할 것.
+
+        ⚠️ 그리퍼는 팔과 **따로** 둔다(`gripper_profile_velocity`). 그리퍼 속도를 낮추면
+        완전 개폐 시간이 늘어나는데, `gripper_presets.gripper_action_time`(2.5s)은 그
+        시간을 넘겨야 파지 effort 를 제대로 읽는다 — 같이 낮추면 "닫히는 도중에 판정"
+        해서 grasp effort 가 0 으로 읽히는 알려진 실패로 돌아간다.
         """
+        if velocity is None:
+            velocity = self.arm_profile_velocity
         for addr, value, field in (
-            (ADDR_PROFILE_ACCELERATION, PROFILE_ACCELERATION, "Profile Acceleration"),
-            (ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY, "Profile Velocity"),
+            (ADDR_PROFILE_ACCELERATION, self.profile_acceleration, "Profile Acceleration"),
+            (ADDR_PROFILE_VELOCITY, velocity, "Profile Velocity"),
         ):
             result, error = self.packet_handler.write4ByteTxRx(
                 self.port_handler, dxl_id, addr, value
@@ -537,6 +604,172 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().info(
                 f"Goal PWM 설정: id={dxl_id} -> {self.gripper_goal_pwm} "
                 f"(최대 885, 파지 토크 상한)")
+
+    def _warn_if_torque_off(self):
+        """토크가 꺼진 채 모션 명령이 들어오면 크게 알린다.
+
+        ⚠️ 2026-08-12 실기: 콘솔이 종료하며 토크를 풀어둔 상태에서 픽을 돌렸더니
+        FSM 은 PERCEIVE→…→GRASP 전 구간을 정상 수행하고 브릿지도 goal 을 다 썼는데
+        **서보가 전부 무시**해서 팔이 한 tick 도 안 움직였다. 어디에도 에러가 없어
+        "프로그램은 도는데 안 움직인다" 로만 보인다 — 이 저장소가 반복해서 밟는
+        조용한 실패다. 여기서 한 번은 말해준다.
+
+        자동으로 토크를 켜지는 **않는다**. 사람이 팔을 만지려고 일부러 푼 것일 수
+        있고, 그때 명령 하나에 팔이 다시 잠기면 손을 다친다.
+        """
+        off = sorted(self.active_ids - self.torque_enabled_ids)
+        if not off:
+            return
+        self.get_logger().error(
+            f"모션 명령을 받았지만 ID {off} 의 토크가 꺼져 있습니다 — 서보가 무시하므로 "
+            "팔은 움직이지 않습니다(에러 없이 조용히). 켜려면 mission_console 의 "
+            "'torque on' 또는 /dynamixel/torque_request 에 [1] 발행.")
+
+    def torque_request_callback(self, msg):
+        """`[enable, id...]` → 해당 ID 토크 on/off. id 생략 시 등록된 전 축.
+
+        ⚠️ 끄면 팔이 중력으로 처진다. 그래서 "요청받았으니 끈다" 이상은 하지 않는다 —
+        여기서 자세를 미리 접거나 하는 배려를 넣으면, 정작 급히 끊고 싶을 때 그 동작이
+        먼저 나가버린다(안전 게이트에 부가 동작을 넣지 않는다는 이 저장소의 원칙).
+        """
+        data = list(msg.data)
+        if not data:
+            self.get_logger().error("torque_request: [enable, id...] 형식이어야 합니다")
+            return
+        if self.read_only:
+            self.get_logger().warn("torque_request 무시 — read_only 모드는 레지스터를 쓰지 않습니다")
+            return
+
+        enable = 1 if data[0] else 0
+        ids = data[1:] or sorted(self.active_ids)
+        applied, failed = [], []
+        for dxl_id in ids:
+            if dxl_id not in self.active_ids:
+                self.get_logger().warn(f"torque_request 무시 — 등록 안 된 ID {dxl_id}")
+                continue
+            if enable:
+                # ⚠️ 토크를 켜기 **전에** Goal Position 을 현재 위치로 덮어쓴다.
+                # 토크가 꺼진 동안 팔은 중력으로 처지는데 Goal 레지스터에는 마지막
+                # 명령값이 그대로 남아 있다 — 그냥 켜면 서보가 그 옛 목표로 **튄다**
+                # (teleop_core 의 resume 이 _sync_goal_to_measured 를 하는 것과 같은 이유).
+                pos, res, err = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+                if res == 0 and err == 0:
+                    self.packet_handler.write4ByteTxRx(
+                        self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
+                else:
+                    self.get_logger().error(
+                        f"ID {dxl_id} 현재 위치를 못 읽어 goal 동기화를 건너뜁니다 — "
+                        "토크 인가 시 팔이 옛 목표로 튈 수 있습니다")
+            result, error = self.packet_handler.write1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
+                TORQUE_ENABLE if enable else TORQUE_DISABLE)
+            if result != 0 or error != 0:
+                failed.append(dxl_id)
+                continue
+            applied.append(dxl_id)
+            if enable:
+                self.torque_enabled_ids.add(dxl_id)
+            else:
+                self.torque_enabled_ids.discard(dxl_id)
+
+        word = "인가" if enable else "해제"
+        if applied:
+            self.get_logger().warn(f"토크 {word}: ID {applied}")
+        if failed:
+            self.get_logger().error(f"토크 {word} 실패: ID {failed}")
+
+    def _check_gripper_in_calibrated_range(self, dxl_id):
+        """그리퍼가 캘리브 tick 범위 **밖**에 있으면 크게 경고한다.
+
+        ⚠️ 2026-08-12 실기: 토크를 끄고 팔을 손으로 다루는 동안 그리퍼가 닫힘 끝단
+        (-401)보다 786 tick 아래(-1187)까지 밀려 들어갔다. 그 영역에서는
+        `gripper_goal_pwm`(280, 파지 토크 상한)의 힘으로 **되돌아 나올 수 없다** —
+        실측으로 tick -890 부근에서 전류 316 을 뽑으며 스톨했고, 양방향 모두 막혔다.
+        정상 범위 안에서는 같은 PWM 280 으로 전 구간을 2.5초에 여닫는다(실측).
+
+        증상이 지독하다: 그리퍼가 "안 닫히고", `/joint_states` effort 는 스톨 전류
+        316 을 계속 보고해 `grasp_effort_thresh`(250)를 넘으므로 FSM 은 **빈손인데
+        파지 성공으로 판정**한다. 어느 로그에도 에러가 안 뜬다.
+
+        복구는 Goal PWM 을 일시적으로 올려(500 이상) 범위 안으로 끌어낸 뒤 되돌리는
+        것이다. 자동으로 하지 않는 이유는 그 상한이 Overload 트립을 막는 안전장치라,
+        올릴지는 사람이 상황을 보고 정해야 하기 때문이다.
+        """
+        pos, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+        if result != 0 or error != 0:
+            return
+        tick = pos - (1 << 32) if pos >= (1 << 31) else pos
+        lo = min(self.gripper_close_tick, self.gripper_open_tick)
+        hi = max(self.gripper_close_tick, self.gripper_open_tick)
+        margin = max(1, int(0.05 * (hi - lo)))
+        if lo - margin <= tick <= hi + margin:
+            return
+        self.get_logger().error(
+            f"그리퍼(id={dxl_id})가 캘리브 범위 밖입니다: tick={tick} "
+            f"(정상 {lo}~{hi}). 이 상태에서는 Goal PWM {self.gripper_goal_pwm} 의 힘으로 "
+            "빠져나오지 못해 '안 닫히는' 것처럼 보이고, 스톨 전류가 파지 임계를 넘어 "
+            "**빈손인데 파지 성공으로 오판**합니다.")
+        if self.gripper_auto_recover:
+            self._recover_gripper_range(dxl_id, tick)
+        else:
+            self.get_logger().error(
+                "gripper_auto_recover=false 이므로 자동 복구하지 않습니다 — Goal PWM 을 "
+                "일시적으로 500 이상으로 올려 범위 안으로 되돌린 뒤 다시 시작하세요.")
+
+    def _recover_gripper_range(self, dxl_id, tick):
+        """캘리브 범위 밖으로 미끄러진 그리퍼를 열림 끝단으로 끌어낸다.
+
+        ⚠️ 왜 매번 필요한가: `destroy_node()` 가 종료 시 전 ID 토크를 해제하는데,
+        그리퍼는 힘을 잃으면 닫힘 방향으로 미끄러져 **끝단을 지나쳐 버린다**(2026-08-12
+        실측: +1070 → -1259). 즉 스택을 재기동할 때마다 재발한다. 사람이 매번 손으로
+        PWM 을 올려 빼내는 건 현실적이지 않아 자동화했다.
+
+        복구는 파지 토크 상한(`gripper_goal_pwm`)을 **일시적으로** 올려서 한다 — 그
+        상한은 물체를 문 채 무한정 미는 걸 막는 장치지, 빈 그리퍼를 옮기는 데 필요한
+        힘까지 제한하려던 게 아니다. 실측으로 PWM 885 에서 1.5초 만에 끝나고 움직이는
+        중 전류는 40~90(무부하 수준)까지 떨어진다. 끝나면 반드시 원래 값으로 되돌린다.
+        """
+        # 끝단(open_tick) 자체를 겨냥하지 않는다 — 거기는 기구적 스토퍼라 밀어붙이면
+        # 랙이 미끄러진다(2026-08-12, 그때 오프셋이 통째로 ~1880 tick 이동했다).
+        # 범위 안쪽 15% 지점이면 "밖에서 안으로" 라는 목적은 그대로 달성하면서
+        # 스토퍼를 때리지 않는다.
+        span = self.gripper_open_tick - self.gripper_close_tick
+        target = int(self.gripper_open_tick - 0.15 * span)
+        self.get_logger().warn(
+            f"자동 복구 시도: Goal PWM {self.gripper_goal_pwm} → "
+            f"{self.gripper_recover_pwm} 로 일시 상향, tick {tick} → {target} 로 이동")
+        try:
+            self.packet_handler.write2ByteTxRx(
+                self.port_handler, dxl_id, ADDR_GOAL_PWM, self.gripper_recover_pwm)
+            self.packet_handler.write4ByteTxRx(
+                self.port_handler, dxl_id, ADDR_GOAL_POSITION, target & 0xFFFFFFFF)
+            deadline = time.time() + self.gripper_recover_timeout
+            reached = False
+            while time.time() < deadline:
+                time.sleep(0.2)
+                pos, result, error = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+                if result != 0 or error != 0:
+                    continue
+                now = pos - (1 << 32) if pos >= (1 << 31) else pos
+                if abs(now - target) <= 40:
+                    reached = True
+                    break
+        finally:
+            # 성공하든 실패하든 상한을 되돌린다 — 높은 PWM 을 켠 채 파지에 들어가면
+            # Overload 트립 위험이 그대로 돌아온다.
+            self.packet_handler.write2ByteTxRx(
+                self.port_handler, dxl_id, ADDR_GOAL_PWM, self.gripper_goal_pwm)
+        if reached:
+            self.get_logger().info(
+                f"자동 복구 성공 — 그리퍼가 범위 안({target})으로 복귀. "
+                f"Goal PWM {self.gripper_goal_pwm} 복원됨.")
+        else:
+            self.get_logger().error(
+                "자동 복구 실패 — 그리퍼가 여전히 범위 밖입니다. 기구적 걸림일 수 "
+                "있으니 손으로 확인하세요(파지 판정을 신뢰하지 말 것).")
 
     def _ensure_operating_mode(self, dxl_id, label, extended):
         """Operating Mode 를 이 축이 요구하는 값으로 맞춘다 (토크 인가 **전에** 호출).
@@ -602,12 +835,26 @@ class MoveItDynamixelBridge(Node):
                 f"{label} (id {dxl_id}) 응답에 에러 플래그: {error}")
         return True
 
-    def _enable_torque(self, dxl_id, label, extended=False):
+    def _enable_torque(self, dxl_id, label, extended=False, velocity=None):
         # 모드가 틀리면 Goal Position 이 무시되므로 토크보다 먼저 맞춘다(EEPROM = 토크 OFF 필요).
         if not self._ensure_operating_mode(dxl_id, label, extended):
             return False
         # 토크 인가 전에 모션 프로파일부터 넣는다(급가속 트립 방지).
-        self._write_motion_profile(dxl_id, label)
+        self._write_motion_profile(dxl_id, label, velocity)
+        # ⚠️ 그리고 Goal Position 을 **현재 위치로 덮어쓴다.** 서보의 Goal 레지스터에는
+        # 지난 세션의 마지막 명령값이 그대로 남아 있는데, 그 사이 토크가 꺼져 팔이
+        # 중력으로 처졌다면 토크를 켜는 순간 옛 목표로 **튄다**. mission_console 이
+        # 종료할 때마다 토크를 풀어 팔을 늘어뜨리므로 이 경로는 기동마다 걸린다.
+        # (torque_request_callback 의 enable 경로도 같은 이유로 같은 처리를 한다.)
+        pos, res, err = self.packet_handler.read4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+        if res == 0 and err == 0:
+            self.packet_handler.write4ByteTxRx(
+                self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
+        else:
+            self.get_logger().error(
+                f"{label}(id={dxl_id}) 현재 위치를 못 읽어 goal 동기화를 건너뜁니다 — "
+                "토크 인가 시 팔이 옛 목표로 튈 수 있습니다")
         result, error = self.packet_handler.write1ByteTxRx(
             self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE
         )
@@ -840,6 +1087,7 @@ class MoveItDynamixelBridge(Node):
             return
         if not msg.points:
             return
+        self._warn_if_torque_off()
 
         point = msg.points[-1]
 
@@ -1065,7 +1313,15 @@ class MoveItDynamixelBridge(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MoveItDynamixelBridge()
+
+    # position_node 와 같은 이유로 traceback 대신 한 줄로 죽는다(그쪽 main 참고).
+    try:
+        node = MoveItDynamixelBridge()
+    except bus_lock.BusInUseError as exc:
+        print(f"[moveit_dynamixel_bridge] 기동 거부: {exc}")
+        if rclpy.ok():
+            rclpy.shutdown()
+        raise SystemExit(1)
 
     try:
         rclpy.spin(node)
