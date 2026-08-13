@@ -35,6 +35,10 @@ import threading
 SOURCES = {
     'debug': '/perception/debug_image',   # bbox·마스크·거리 오버레이 (인식 노드에 비용 발생)
     'raw': '/perception/raw_image',       # 원본 (오버레이 비용 없음)
+    # 손목 캠(`wrist_camera` 노드). 안 띄워져 있으면 그냥 프레임이 안 올 뿐이라
+    # 나머지 소스에 영향이 없다 — 구독은 refcount 로 동적 생성/파괴된다.
+    'wrist': '/wrist/raw_image',          # 원본 (손목 노드도 게이트 없이 발행)
+    'wrist_debug': '/wrist/debug_image',  # 오버레이 (구독자가 있을 때만 그린다)
 }
 
 

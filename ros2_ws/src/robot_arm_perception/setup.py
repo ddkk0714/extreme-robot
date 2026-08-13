@@ -31,6 +31,7 @@ setup(
             'detection_markers = robot_arm_perception.detection_markers:main',
             'camera_tf_tuner = robot_arm_perception.camera_tf_tuner:main',
             'calib_status_view = robot_arm_perception.calib_status_view:main',
+            'wrist_camera = robot_arm_perception.wrist_camera_node:main',
             'ground_truth_markers = robot_arm_perception.ground_truth_markers:main',
             'depth_method_compare = robot_arm_perception.depth_method_compare:main',
             'mask_pca_explain = robot_arm_perception.mask_pca_explain:main',
