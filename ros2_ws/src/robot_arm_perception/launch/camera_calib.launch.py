@@ -6,6 +6,7 @@ RViz에서 **카메라 프레임을 드래그해가며** 검출된 박스가 실
     robot_state_publisher   URDF 로봇 모델 (맞았는지 판단할 시각 기준)
     joint_state_publisher_gui   서보 없이 팔 자세를 바꿔볼 수 있게
     camera_tf_tuner         base_link→camera_link 를 드래그로 조정 + 값 출력
+    calib_status_view       그 안내를 한국어로 크게 띄우는 별도 창 (status_view:=false 로 끔)
     detection_markers       /detected_objects → RViz 큐브
     ground_truth_markers    줄자로 잰 박스 위치 → 흰 와이어프레임
     perception_node         RealSense + YOLO (+ depth 포인트클라우드)
@@ -90,6 +91,10 @@ def generate_launch_description():
         DeclareLaunchArgument('jsp_gui', default_value='true'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument(
+            'status_view', default_value='true',
+            description='RViz 3D 텍스트와 같은 안내를 한국어로 크게 띄우는 별도 창'),
+        DeclareLaunchArgument('status_font_size', default_value='14'),
+        DeclareLaunchArgument(
             'rqt', default_value='false',
             description='cam_x/y/z 를 숫자로 입력하는 GUI(rqt_reconfigure)도 같이 띄운다'),
     ]
@@ -144,6 +149,15 @@ def generate_launch_description():
                 'conf_threshold': LaunchConfiguration('conf_threshold'),
                 'publish_cloud': LaunchConfiguration('cloud'),
             }],
+        ),
+        # 3D 뷰의 텍스트 마커는 작고·가려지고·한글을 못 그린다(Ogre 폰트). 같은 안내를
+        # 한국어로 크게 띄우는 창을 옆에 둔다 — 읽기 전용이라 캘리브 동작에 관여하지 않는다.
+        Node(
+            package='robot_arm_perception',
+            executable='calib_status_view',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('status_view')),
+            parameters=[{'font_size': LaunchConfiguration('status_font_size')}],
         ),
         Node(
             package='rviz2',

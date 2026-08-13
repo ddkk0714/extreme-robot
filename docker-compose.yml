@@ -20,6 +20,13 @@ services:
       # ⚠️ 호스트에 ~/.Xauthority 파일이 아예 없으면(X를 한 번도 안 띄운 계정) Docker가 마운트
       # 시점에 빈 디렉터리로 만들어버려 깨진다 — 처음 쓰는 팀원은 `touch ~/.Xauthority` 먼저.
       - ${HOME}/.Xauthority:/root/.Xauthority:ro
+      # 호스트 폰트를 그대로 빌려온다. 컨테이너 이미지엔 한글 글리프가 **하나도** 없어서
+      # (`fc-list :lang=ko` 가 0건) Tk 창(calib_status_view 등)이 한글을 전부 두부(□)로
+      # 그린다. 이미지에 폰트를 설치하면 팀 전원이 arm64 재빌드라, CUDA/cuDNN 을 마운트로
+      # 해결한 것과 같은 방식을 쓴다. 기존 폰트를 덮지 않게 하위 경로에 얹는다.
+      # (RViz/Ogre 는 자기 번들 폰트를 쓰므로 여기 영향을 받지 않는다 — 그래서 3D 뷰에
+      #  뜨는 문자열은 여전히 영어여야 한다.)
+      - /usr/share/fonts:/usr/share/fonts/host:ro
       - ./ros2_ws:/root/ros2_ws
       - /dev:/dev
     network_mode: host
