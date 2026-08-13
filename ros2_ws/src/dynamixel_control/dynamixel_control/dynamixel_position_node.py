@@ -13,6 +13,8 @@ from dynamixel_sdk import (
     PortHandler, PacketHandler, GroupSyncRead, GroupSyncWrite,
 )
 
+from dynamixel_control import bus_lock
+
 
 #: teleop_core_node.POSES_LIST_QOS 와 동일 — tick_limits 는 transient_local 로 오므로
 #: (teleop_core 재기동 없이 이 노드만 늦게/다시 뜨는 경우에도) 놓치지 않고 받는다.
@@ -318,6 +320,12 @@ class DynamixelPositionNode(Node):
                 f"joint_names({len(self.joint_names)}) 길이가 다릅니다"
             )
 
+        # ⚠️ 포트를 열기 **전에** 배타 잠금을 잡는다 — 이 노드와
+        # moveit_dynamixel_bridge 가 같은 버스를 동시에 쓰면 "축 하나만 조용히
+        # 빠지는" 형태로 망가진다(bus_lock 모듈 docstring 에 실기 사고 기록).
+        # fd 는 인스턴스가 들고 있어야 한다 — GC 되면 잠금도 풀린다.
+        self._bus_lock_fd = bus_lock.acquire(port, self.get_logger())
+
         latency = int(self.get_parameter("ftdi_latency_timer").value)
         if latency > 0:
             _set_ftdi_latency(port, latency, self.get_logger())
@@ -506,6 +514,21 @@ class DynamixelPositionNode(Node):
             f"current_spike_enabled={self.current_spike_enabled})")
 
     # ------------------------------------------------------------------ 기동
+    def _comm_detail(self, result, error):
+        """SDK 의 두 실패 축을 **구분해서** 문자열로 만든다.
+
+        `result`(통신 계층: 응답 없음·패킷 깨짐)와 `error`(서보가 보낸 패킷 에러:
+        Access Error 등)는 원인이 전혀 다르다 — 전자는 배선/버스 경합, 후자는
+        "토크가 켜진 채 EEPROM 을 쓰려 했다" 같은 절차 문제다. 뭉뚱그리면 어느 쪽을
+        고쳐야 하는지 알 수 없다.
+        """
+        parts = []
+        if result != 0:
+            parts.append(f"comm={self.packet_handler.getTxRxResult(result)}")
+        if error != 0:
+            parts.append(f"servo={self.packet_handler.getRxPacketError(error)}")
+        return ", ".join(parts) or "원인 불명"
+
     def _init_motor(self, dxl_id):
         """서보 하나를 위치제어 + 프로파일 가감속 상태로 만들고 토크를 켠다.
 
@@ -521,16 +544,35 @@ class DynamixelPositionNode(Node):
             return False
 
         # 모드 변경/EEPROM 쓰기를 위해 일단 토크를 내린다.
-        self.packet_handler.write1ByteTxRx(
+        # ⚠️ 결과를 반드시 확인한다 — 이 쓰기가 조용히 실패하면 토크가 켜진 채로
+        # 남아서 다음 EEPROM 쓰기가 Access Error 로 거절되는데, 로그만 봐서는
+        # "모드 변경 실패"로 보여 원인이 한 단계 가려진다.
+        result, error = self.packet_handler.write1ByteTxRx(
             self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"ID {dxl_id} 토크 OFF 실패 — 건너뜁니다 "
+                f"({self._comm_detail(result, error)})")
+            return False
 
         if self.force_position_mode:
             target_mode = (
                 OP_MODE_EXTENDED_POSITION if dxl_id in self.extended_position_ids
                 else OP_MODE_POSITION
             )
-            mode, _, _ = self.packet_handler.read1ByteTxRx(
+            # ⚠️ 읽기의 result/error 를 반드시 본다. dynamixel_sdk 는 통신이 깨져도
+            # 데이터 자리에 **0 을 돌려준다** — 그걸 실제 모드로 믿고 로그에 찍으면
+            # "서보가 Current Control Mode(0) 에 있다"는 존재하지 않는 원인을
+            # 가리키게 된다(2026-08-12 실기에서 실제로 오진을 유발했다).
+            mode, result, error = self.packet_handler.read1ByteTxRx(
                 self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+            if result != 0 or error != 0:
+                self.get_logger().error(
+                    f"ID {dxl_id} operating mode 읽기 실패 — 건너뜁니다 "
+                    f"({self._comm_detail(result, error)}). "
+                    f"읽힌 값 {mode} 는 실제 모드가 아니라 통신 실패의 기본값입니다 "
+                    "— 버스를 두 프로세스가 나눠 쓰고 있지 않은지 먼저 확인하세요")
+                return False
             if mode != target_mode:
                 result, error = self.packet_handler.write1ByteTxRx(
                     self.port_handler, dxl_id,
@@ -538,7 +580,8 @@ class DynamixelPositionNode(Node):
                 if result != 0 or error != 0:
                     self.get_logger().error(
                         f"ID {dxl_id} operating mode 변경 실패 "
-                        f"({mode} → {target_mode}) — 건너뜁니다")
+                        f"({mode} → {target_mode}) — 건너뜁니다 "
+                        f"({self._comm_detail(result, error)})")
                     return False
                 mode_label = "다회전" if target_mode == OP_MODE_EXTENDED_POSITION else "위치제어"
                 self.get_logger().info(
@@ -1047,7 +1090,16 @@ class DynamixelPositionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
 
-    node = DynamixelPositionNode()
+    # 버스 경합은 traceback 이 아니라 **읽히는 한 줄**로 죽어야 한다 — 이 실패는
+    # 사용자가 곧바로 조치할 수 있는 종류이고(다른 노드를 내린다), 파이썬 스택은
+    # 그 조치를 오히려 가린다.
+    try:
+        node = DynamixelPositionNode()
+    except bus_lock.BusInUseError as exc:
+        print(f"[dynamixel_position_node] 기동 거부: {exc}")
+        if rclpy.ok():
+            rclpy.shutdown()
+        raise SystemExit(1)
 
     try:
         rclpy.spin(node)
