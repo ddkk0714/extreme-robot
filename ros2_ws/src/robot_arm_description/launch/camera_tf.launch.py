@@ -65,6 +65,20 @@ def generate_launch_description():
         #    ±5° 안쪽을 목표로 할 것. 그래도 안 줄면 캘리브가 아니라 **박스가 실제로 팔
         #    정면에서 벗어나 있는** 것이므로 박스를 옮겨야 한다(둘을 혼동하지 말 것).
         #
+        # 🔧 **2026-08-12 2차 — 그리퍼 대응점 3개로 평행이동만 보정.**
+        #    `campose --from-gripper` 로 (optical 관측, 그리퍼 FK 실측) 대응점을 모았는데
+        #    쓸 만한 게 3점(A/B/D)뿐이라 회전은 풀지 못했다(비공선 3점 이상 필요, 게다가
+        #    수집점이 거의 한 직선 위였다). 대신 **현재 TF 의 잔차가 전 점에서 13~16cm**
+        #    로 크고 방향이 일관돼, 그 평균만큼 camera_link 원점을 옮겼다:
+        #      Δ(예측−실측) 평균 = (+0.0485, -0.0224, -0.1347) m  → 보정은 부호 반대
+        #    ⚠️ 이 보정은 순수 카메라 오차가 아니라 **tip_link(link_043)↔실제 파지점
+        #       오프셋까지 함께 흡수**한다 — 실측 '진짜 좌표'가 그리퍼 FK 이기 때문이고,
+        #       FSM 이 겨냥하는 것도 같은 tip_link 라 그게 오히려 맞다.
+        #    ⚠️ **z(-13cm)와 x(+5cm)는 3점이 일관**했지만 **y 는 -5.7~+1.9cm 로 흩어졌다**
+        #       (편차 7.7cm). 손목 각도에 따라 tip↔접촉점 오프셋이 평면 안에서 회전하는
+        #       탓으로 보인다 — 평행이동 한 벌로는 y 를 못 잡는다. y 가 계속 빗나가면
+        #       이 값이 아니라 **회전까지 푸는 다점 캘리브**가 답이다.
+        # 이전 값(2026-08-12 1차): x=0.4968 y=-0.5041 z=0.1287
         # 이전 값(2026-08-09 2차): x=0.2022 y=-0.5957 z=0.1272
         #    roll=-0.0619 pitch=0.0404 yaw=1.6265
         # 이전 값(2026-08-09 1차): x=0.2022 y=-0.6269 z=0.1402
@@ -72,9 +86,9 @@ def generate_launch_description():
         #    roll=0.0267 pitch=0.0210 yaw=0.4718
         # 이전 값(차체 장착 CAD 추정, 실기 검증 전): x=0.123 y=0.0 z=0.082
         #    roll=0.0 pitch=-0.26 yaw=0.0 — 정식 장착 시 출발점으로 참고.
-        DeclareLaunchArgument('cam_x',     default_value='0.4968'),
-        DeclareLaunchArgument('cam_y',     default_value='-0.5041'),
-        DeclareLaunchArgument('cam_z',     default_value='0.1287'),
+        DeclareLaunchArgument('cam_x',     default_value='0.4483'),
+        DeclareLaunchArgument('cam_y',     default_value='-0.4817'),
+        DeclareLaunchArgument('cam_z',     default_value='0.2634'),
         DeclareLaunchArgument('cam_roll',  default_value='-0.0619'),
         DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
         DeclareLaunchArgument('cam_yaw',   default_value='2.8198'),
