@@ -383,6 +383,15 @@ def test_single_move_group_goal_constrains_tcp_and_keeps_dual_regression():
     assert dual_constraints.orientation_constraints == []
 
 
+def test_dual_kdl_solver_is_configured_for_position_only_goals():
+    """The five-axis dual arm cannot satisfy arbitrary sampled 6-D poses."""
+    config = Path(__file__).parents[2] / "robot_arm_moveit_config" / \
+        "config" / "kinematics.yaml"
+    text = config.read_text(encoding="utf-8")
+    assert "kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin" in text
+    assert "position_only_ik: true" in text
+
+
 def test_fake_realsense_target_transforms_camera_to_base_for_single_tcp():
     transform = TransformStamped()
     transform.header.frame_id = "base_link"

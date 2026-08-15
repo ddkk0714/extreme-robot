@@ -11,7 +11,7 @@ def test_mock_defaults_cover_arm_and_virtual_gripper_geometry():
     assert ARM_JOINTS == (
         'arm_joint_1', 'arm_joint_2', 'arm_joint_3',
         'arm_joint_4', 'arm_joint_5')
-    assert GRIPPER_JOINT == 'gripper_drive_joint'
+    assert GRIPPER_JOINT == 'gripper_left_pinion_joint'
     assert ALL_JOINTS[-1] == GRIPPER_JOINT
     assert len(DEFAULT_POSITIONS) == len(ALL_JOINTS)
 
