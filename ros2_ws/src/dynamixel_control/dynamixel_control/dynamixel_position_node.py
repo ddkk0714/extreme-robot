@@ -149,6 +149,9 @@ CURRENT_SPIKE_BIT = 7
 # current_trip_threshold(절대값 트립, 기본 400)보다는 낮게 유지해 최소한의
 # 구분은 남긴다. 실서보 정상 조그/기동 전류 로그를 모아 다시 좁혀야 한다.
 DEFAULT_CURRENT_SPIKE_DELTA = 350
+
+# 전류 가드(절대 트립 + 급변 감지)에서 제외할 서보 ID — 선언부 주석 참고.
+DEFAULT_CURRENT_GUARD_EXEMPT_IDS = [11]
 # read_rate_hz=30 기준 약 3초 — 짧으면(과거 10샘플/0.33초) 사람 손처럼
 # 300ms~1초 넘게 걸리는 힘을 놓친다(위 히스토리 1~2차). 길면 최솟값 기준선이
 # 더 오래된 값을 참조하게 되지만, 실측상 정상 조그의 델타 상한(160, 테스트
@@ -293,7 +296,29 @@ class DynamixelPositionNode(Node):
         # 은 이 스위치와 무관하게 항상 켜져 있다 — 이건 "급변(변화량)" 감지만
         # 끈다. 런타임에는 /dynamixel/current_spike_config 로 토글(아래
         # current_spike_config_callback 참고).
-        self.declare_parameter("current_spike_enabled", True)
+        # 🔁 **2026-08-19 기본값 True → False.** 실서보에서 오탐이 계속 났다 —
+        # baseline 이 min(window) 라 정지 중이면 0 이 되고, 거기서 조그를 시작하면
+        # **정상 기동 전류**가 그대로 Δ가 되어 문턱을 넘는다(ID 11 에서 Δ396 ≥ 350
+        # 으로 전 관절 비상정지). 문턱을 실측으로 다시 잡기 전까지는 꺼두는 쪽이
+        # 맞다 — 절대 트립(current_trip_threshold)이 백스톱으로 남는다.
+        self.declare_parameter("current_spike_enabled", False)
+
+        # 두 전류 가드(절대 트립 + 급변 감지)에서 **통째로 빼는 서보 ID 목록**.
+        #
+        # ⚠️ 문턱값이 모터 계열을 가리지 않는다는 게 근본 문제다. 주소 126 의 의미가
+        #    계열마다 다르다 — XL430(그리퍼 3·4, 손목 16)은 `Present Load`(0.1% 단위),
+        #    XM540(팔 11·12·13·14)은 `Present Current`(2.69mA 단위)다. 지금 문턱
+        #    (500/350)은 XL430 기준으로 잡힌 값이라 XM540 축에 그대로 적용하면
+        #    1A 남짓한 정상 구동 전류에도 걸린다(XM540-W270 정격 2A대, current_limit
+        #    레지스터 2047 ≈ 5.5A).
+        #
+        # 기본값 [11] = arm_joint_1(베이스 요축). 2026-08-19 재조립으로 새로 편입된
+        # XM540 축이고 실기에서 실제로 오탐 트립이 났다(사용자 요청으로 제외).
+        # ⚠️ **ID 12/13/14 도 같은 XM540 이라 같은 오탐 소지가 있다** — 아직 안 걸린
+        #    건 그 축들을 덜 움직여서일 가능성이 크다. 제대로 고치려면 계열별로
+        #    문턱을 나눠야 하고(XM540=mA 도메인, XL430=% 도메인), 그러려면 각 축의
+        #    정상 조그 전류 상한 실측이 필요하다. 그 전까지의 임시 조치다.
+        self.declare_parameter("current_guard_exempt_ids", DEFAULT_CURRENT_GUARD_EXEMPT_IDS)
 
         port = self.get_parameter("port").value
         baudrate = int(self.get_parameter("baudrate").value)
@@ -313,6 +338,8 @@ class DynamixelPositionNode(Node):
         self.current_spike_delta_threshold = int(
             self.get_parameter("current_spike_delta_threshold").value)
         self.current_spike_enabled = bool(self.get_parameter("current_spike_enabled").value)
+        self.current_guard_exempt_ids = set(
+            int(v) for v in self.get_parameter("current_guard_exempt_ids").value)
 
         if len(self.motor_ids) != len(self.joint_names):
             raise RuntimeError(
@@ -511,7 +538,8 @@ class DynamixelPositionNode(Node):
             f"current_trip_threshold={self.current_trip_threshold}, "
             f"current_trip_enabled={self.current_trip_enabled}, "
             f"current_spike_delta_threshold={self.current_spike_delta_threshold}, "
-            f"current_spike_enabled={self.current_spike_enabled})")
+            f"current_spike_enabled={self.current_spike_enabled}, "
+            f"current_guard_exempt_ids={sorted(self.current_guard_exempt_ids)})")
 
     # ------------------------------------------------------------------ 기동
     def _comm_detail(self, result, error):
@@ -964,6 +992,7 @@ class DynamixelPositionNode(Node):
             # 끊기 위한 소프트 안전장치. read_state 는 매 주기(기본 30Hz) 이 검사를
             # 하므로 다음 SyncWrite 를 기다리지 않고 바로 여기서 torque 를 끈다.
             if (self.current_trip_enabled
+                    and dxl_id not in self.current_guard_exempt_ids
                     and self.current_trip_threshold > 0
                     and abs(current) >= self.current_trip_threshold
                     and not (self.error_latched.get(dxl_id, 0) & (1 << CURRENT_TRIP_BIT))):
@@ -997,7 +1026,8 @@ class DynamixelPositionNode(Node):
             # current_spike_enabled=False 면 창을 아예 안 쌓는다 — 다시 켰을 때
             # 옛(다른 상태에서 쌓인) 값이 기준선으로 섞이지 않게, torque on/off
             # 전환과 같은 방식으로 첫 샘플은 비교 없이 기록만 하고 시작한다.
-            if not self.current_spike_enabled:
+            if (not self.current_spike_enabled
+                    or dxl_id in self.current_guard_exempt_ids):
                 self.current_history.pop(dxl_id, None)
             else:
                 window = self.current_history.setdefault(
