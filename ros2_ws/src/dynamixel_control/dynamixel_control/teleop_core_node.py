@@ -879,6 +879,8 @@ class TeleopCore(Node):
             self._cmd_save_pose(arg)
         elif action == "goto":
             self._cmd_goto_pose(arg)
+        elif action == "delete":
+            self._cmd_delete_pose(arg)
         elif action == "poses":
             self._publish_poses_list()
             self.get_logger().info(f"저장된 자세: {sorted(self.poses) or '(없음)'}")
@@ -1256,6 +1258,27 @@ class TeleopCore(Node):
         # 같은 값으로 맞춰준다(안 그러면 다음 조그가 낡은 목표 기준으로 튐).
         self._torque_request(self._pose_motor_ids(), enable=True)
         self._sync_goal_to_measured(available)
+
+    def _cmd_delete_pose(self, name):
+        """저장된 자세를 지운다 (2026-08-19 추가).
+
+        지우기 전에는 GUI 에서 잘못 저장된 이름을 없앨 방법이 없었다 — 실제로
+        붙여넣기 사고로 만들어진 이름(제어문자 포함)이 목록에 남아 있었다.
+        **모션을 만들지 않는다**(파일과 목록만 바꾼다).
+        """
+        name = self._norm_pose_name(name)
+        if not name:
+            self.get_logger().warn("지울 자세 이름이 없습니다 (예: 'delete home')")
+            return
+        if name not in self.poses:
+            self.get_logger().warn(
+                f"자세 '{name}' 이(가) 없습니다 — 저장된 자세: "
+                f"{sorted(self.poses) or '(없음)'}")
+            return
+        del self.poses[name]
+        self._save_poses_file()
+        self._publish_poses_list()
+        self.get_logger().info(f"자세 삭제: '{name}'")
 
     def _cmd_goto_pose(self, name):
         name = self._norm_pose_name(name)
