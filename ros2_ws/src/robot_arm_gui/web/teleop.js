@@ -512,6 +512,113 @@ function renderCommandButtons() {
   });
 }
 
+/* ── 자세 저장/불러오기 ────────────────────────────────
+ *
+ * 저장은 **2단계**다. teleop_core 의 "프리드라이브 저장" 계약상 `save` 전에
+ * `freedrive` 를 먼저 보내야 한다 — 토크가 걸린 채로는 손으로 자세를 잡을 수
+ * 없기 때문이다. 사용자가 취소하면 `freedrive_cancel` 로 저장 없이 토크만
+ * 되돌린다. 이 순서를 프론트엔드가 지켜야 하고, 안 지키면 "저장은 되는데 늘
+ * 같은 자세만 저장되는" 형태로 조용히 잘못된다.
+ *
+ * 이름 규칙은 teleop_vocab._NAME_RE 와 같은 것을 여기서도 본다 — 서버가 어차피
+ * 400 으로 막지만, 누르기 전에 알려주는 편이 낫다. */
+const POSE_NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
+let posePending = null;   // freedrive 중인 저장 대기 이름
+
+function renderPoses(snap) {
+  const box = el('pose-list');
+  if (!box) return;
+  const esc = window.Control.escapeHtml;
+  const names = (snap && snap.teleop && snap.teleop.poses) || [];
+  if (!names.length) {
+    box.innerHTML = '<span class="muted small">저장된 자세 없음</span>';
+    return;
+  }
+  // 이름 화이트리스트를 통과 못 하는 자세는 **삭제 명령도 거부된다**(같은 검증기를
+  // 탄다) — 검증이 생기기 전에 저장된 항목이 실제로 남아 있었다. 누르면 400 이
+  // 뜨는 버튼을 그리느니, 못 지운다는 걸 화면에서 말한다(정리는 poses_file 직접 편집).
+  box.innerHTML = names.map((n) => {
+    const removable = POSE_NAME_RE.test(n);
+    return `<span class="pose-btn">` +
+      `<button class="btn" type="button" data-goto="${esc(n)}" ` +
+      `title="이 자세로 이동">${esc(n)}</button>` +
+      (removable
+        ? `<button class="btn pose-del" type="button" data-del="${esc(n)}" ` +
+          `title="자세 삭제">×</button>`
+        : `<button class="btn pose-del" type="button" disabled ` +
+          `title="이름에 쓸 수 없는 문자가 있어 GUI 로는 지울 수 없습니다 — ` +
+          `poses_file 을 직접 편집하세요">×</button>`) +
+      `</span>`;
+  }).join('');
+  box.querySelectorAll('[data-goto]').forEach((b) => {
+    b.addEventListener('click', () => sendCmd(`goto ${b.dataset.goto}`));
+  });
+  box.querySelectorAll('[data-del]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const n = b.dataset.del;
+      // 삭제는 되돌릴 수 없고 파일까지 바뀐다 — 한 번 묻는다.
+      if (window.confirm(`자세 '${n}' 을(를) 삭제할까요?`)) sendCmd(`delete ${n}`);
+    });
+  });
+}
+
+function showFreedrive(on) {
+  const bar = el('pose-freedrive');
+  if (bar) bar.hidden = !on;
+  const btn = el('pose-save');
+  if (btn) btn.disabled = on;
+}
+
+async function beginPoseSave() {
+  const input = el('pose-name');
+  const name = (input.value || '').trim();
+  if (!POSE_NAME_RE.test(name)) {
+    T.hint = '✖ 자세 이름은 영문/숫자/_/- 만, 1~32자';
+    render({});
+    return;
+  }
+  posePending = name;
+  T.slotMode = null;   // 키보드 슬롯 저장과 동시에 걸리면 freedrive 가 두 번 나간다
+  const label = el('pose-pending-name');
+  if (label) label.textContent = name;
+  // 토크를 먼저 푼다 — 이게 성공해야 손으로 자세를 잡을 수 있다.
+  await sendCmd('freedrive');
+  showFreedrive(true);
+}
+
+async function confirmPoseSave() {
+  if (!posePending) return;
+  await sendCmd(`save ${posePending}`);   // teleop_core 가 저장 후 토크를 되켠다
+  posePending = null;
+  showFreedrive(false);
+  const input = el('pose-name');
+  if (input) input.value = '';
+}
+
+async function cancelPoseSave() {
+  posePending = null;
+  showFreedrive(false);
+  await sendCmd('freedrive_cancel');
+}
+
+function wirePoseControls() {
+  const save = el('pose-save');
+  if (save) save.addEventListener('click', beginPoseSave);
+  const confirm = el('pose-confirm');
+  if (confirm) confirm.addEventListener('click', confirmPoseSave);
+  const cancel = el('pose-cancel');
+  if (cancel) cancel.addEventListener('click', cancelPoseSave);
+  const input = el('pose-name');
+  if (input) {
+    // 조그 핸들러(window) 는 isTyping() 으로 이미 입력 칸을 걸러내므로
+    // stopPropagation 은 필요 없다 — Enter 로 저장만 시작한다.
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); beginPoseSave(); }
+    });
+  }
+  window.onFull(renderPoses);
+}
+
 /* ── 초기화 ────────────────────────────────────────────── */
 function init() {
   const C = window.Control;
@@ -525,6 +632,7 @@ function init() {
 
   renderCommandButtons();
   renderPadMapping();
+  wirePoseControls();
 
   // 이미 다른 프론트엔드가 /arm/teleop_jog 를 밀고 있으면 획득 전에 알려준다 —
   // 눌러 보고 나서 409 를 받는 것보다 낫다.

@@ -24,8 +24,27 @@ def test_no_arg_command_rejects_an_argument():
     assert cmd is None and '인자를' in reason
 
 
+def test_delete_is_a_name_command():
+    """자세 삭제(2026-08-19 추가) — teleop_core._cmd_delete_pose 와 짝이다."""
+    assert validate('delete bench_test') == ('delete bench_test', None)
+    cmd, reason = validate('delete')
+    assert cmd is None and reason
+
+
+def test_delete_rejects_names_it_would_not_let_you_create():
+    """만들 수 없는 이름은 지울 수도 없다 — 같은 검증기를 타기 때문이다.
+
+    검증이 생기기 전에 저장된 항목(붙여넣기 사고로 제어문자가 섞인 이름)이 실제로
+    남아 있었고, GUI 로는 지울 수 없어 poses_file 을 직접 고쳐야 했다. 이 제약은
+    의도된 것이다(명령 채널이 공백 구분이라 화이트리스트를 풀 수 없다) —
+    프론트엔드는 그런 이름의 삭제 버튼을 비활성으로 그린다.
+    """
+    cmd, reason = validate('delete rt:=/dev/ttyusb0')
+    assert cmd is None and reason
+
+
 def test_name_commands_require_a_name():
-    for action in ('save', 'goto', 'reboot'):
+    for action in ('save', 'goto', 'delete', 'reboot'):
         cmd, reason = validate(action)
         assert cmd is None and '이름이 필요' in reason
 
