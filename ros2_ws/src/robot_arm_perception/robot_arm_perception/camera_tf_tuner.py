@@ -48,6 +48,12 @@ IK가 흡수하지 못한다). 반대로 수치 해는 **측정 기준점이 통
 C++ 플러그인을 컴파일해야 하는데, 이 노드의 자세가 전부 ROS 파라미터라
 `rqt_reconfigure`가 그대로 편집 GUI가 된다(cam_x/cam_y/… 를 숫자로 입력).
 
+**안내문은 두 곳으로 나간다** — RViz 3D 텍스트(`/perception/calib_status`, Ogre 폰트가
+한글을 못 그려 **영어**)와, 같은 내용의 한국어 판(`/perception/calib_guide`,
+`std_msgs/String`)이다. 후자는 `calib_status_view` 가 별도 Tk 창에 큰 글씨로 띄운다
+(`camera_calib.launch.py` 가 기본으로 같이 띄운다). 두 언어를 `_guide_lines(ko=)` 한
+함수에서 만들므로 한쪽만 고쳐져 어긋나는 일이 없다.
+
 - 미세조정은 파라미터로도 가능: `ros2 param set /camera_tf_tuner cam_x 0.305`
 - 드래그를 놓을 때마다 현재 값을 `cam_x:=... ` 복붙 형태로 로그에 찍는다.
 - 파일로 저장: `ros2 service call /camera_tf_tuner/save std_srvs/srv/Trigger {}`
@@ -63,7 +69,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import Pose, Quaternion, TransformStamped, Vector3
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import (
     InteractiveMarker, InteractiveMarkerControl, InteractiveMarkerFeedback, Marker,
@@ -81,7 +87,11 @@ from robot_arm_perception.ground_truth_markers import parse_points
 OPTICAL_RPY = solver.OPTICAL_RPY
 
 TOPIC_PICK = "/pick_target"
+#: RViz 3D 뷰에 뜨는 텍스트 마커 — Ogre 폰트가 한글을 못 그려 **영어**다.
 TOPIC_STATUS = "/perception/calib_status"
+#: 같은 내용의 **한국어** 판. `calib_status_view`(Tk 창)가 이걸 크게 띄운다.
+#: 3D 뷰 텍스트가 작고 한 덩어리라 읽기 힘든 문제 때문에 옆 창을 따로 둔다.
+TOPIC_GUIDE = "/perception/calib_guide"
 
 LATCHED = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
@@ -169,9 +179,11 @@ class CameraTfTuner(Node):
         self._order = []        # 측정 순서 (취소용)
         self._collecting = None
         self._status_lines = []
+        self._status_lines_ko = []
         self._solved = False
         self._last_pick = None      # (수신 시각, confidence) — "박스가 지금 보이나" 표시용
         self.pub_status = self.create_publisher(Marker, TOPIC_STATUS, LATCHED)
+        self.pub_guide = self.create_publisher(String, TOPIC_GUIDE, LATCHED)
         self.create_subscription(DetectedObject, TOPIC_PICK, self._on_pick, LATCHED)
         self.create_timer(1.0, self._check_measure_timeout)
 
@@ -292,7 +304,9 @@ class CameraTfTuner(Node):
             # 측정 대상이 없으면 메뉴에 이유를 띄운다 — 빈 메뉴는 고장처럼 보인다.
             menu.insert("(gt_points is empty - pass it as a launch argument)",
                         callback=lambda feedback: self._set_status(
-                            'gt_points not set - e.g. gt_points:="30,0,3; 35,15,3"'))
+                            'gt_points not set - e.g. gt_points:="30,0,3; 35,15,3"',
+                            ko='gt_points 가 비어 있습니다 — launch 인자로 넘기세요. '
+                               '예: gt_points:="30,0,3; 35,15,3" (cm, base_link 기준)'))
         menu.insert("Solve (Kabsch) and apply",
                     callback=lambda f: self._menu_solve(apply=True))
         menu.insert("Diagnose only (no apply)",
@@ -304,7 +318,8 @@ class CameraTfTuner(Node):
 
     def _menu_measure(self, index):
         if self._collecting is not None:
-            self._set_status("already measuring - wait for it to finish.")
+            self._set_status("already measuring - wait for it to finish.",
+                             ko="이미 측정 중입니다 — 끝날 때까지 기다리세요.")
             return
         self._collecting = {
             "index": index,
@@ -315,7 +330,9 @@ class CameraTfTuner(Node):
         x, y, z = self._truths[index]
         self._set_status(
             f"measuring point {index + 1} (at {x * 100:.0f},{y * 100:.0f},{z * 100:.0f} cm) "
-            "- the box must be visible to the camera")
+            "- the box must be visible to the camera",
+            ko=f"{index + 1}번 점 측정 중 ({x * 100:.0f},{y * 100:.0f},{z * 100:.0f} cm) "
+               "— 박스가 카메라에 보여야 합니다")
 
     def _on_pick(self, msg):
         """측정 중일 때만 샘플을 모은다 — 검출 지터를 여러 프레임 평균으로 눌러야 한다.
@@ -342,7 +359,8 @@ class CameraTfTuner(Node):
         if got >= need:
             self._finish_measure()
         elif got % 10 == 0:
-            self._set_status(f"measuring... {got}/{need}")
+            self._set_status(f"measuring... {got}/{need}",
+                             ko=f"측정 중... {got}/{need} 프레임")
 
     def _check_measure_timeout(self):
         # 가이드의 "box detected" 줄이 살아있어야 하므로 매 틱 다시 그린다.
@@ -357,7 +375,10 @@ class CameraTfTuner(Node):
         self._set_status(
             f"point {index + 1} FAILED - no {TOPIC_PICK} received. Check that "
             "perception_node is running, the box is visible, and pick_classes / "
-            "conf_threshold are not filtering it out.")
+            "conf_threshold are not filtering it out.",
+            ko=f"{index + 1}번 점 측정 실패 — {TOPIC_PICK} 이 한 건도 안 왔습니다. "
+               "perception_node 가 떠 있는지, 박스가 화면에 보이는지, "
+               "pick_classes / conf_threshold 가 걸러내고 있지 않은지 확인하세요.")
 
     def _finish_measure(self):
         index = self._collecting["index"]
@@ -372,22 +393,28 @@ class CameraTfTuner(Node):
             self._order.append(index)
         self._measured[index] = mean
 
-        lines = [f"point {index + 1} measured ({len(samples)} frames averaged)",
-                 f"  observed {mean[0]:+.3f},{mean[1]:+.3f},{mean[2]:+.3f} m  "
-                 f"jitter sd=({std[0] * 100:.1f},{std[1] * 100:.1f},{std[2] * 100:.1f})cm"]
+        measurement = (f"  observed {mean[0]:+.3f},{mean[1]:+.3f},{mean[2]:+.3f} m  "
+                       f"jitter sd=({std[0] * 100:.1f},{std[1] * 100:.1f},"
+                       f"{std[2] * 100:.1f})cm")
+        lines = [f"point {index + 1} measured ({len(samples)} frames averaged)", measurement]
+        lines_ko = [f"{index + 1}번 점 측정 완료 ({len(samples)} 프레임 평균)", measurement]
 
         # 가드 — 문제를 '지금' 알려야 다시 재는 삽질이 없다.
+        # 경고문 자체는 solver(=터미널 도구와 공유하는 단일 출처)가 영어로 만든다.
+        warnings = []
         warning = solver.check_range(mean, float(self.get_parameter("min_range").value))
         if warning:
-            lines.append("⚠️ " + warning)
+            warnings.append(warning)
         others = [i for i in self._order if i != index]
-        lines.extend("⚠️ " + w for w in solver.check_pair(
+        warnings.extend(solver.check_pair(
             mean, truth,
             [self._measured[i] for i in others],
             [np.array(self._truths[i]) for i in others],
             float(self.get_parameter("pair_tol").value)))
+        lines.extend("⚠️ " + w for w in warnings)
+        lines_ko.extend("⚠️ " + w for w in warnings)
 
-        self._set_status("\n".join(lines))
+        self._set_status("\n".join(lines), ko="\n".join(lines_ko))
 
     def _menu_solve(self, *, apply):
         indexes = [i for i in self._order if i in self._measured]
@@ -397,12 +424,14 @@ class CameraTfTuner(Node):
             min_range=float(self.get_parameter("min_range").value),
             pair_tol=float(self.get_parameter("pair_tol").value))
         if result is None:
-            self._set_status(f"only {len(indexes)} point(s) - measure at least 3.")
+            self._set_status(f"only {len(indexes)} point(s) - measure at least 3.",
+                             ko=f"점이 {len(indexes)}개뿐입니다 — 최소 3개를 측정하세요.")
             return
 
         report = solver.format_report(result)
         if not apply:
-            self._set_status("DIAGNOSE (not applied)\n" + report)
+            self._set_status("DIAGNOSE (not applied)\n" + report,
+                             ko="진단만 함 (적용 안 됨)\n" + report)
             return
 
         self._pose = list(result["xyz"]) + list(result["rpy"])
@@ -411,35 +440,45 @@ class CameraTfTuner(Node):
         if self._server is not None:
             self._server.setPose(MARKER_NAME, self._current_pose_msg())
             self._server.applyChanges()
-        self._set_status("SOLVED and applied\n" + report)
+        self._set_status("SOLVED and applied\n" + report,
+                         ko="해를 구해 카메라 자세에 적용했습니다\n" + report)
 
     def _menu_undo(self):
         if not self._order:
-            self._set_status("nothing to undo.")
+            self._set_status("nothing to undo.", ko="취소할 측정이 없습니다.")
             return
         index = self._order.pop()
         self._measured.pop(index, None)
-        self._set_status(f"undid point {index + 1} ({len(self._order)} left)")
+        self._set_status(f"undid point {index + 1} ({len(self._order)} left)",
+                         ko=f"{index + 1}번 점 측정을 취소했습니다 (남은 점 {len(self._order)}개)")
 
     def _menu_clear(self):
         self._measured.clear()
         self._order.clear()
         self._collecting = None
         self._solved = False
-        self._set_status("measurements cleared.")
+        self._set_status("measurements cleared.", ko="측정값을 모두 지웠습니다.")
 
     def _menu_save(self):
         response = self._on_save(None, Trigger.Response())
-        self._set_status(response.message)
+        self._set_status(response.message,
+                         ko=("저장됨: " + self.get_parameter("save_path").value
+                             if response.success else response.message))
 
     # ── 상태 표시 (RViz 3D 텍스트) ─────────────
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def _set_status(self, text):
+    def _set_status(self, text, ko=None):
+        """`text` 는 RViz 3D 텍스트용 영어, `ko` 는 Tk 창(`calib_status_view`)용 한국어.
+
+        `ko` 를 안 주면 영어를 그대로 쓴다 — solver 리포트처럼 숫자 위주라 번역이
+        무의미하거나, 터미널 도구(`calibrate_camera_pose.py`)와 문구를 맞춰야 하는 경우다.
+        """
         self._status_lines = text.split("\n")
-        for line in self._status_lines:
+        self._status_lines_ko = (ko if ko is not None else text).split("\n")
+        for line in self._status_lines_ko:
             self.get_logger().info(line)
         self._publish_status()
 
@@ -453,62 +492,100 @@ class CameraTfTuner(Node):
             return 2                                   # 측정 중
         return 1                                       # 거친 정렬
 
-    def _detection_line(self) -> str:
+    def _detection_line(self, ko=False) -> str:
         """'지금 박스가 보이나' — 측정 실패 원인 1순위라 누르기 전에 보여준다."""
         if self._last_pick is None:
-            return "box detected: NO (never received /pick_target)"
+            return ("박스 인식: 없음 (/pick_target 을 한 번도 못 받음)" if ko else
+                    "box detected: NO (never received /pick_target)")
         age = self._now() - self._last_pick[0]
         if age > 2.0:
-            return f"box detected: NO (last seen {age:.0f}s ago)"
-        return f"box detected: YES (conf {self._last_pick[1]:.2f})"
+            return (f"박스 인식: 없음 ({age:.0f}초 전이 마지막)" if ko else
+                    f"box detected: NO (last seen {age:.0f}s ago)")
+        return (f"박스 인식: 있음 (확신도 {self._last_pick[1]:.2f})" if ko else
+                f"box detected: YES (conf {self._last_pick[1]:.2f})")
 
-    def _guide_lines(self):
-        """단계 체크리스트 + '지금 할 일' 한 줄."""
+    def _guide_lines(self, ko=False):
+        """단계 체크리스트 + '지금 할 일' 한 줄.
+
+        영어/한국어를 **한 함수에서** 만든다 — 두 벌로 나누면 한쪽만 고쳐져서 어긋난다.
+        영어는 RViz 3D 텍스트(Ogre 폰트가 한글을 두부로 그림), 한국어는 Tk 창용이다.
+        """
+        def t(en, kr):
+            return kr if ko else en
+
         step = self._current_step()
         done, total = len(self._order), len(self._truths)
         checks = "".join("[x]" if i in self._measured else "[ ]"
                          for i in range(total))
 
         steps = [
-            (1, "Coarse align   drag the yellow camera box"),
-            (2, f"Measure points {done}/{total} {checks}"),
-            (3, "Solve          right-click > Solve (Kabsch)"),
-            (4, "Verify & Save  green cube inside white box"),
+            (1, t("Coarse align   drag the yellow camera box",
+                  "거친 정렬     노란 카메라 상자를 드래그")),
+            (2, t(f"Measure points {done}/{total} {checks}",
+                  f"점 측정       {done}/{total} {checks}")),
+            (3, t("Solve          right-click > Solve (Kabsch)",
+                  "해 계산       우클릭 > Solve (Kabsch)")),
+            (4, t("Verify & Save  green cube inside white box",
+                  "검증 & 저장   초록 큐브가 흰 와이어프레임 안에")),
         ]
-        lines = ["=== CAMERA TF CALIBRATION ==="]
+        lines = [t("=== CAMERA TF CALIBRATION ===", "=== 카메라 TF 캘리브레이션 ===")]
         lines += [f"{'>>' if n == step else '  '} {n}. {text}" for n, text in steps]
         lines.append("-" * 30)
 
+        now = t("NOW: ", "지금: ")
         if step == 1:
-            lines.append("NOW: pick the 'Interact' tool in the top toolbar,")
-            lines.append("then drag the yellow box until the point cloud's")
-            lines.append("table/chassis overlaps the robot model.")
-            lines.append("(do NOT align on the arm links - without servos")
-            lines.append(" the model's joint angles are not the real ones)")
+            lines.append(now + t("pick the 'Interact' tool in the top toolbar,",
+                                 "RViz 상단 툴바에서 'Interact' 도구를 고른 뒤,"))
+            lines.append(t("then drag the yellow box until the point cloud's",
+                           "포인트클라우드의 책상/차체가 로봇 모델과 겹칠 때까지"))
+            lines.append(t("table/chassis overlaps the robot model.",
+                           "노란 상자를 드래그하세요."))
+            lines.append(t("(do NOT align on the arm links - without servos",
+                           "(팔 링크에 맞추지 말 것 — 서보가 없으면 모델의"))
+            lines.append(t(" the model's joint angles are not the real ones)",
+                           " 관절각이 실제 각도가 아닙니다)"))
         elif step == 2:
             nxt = next((i for i in range(total) if i not in self._measured), None)
             if self._collecting is not None:
-                lines.append(f"NOW: hold still, measuring point "
-                             f"{self._collecting['index'] + 1}...")
+                index = self._collecting["index"]
+                lines.append(now + t(f"hold still, measuring point {index + 1}...",
+                                     f"움직이지 말고 대기 — {index + 1}번 점 측정 중..."))
             elif nxt is None:
-                lines.append("NOW: all points measured - right-click > Solve")
+                lines.append(now + t("all points measured - right-click > Solve",
+                                     "점을 다 쟀습니다 — 우클릭 > Solve (Kabsch)"))
             else:
                 x, y, z = self._truths[nxt]
-                lines.append(f"NOW: put the box at GT{nxt + 1} "
-                             f"({x * 100:.0f}, {y * 100:.0f}, {z * 100:.0f} cm),")
-                lines.append(f"then right-click the yellow box >")
-                lines.append(f"Measure point > {nxt + 1})")
+                spot = f"({x * 100:.0f}, {y * 100:.0f}, {z * 100:.0f} cm)"
+                lines.append(now + t(f"put the box at GT{nxt + 1} {spot},",
+                                     f"박스를 {nxt + 1}번 자리 {spot} 에 놓고,"))
+                lines.append(t("then right-click the yellow box >",
+                               "노란 상자를 우클릭 >"))
+                lines.append(t(f"Measure point > {nxt + 1})",
+                               f"Measure point > {nxt + 1}) 을 누르세요"))
         elif step == 3:
-            lines.append("NOW: right-click > Solve (Kabsch) and apply")
-            lines.append("(more points = better; 5-6 is ideal)")
+            lines.append(now + t("right-click > Solve (Kabsch) and apply",
+                                 "우클릭 > Solve (Kabsch) and apply"))
+            lines.append(t("(more points = better; 5-6 is ideal)",
+                           "(점이 많을수록 좋습니다 — 5~6개가 이상적)"))
         else:
-            lines.append("NOW: put the box at any GT spot and check the")
-            lines.append("green cube lands inside the white wireframe.")
-            lines.append("Then right-click > Save values to file,")
-            lines.append("and copy them into camera_tf.launch.py")
+            lines.append(now + t("put the box at any GT spot and check the",
+                                 "아무 기준점에나 박스를 놓고, 초록 큐브가"))
+            lines.append(t("green cube lands inside the white wireframe.",
+                           "흰 와이어프레임 안에 들어오는지 확인하세요."))
+            lines.append(t("Then right-click > Save values to file,",
+                           "맞으면 우클릭 > Save values to file 로 저장하고,"))
+            lines.append(t("and copy them into camera_tf.launch.py",
+                           "그 값을 camera_tf.launch.py 기본값에 넣으세요."))
 
-        lines.append(self._detection_line())
+        lines.append(self._detection_line(ko))
         return lines
+
+    def _status_text(self, ko=False) -> str:
+        lines = self._guide_lines(ko) if self.get_parameter("show_guide").value else []
+        status = self._status_lines_ko if ko else self._status_lines
+        if status:
+            lines = lines + ["-" * 30] + status
+        return "\n".join(lines)
 
     def _publish_status(self):
         marker = Marker()
@@ -522,11 +599,10 @@ class CameraTfTuner(Node):
         marker.pose.orientation.w = 1.0
         marker.scale.z = 0.035
         marker.color = ColorRGBA(r=1.0, g=1.0, b=0.6, a=1.0)
-        lines = self._guide_lines() if self.get_parameter("show_guide").value else []
-        if self._status_lines:
-            lines = lines + ["-" * 30] + self._status_lines
-        marker.text = "\n".join(lines)
+        marker.text = self._status_text(ko=False)
         self.pub_status.publish(marker)
+        # 같은 내용의 한국어 판 — 옆 창(calib_status_view)이 크게 띄운다.
+        self.pub_guide.publish(String(data=self._status_text(ko=True)))
 
     # ── 파라미터 ↔ 마커 동기화 ─────────────────
 
