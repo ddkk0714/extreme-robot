@@ -17,6 +17,8 @@ ROS 콜백과 HTTP 스레드가 만나는 **유일한 지점**이다. 설계 원
 import threading
 from collections import deque
 
+from .calib_status_parse import parse as parse_calib_status
+from .calib_status_parse import summary as summarize_calib_status
 from .topic_health import classify_joint_publishers
 
 
@@ -97,17 +99,25 @@ class StateStore:
         self._detections = {'objects': [], 'at': None, 'hz': None}
         self._detect_times = deque(maxlen=30)
         self._pick_target = None
+        #: perception_node 의 모델 로드 결과(/perception/model_status).
+        self._model_status = None
+
+        #: 캘리브 마법사의 마지막 계산 결과(제어 모드에서만 채워진다).
+        self._calib_result = None
 
         self._teleop = {
             'jog_at': None, 'jog_joints': [], 'jog_velocities': [],
             'jog_publishers': [], 'last_cmd': None, 'last_cmd_at': None,
-            'poses': [], 'calib': None,
+            'poses': [], 'calib': None, 'calib_info': None,
         }
         self._joy = {'at': None, 'buttons': [], 'axes': []}
         self._joy_params = {'deadman_button': None, 'turbo_button': None,
                             'estop_button': None, 'resolved': False}
 
         self._video = {'source': 'off', 'clients': 0, 'fps': None, 'at': None}
+        #: 제어 세션(조종권·워치독). 읽기 전용 모드에서는 영원히 None 이고,
+        #: 화면은 그걸로 '제어 미탑재'를 판정한다.
+        self._control = None
         self._system = {}
         # 계약 어휘(LOCK_MODES 등)와 표시 임계. 노드가 기동 시 한 번 심어두면
         # 프론트엔드가 "작업 허가/잠금" 같은 파생 판정을 자기 쪽에서 할 수 있다.
@@ -323,6 +333,24 @@ class StateStore:
                                 f"{kind} 임계값 {slot['value']} ({state})", 'info', now)
 
     # ------------------------------------------------------------ 계약/FSM
+    def joint_positions(self, max_age_s=None, now=None):
+        """`{관절: rad}` — 캘리브 마법사가 "지금 값"을 캡처할 때 쓴다.
+
+        `max_age_s` 를 주면 그보다 낡은 관절은 뺀다. 캘리브에서 낡은 값을 캡처하면
+        **손으로 이미 움직인 뒤의 자세를 그 전 값으로 기록**하게 된다.
+        """
+        with self._lock:
+            out = {}
+            for name, slot in self._joints.items():
+                if slot['position'] is None:
+                    continue
+                if max_age_s is not None and (
+                        slot['at'] is None or now is None
+                        or now - slot['at'] > max_age_s):
+                    continue
+                out[name] = slot['position']
+            return out
+
     def set_arm_status(self, status, mission_id, now, stamp_age=None):
         with self._lock:
             self._note('/arm_status', now)
@@ -430,6 +458,11 @@ class StateStore:
         with self._lock:
             self._teleop['jog_publishers'] = list(publishers)
 
+    def teleop_jog_publishers(self):
+        """`/arm/teleop_jog` 를 발행 중인 노드 이름 — 제어 획득 전 충돌 검사용."""
+        with self._lock:
+            return list(self._teleop['jog_publishers'])
+
     def set_teleop_cmd(self, cmd, now):
         with self._lock:
             self._note('/arm/teleop_cmd', now)
@@ -443,12 +476,19 @@ class StateStore:
             self._teleop['poses'] = list(names)
 
     def set_calib_status(self, text, now):
+        """원문과 파싱 결과를 함께 담는다.
+
+        원문을 버리지 않는 이유: 형식이 바뀌어 파서가 `unknown` 을 내도 운영자가
+        무엇이 왔는지 볼 수 있어야 한다(→ `calib_status_parse`).
+        """
         with self._lock:
             self._note('/arm/calib_status', now)
             prev = self._teleop['calib']
             self._teleop['calib'] = text
+            self._teleop['calib_info'] = parse_calib_status(text)
             if prev != text:
-                self._add_event('calib', text, 'info', now)
+                self._add_event('calib', summarize_calib_status(
+                    self._teleop['calib_info']), 'info', now)
 
     def set_joy(self, buttons, axes, now):
         with self._lock:
@@ -470,6 +510,42 @@ class StateStore:
     def set_video(self, source, clients, fps, now):
         with self._lock:
             self._video = {'source': source, 'clients': clients, 'fps': fps, 'at': now}
+
+    def set_calib_result(self, info):
+        """캘리브 마법사의 계산 결과(복사 블록 포함).
+
+        작업 결과의 `detail` 문자열에는 한 줄 요약만 담고, 붙여넣을 블록과 축별 수치는
+        여기 담아 SSE 로 내보낸다 — 결과가 나온 뒤 새로고침해도 사라지지 않아야 한다.
+        """
+        with self._lock:
+            self._calib_result = None if info is None else dict(info)
+
+    def set_model_status(self, info, now):
+        """모델 교체 결과. 상태가 바뀔 때만 이벤트를 남긴다(로그 도배 방지)."""
+        with self._lock:
+            self._note('/perception/model_status', now)
+            prev = self._model_status
+            self._model_status = dict(info, at=now)
+            key = (info.get('state'), info.get('name'), info.get('path'))
+            prev_key = (None if prev is None else
+                        (prev.get('state'), prev.get('name'), prev.get('path')))
+            if key == prev_key:
+                return
+            state = info.get('state')
+            if state == 'loaded':
+                seconds = info.get('seconds')
+                took = '' if seconds is None else f' ({seconds}초)'
+                self._add_event('model', f'모델 로드: {info.get("name")}{took}',
+                                'info', now)
+            elif state == 'error':
+                self._add_event('model',
+                                f'모델 로드 실패: {info.get("name")} — '
+                                f'{info.get("detail")}', 'critical', now)
+
+    def set_control(self, info):
+        """제어 평면의 세션 스냅샷. 제어 모드에서만 채워진다."""
+        with self._lock:
+            self._control = None if info is None else dict(info)
 
     def set_system(self, info):
         with self._lock:
@@ -576,6 +652,11 @@ class StateStore:
                 },
                 'pick_target': (None if self._pick_target is None else dict(
                     self._pick_target, age=self._age(self._pick_target.get('at'), now))),
+                'model': (None if self._model_status is None else dict(
+                    self._model_status,
+                    age=self._age(self._model_status.get('at'), now))),
+                'calib_result': (None if self._calib_result is None
+                                 else dict(self._calib_result)),
                 'teleop': {
                     'jog_age': self._age(self._teleop['jog_at'], now),
                     'jog_joints': self._teleop['jog_joints'],
@@ -585,6 +666,7 @@ class StateStore:
                     'last_cmd_age': self._age(self._teleop['last_cmd_at'], now),
                     'poses': self._teleop['poses'],
                     'calib': self._teleop['calib'],
+                    'calib_info': self._teleop['calib_info'],
                 },
                 'joy': {
                     'age': self._age(self._joy['at'], now),
@@ -597,6 +679,7 @@ class StateStore:
                     'params_resolved': self._joy_params['resolved'],
                 },
                 'video': dict(self._video),
+                'control': None if self._control is None else dict(self._control),
                 'system': dict(self._system),
                 'contract': dict(self._contract),
                 'topics': {
@@ -628,6 +711,8 @@ class StateStore:
                     self._controller_fault,
                     age=self._age(self._controller_fault['at'], now)),
                 'hw_errors': self._hw_entries,
+                # 워치독 잔여 시간은 1Hz 로 보면 이미 늦다 — 조종 중 표시는 hot 에 싣는다.
+                'control': None if self._control is None else dict(self._control),
                 'topics': {
                     name: {'count': slot['count'], 'age': self._age(slot['last'], now)}
                     for name, slot in self._topics.items()

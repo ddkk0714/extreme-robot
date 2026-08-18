@@ -37,7 +37,6 @@ rad 끝단(`gripper_open_rad`=1.9444 / `gripper_close_rad`=0.0)은 URDF 가 정�
 그대로 쓸 수 있다 — `gripper_calibration.py`(포트 직접 오픈, 2모터 전제)와 다른 점이다.
 """
 import argparse
-import math
 import os
 import select
 import sys
@@ -47,6 +46,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 try:
+    from dynamixel_control import calib_math
     from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
 except ImportError:
     sys.stderr.write(
@@ -157,32 +157,25 @@ def main():
             return 1
         print(f"\n   열림 tick = {opened:.1f}")
 
-        span = opened - closed
-        if abs(span) < 50:
-            print(f"\n개폐 tick 차이가 {abs(span):.0f} 밖에 안 됩니다 — 실제로 "
-                  "여닫으셨나요?", file=sys.stderr)
+        # 마진 부호 처리와 경고 판정은 calib_math 한 곳에 있다 — 관제 GUI 의 그리퍼
+        # 마법사도 같은 함수를 부르므로 두 경로가 갈라질 수 없다.
+        try:
+            result = calib_math.gripper_endpoints(closed, opened, args.margin)
+        except ValueError as exc:
+            print(f"\n{exc}", file=sys.stderr)
             return 1
-
-        # 마진은 항상 '안쪽'으로 — 열림/닫힘 tick 의 대소 관계가 조립에 따라 뒤집힐 수
-        # 있어서 부호를 span 에서 가져온다.
-        direction = 1 if span > 0 else -1
-        close_final = round(closed + direction * args.margin)
-        open_final = round(opened - direction * args.margin)
+        close_final, open_final = result["close"], result["open"]
 
         print("\n" + "=" * 70)
         print(f"  gripper_close_tick = {close_final}")
         print(f"  gripper_open_tick  = {open_final}")
-        print(f"  (stroke {abs(open_final - close_final)} tick "
-              f"= {abs(open_final - close_final) / 4096 * 360:.1f}° 서보축"
+        print(f"  (stroke {result['stroke_tick']} tick "
+              f"= {result['stroke_deg']:.1f}° 서보축"
               + (f", 양끝 마진 {args.margin} tick 적용" if args.margin else "") + ")")
         print("=" * 70)
 
-        stroke_deg = abs(open_final - close_final) / 4096 * 360
-        if stroke_deg > 300:
-            print("\n  ⚠️ 스트로크가 서보 한 바퀴에 가깝습니다. 단일회전(0~4095) 모드면")
-            print("     wrap 경계가 사용 범위 한가운데 걸려 양 끝이 막힙니다 —")
-            print("     Extended Position 모드인지 확인하세요(teleop_core 가 같은 이유로")
-            print("     그리퍼를 EXTENDED_POSITION_NAMES 에 넣어뒀습니다).")
+        for warning in result["warnings"]:
+            print(f"\n  ⚠️ {warning}")
 
         print("\ngripper_presets.py 의 GRIPPER_PRESETS['%s'] 에 반영:\n"
               % args.gripper_type)
