@@ -11,16 +11,16 @@ from std_msgs.msg import Bool
 from control_msgs.action import FollowJointTrajectory
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
 
-from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
-
-
 ADDR_TORQUE_ENABLE = 64
+ADDR_OPERATING_MODE = 11
 ADDR_HARDWARE_ERROR_STATUS = 70
+ADDR_GOAL_VELOCITY = 104
 ADDR_GOAL_POSITION = 116
 ADDR_PRESENT_CURRENT = 126
 ADDR_PRESENT_POSITION = 132
 
 LEN_GOAL_POSITION = 4
+LEN_GOAL_VELOCITY = 4
 LEN_HARDWARE_ERROR_STATUS = 1
 LEN_PRESENT_CURRENT = 2
 LEN_PRESENT_POSITION = 4
@@ -58,7 +58,7 @@ JOINT_CONFIG = {
 
 
 def to_signed(value, byte_len):
-    """무부호 정수를 byte_len 바이트 2의 보수 부호 정수로 변환 (PRESENT_CURRENT 용)."""
+    """무부호 정수를 byte_len 바이트 2의 보수 부호 정수로 변환."""
     bits = byte_len * 8
     if value >= (1 << (bits - 1)):
         value -= (1 << bits)
@@ -69,26 +69,20 @@ class MoveItDynamixelBridge(Node):
     def __init__(self):
         super().__init__("moveit_dynamixel_bridge")
 
-        # --- 그리퍼 파라미터 (단일 서보 양 핑거 미러링) ---
-        # gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
-        # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
-        self.declare_parameter("gripper_type", DEFAULT_GRIPPER)
-        self.gripper_type = self.get_parameter("gripper_type").value
-        preset = get_preset(self.gripper_type, self.get_logger())
+        # 털털이 ZIP에 모터 ID/방향/속도가 없어 모두 fail-closed 기본값이다.
+        self.declare_parameter("cleaning_actuator_joint", "")
+        self.declare_parameter("cleaning_actuator_id", -1)
+        self.declare_parameter("cleaning_direction", 0)
+        self.declare_parameter("cleaning_velocity_raw", 0)
 
-        self.declare_parameter("gripper_joints", preset["gripper_joints"])
-        self.declare_parameter("gripper_ids", preset["gripper_ids"])  # 빈 배열이면 그리퍼 비활성
-        self.declare_parameter("gripper_open_m", preset["gripper_open_m"])
-        self.declare_parameter("gripper_close_m", preset["gripper_close_m"])
-        self.declare_parameter("gripper_open_tick", preset["gripper_open_tick"])
-        self.declare_parameter("gripper_close_tick", preset["gripper_close_tick"])
-
-        self.gripper_joints = list(self.get_parameter("gripper_joints").value)
-        self.gripper_ids = list(self.get_parameter("gripper_ids").value)
-        self.gripper_open_m = float(self.get_parameter("gripper_open_m").value)
-        self.gripper_close_m = float(self.get_parameter("gripper_close_m").value)
-        self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
-        self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
+        self.cleaning_actuator_joint = self.get_parameter("cleaning_actuator_joint").value
+        self.cleaning_actuator_id = int(self.get_parameter("cleaning_actuator_id").value)
+        self.cleaning_direction = int(self.get_parameter("cleaning_direction").value)
+        self.cleaning_velocity_raw = int(self.get_parameter("cleaning_velocity_raw").value)
+        self.cleaning_configured = (
+            bool(self.cleaning_actuator_joint) and self.cleaning_actuator_id >= 0
+            and self.cleaning_direction in (-1, 1) and self.cleaning_velocity_raw > 0
+        )
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -106,7 +100,7 @@ class MoveItDynamixelBridge(Node):
             LEN_GOAL_POSITION,
         )
 
-        # current+position 연속 블록을 한 번에 읽는 SyncRead
+        # hardware error+address 126 feedback+position 블록을 한 번에 읽는 SyncRead
         self.group_sync_read = GroupSyncRead(
             self.port_handler,
             self.packet_handler,
@@ -125,11 +119,8 @@ class MoveItDynamixelBridge(Node):
                 self.group_sync_read.addParam(config["id"])
                 self.active_ids.add(config["id"])
 
-        # 그리퍼 서보: 토크 ON 성공한 ID만 SyncRead 등록
-        for gid in self.gripper_ids:
-            if self._enable_torque(gid, f"gripper(id {gid})"):
-                self.group_sync_read.addParam(gid)
-                self.active_ids.add(gid)
+        if self.cleaning_configured:
+            self._configure_cleaning_actuator()
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -137,22 +128,13 @@ class MoveItDynamixelBridge(Node):
             self.trajectory_callback,
             10,
         )
+        self.create_subscription(Bool, "/cleaning/enable", self._on_cleaning_enable, 10)
 
         self.action_server = ActionServer(
             self,
             FollowJointTrajectory,
             "/arm_controller/follow_joint_trajectory",
             execute_callback=self.execute_follow_joint_trajectory,
-            goal_callback=self.goal_callback,
-            cancel_callback=self.cancel_callback,
-        )
-
-        # 그리퍼 액션 서버 (FSM 이 /gripper_controller/follow_joint_trajectory 로 파지/개방 명령)
-        self.gripper_action_server = ActionServer(
-            self,
-            FollowJointTrajectory,
-            "/gripper_controller/follow_joint_trajectory",
-            execute_callback=self.execute_gripper,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
         )
@@ -176,7 +158,7 @@ class MoveItDynamixelBridge(Node):
 
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
-            f"gripper_type={self.gripper_type}, gripper_ids={self.gripper_ids})"
+            f"cleaning_actuator={self.cleaning_actuator_joint or 'UNCONFIGURED'})"
         )
 
     # ------------------------------------------------------------------ helpers
@@ -193,6 +175,38 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().info(f"Torque enabled: {label} -> id {dxl_id}")
             return True
 
+    def _configure_cleaning_actuator(self):
+        """Dynamixel Protocol 2.0 velocity mode(Operating Mode=1)로 설정한다."""
+        dxl_id = self.cleaning_actuator_id
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        result, error = self.packet_handler.write1ByteTxRx(
+            self.port_handler, dxl_id, ADDR_OPERATING_MODE, 1)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"Cleaning actuator velocity-mode setup failed: id={dxl_id}")
+            self.cleaning_configured = False
+            return
+        if self._enable_torque(dxl_id, self.cleaning_actuator_joint):
+            self.group_sync_read.addParam(dxl_id)
+            self.active_ids.add(dxl_id)
+        else:
+            self.cleaning_configured = False
+
+    def _on_cleaning_enable(self, msg):
+        if not self.cleaning_configured:
+            if msg.data:
+                self.get_logger().error(
+                    "Cleaning command rejected: actuator ID/direction/velocity not configured")
+            return
+        velocity = self.cleaning_direction * self.cleaning_velocity_raw if msg.data else 0
+        result, error = self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.cleaning_actuator_id, ADDR_GOAL_VELOCITY,
+            velocity & 0xffffffff)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"Cleaning velocity write failed: result={result}, error={error}")
+
     def rad_to_tick(self, joint_name, rad):
         config = JOINT_CONFIG[joint_name]
         tick = config["center"] + config["direction"] * rad * TICKS_PER_RAD
@@ -202,20 +216,6 @@ class MoveItDynamixelBridge(Node):
     def tick_to_rad(self, joint_name, tick):
         config = JOINT_CONFIG[joint_name]
         return (tick - config["center"]) / (config["direction"] * TICKS_PER_RAD)
-
-    def gripper_m_to_tick(self, meters):
-        span = self.gripper_open_tick - self.gripper_close_tick
-        denom = self.gripper_open_m - self.gripper_close_m
-        frac = 0.0 if denom == 0.0 else (meters - self.gripper_close_m) / denom
-        tick = int(round(self.gripper_close_tick + frac * span))
-        return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
-
-    def gripper_tick_to_m(self, tick):
-        span = self.gripper_open_tick - self.gripper_close_tick
-        if span == 0:
-            return self.gripper_close_m
-        frac = (tick - self.gripper_close_tick) / span
-        return self.gripper_close_m + frac * (self.gripper_open_m - self.gripper_close_m)
 
     def int_to_little_endian_4bytes(self, value):
         return [
@@ -285,51 +285,6 @@ class MoveItDynamixelBridge(Node):
 
         self.group_sync_write.clearParam()
 
-    # ------------------------------------------------------------------ gripper
-    def execute_gripper(self, goal_handle):
-        trajectory = goal_handle.request.trajectory
-
-        result = FollowJointTrajectory.Result()
-
-        if not self.gripper_ids:
-            self.get_logger().warn("Gripper goal received but gripper_ids is empty — ignored")
-            goal_handle.succeed()
-            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
-            return result
-
-        if trajectory.points:
-            point = trajectory.points[-1]
-            name_to_pos = dict(zip(trajectory.joint_names, point.positions))
-            # 단일 구동 조인트(gripper_drive_joint)만 사용 — 나머지 8개는 URDF mimic으로 종속
-            target_m = None
-            for jn in self.gripper_joints:
-                if jn in name_to_pos:
-                    target_m = name_to_pos[jn]
-                    break
-            if target_m is not None:
-                self._write_gripper(target_m)
-            else:
-                self.get_logger().warn(
-                    f"Gripper goal has no known finger joint {self.gripper_joints}"
-                )
-
-        goal_handle.succeed()
-        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
-        result.error_string = "Gripper command sent to Dynamixel"
-        return result
-
-    def _write_gripper(self, meters):
-        goal_tick = self.gripper_m_to_tick(meters)
-        for gid in self.gripper_ids:
-            result, error = self.packet_handler.write4ByteTxRx(
-                self.port_handler, gid, ADDR_GOAL_POSITION, goal_tick
-            )
-            if result != 0 or error != 0:
-                self.get_logger().warn(
-                    f"Gripper write failed: id={gid}, result={result}, error={error}"
-                )
-        self.get_logger().info(f"gripper -> {meters:.4f} m -> tick {goal_tick} (ids {self.gripper_ids})")
-
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
         self.group_sync_read.txRxPacket()
@@ -360,56 +315,56 @@ class MoveItDynamixelBridge(Node):
             msg.position.append(self.tick_to_rad(joint_name, tick))
             msg.effort.append(float(current_raw))
 
-        # 그리퍼 핑거 관절: 단일 서보(gripper_ids[0]) 값을 양 핑거에 동일 보고.
-        # position(m) + effort(raw current) — FSM 이 effort 로 파지/DROP 판정.
-        if self.gripper_ids and self.gripper_ids[0] in self.active_ids:
-            sample = self._read_sample(self.gripper_ids[0])
+        if (self.cleaning_configured
+                and self.cleaning_actuator_id in self.active_ids):
+            sample = self._read_sample(self.cleaning_actuator_id)
             if sample is None:
                 fault = True
             else:
                 current_raw, tick, hw_error = sample
-                if hw_error != 0:
-                    fault = True
-                finger_m = self.gripper_tick_to_m(tick)
-                for jn in self.gripper_joints:
-                    msg.name.append(jn)
-                    msg.position.append(finger_m)
-                    msg.effort.append(float(current_raw))
+                fault = fault or hw_error != 0
+                msg.name.append(self.cleaning_actuator_joint)
+                msg.position.append(float(to_signed(tick, LEN_PRESENT_POSITION)))
+                msg.effort.append(float(current_raw))
 
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=fault))
 
     def _read_sample(self, dxl_id):
-        """SyncRead 블록에서 (signed current, position tick, hardware_error_status) 추출.
+        """SyncRead 블록에서 (signed current, position tick, hardware error) 추출.
 
         미수신 시 None.
         """
         if not self.group_sync_read.isAvailable(
                 dxl_id, ADDR_HARDWARE_ERROR_STATUS, LEN_HARDWARE_ERROR_STATUS):
             return None
-        if not self.group_sync_read.isAvailable(dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT):
+        if not self.group_sync_read.isAvailable(
+                dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT):
             return None
-        if not self.group_sync_read.isAvailable(dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION):
+        if not self.group_sync_read.isAvailable(
+                dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION):
             return None
         hw_error = self.group_sync_read.getData(
             dxl_id, ADDR_HARDWARE_ERROR_STATUS, LEN_HARDWARE_ERROR_STATUS)
         current_raw = to_signed(
-            self.group_sync_read.getData(dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT),
+            self.group_sync_read.getData(
+                dxl_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT),
             LEN_PRESENT_CURRENT,
         )
         tick = self.group_sync_read.getData(dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION)
         return current_raw, tick, hw_error
 
     def destroy_node(self):
+        if self.cleaning_configured:
+            self.packet_handler.write4ByteTxRx(
+                self.port_handler, self.cleaning_actuator_id, ADDR_GOAL_VELOCITY, 0)
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, self.cleaning_actuator_id,
+                ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
         for config in JOINT_CONFIG.values():
             self.packet_handler.write1ByteTxRx(
                 self.port_handler, config["id"], ADDR_TORQUE_ENABLE, TORQUE_DISABLE
             )
-        for gid in self.gripper_ids:
-            self.packet_handler.write1ByteTxRx(
-                self.port_handler, gid, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
-            )
-
         self.port_handler.closePort()
         super().destroy_node()
 

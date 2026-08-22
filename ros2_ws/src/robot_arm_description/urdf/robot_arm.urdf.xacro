@@ -1,14 +1,12 @@
 <?xml version="1.0"?>
-<!-- 메인 xacro: robot_arm.urdf(2026-07-15 VerNOmiddle 통합 재export 기준, 팔+gripper_a 전체가
-     이미 하나의 tree)를 그대로 include. robot_arm.urdf는 <robot> 태그를 가진 완성 URDF지만,
+<!-- 메인 xacro: robot_arm.urdf(팔 5축 + link_051 아래 털털이 fixed base)를 그대로 include.
+     robot_arm.urdf는 <robot> 태그를 가진 완성 URDF지만,
      xacro:include는 루트 태그 이름과 무관하게 자식 엘리먼트를 그대로 이 파일의 <robot>에 이어붙임.
 
      이전엔 여기서 xacro:arg gripper로 그리퍼 모듈(urdf/grippers/*.xacro)을 골라 wrist_to_gripper
      fixed joint로 짜맞췄으나, 서로 다른 CAD export(팔/그리퍼 각각 다른 리비전)의 좌표계를 맞추는
      시도가 반복적으로 어긋나 폐기(2026-07-15, 사용자 결정) — robot_arm.urdf 헤더 주석 참고.
-     그리퍼 "모듈화"는 이제 로직 레벨(dynamixel_control의 gripper_type/gripper_presets.py)에서만
-     유지되고, URDF 레벨 스왑은 없음. 그리퍼를 실제로 교체하려면 robot_arm.urdf 자체를 새 통합
-     export로 다시 만들어야 함(urdf/grippers/ 디렉토리는 더 이상 사용 안 함). -->
+     털털이 ZIP에는 회전 joint가 없어서 회전축은 MoveIt 모델 밖의 별도 actuator로 둔다. -->
 <robot name="robot_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <xacro:include filename="$(find robot_arm_description)/urdf/robot_arm.urdf"/>
