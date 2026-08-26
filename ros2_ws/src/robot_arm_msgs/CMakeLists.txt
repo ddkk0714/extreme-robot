@@ -13,6 +13,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArrivalStatus.msg"
   "msg/ChassisMode.msg"
   "msg/ArmStatus.msg"
+  "msg/TaskCommand.msg"
+  "msg/TaskResult.msg"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 

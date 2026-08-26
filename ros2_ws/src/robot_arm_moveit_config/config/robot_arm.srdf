@@ -7,7 +7,7 @@
     <!-- 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf)로 robot_arm.urdf 전면 교체
          (RViz에서 joint_2/3 축이 계속 이상해 기존 Fusion360/VerNOmiddle 계열을 폐기 — robot_arm.urdf
          헤더 주석 참고). base_link -> link_051 체인(arm_joint_1~5)은 유지한다.
-         털털이 회전축은 제공 ZIP에 joint 정보가 없어 MoveIt planning group에서 제외하고
+         ee_description에는 joint 정보가 없어 MoveIt planning group에서 제외하고
          별도 Dynamixel actuator로 제어한다. -->
     <group name="arm">
         <chain base_link="base_link" tip_link="link_051"/>
@@ -64,7 +64,7 @@
     <disable_collisions link1="link_033" link2="link_039" reason="Adjacent"/>
     <disable_collisions link1="link_039" link2="link_041" reason="Adjacent"/>
     <disable_collisions link1="link_041" link2="link_051" reason="Adjacent"/>
-    <disable_collisions link1="link_051" link2="cleaner_base_link" reason="Adjacent"/>
+    <disable_collisions link1="link_051" link2="ee_base_link" reason="Adjacent"/>
 
     <!-- 2026-07-16: 위 Adjacent만으로는 기어 치합 등 항상-접촉 쌍이 self-collision 오탐으로
          남아 mock 플래닝이 홈(all-zero) 자세부터 막혔음(RRTConnect: "Motion planning start

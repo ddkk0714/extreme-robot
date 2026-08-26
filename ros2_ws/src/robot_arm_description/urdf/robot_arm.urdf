@@ -6,8 +6,9 @@
      원본 텍스트에 대한 순수 문자열 치환만 적용(링크/조인트 재조립 없음): (1) mesh 경로
      meshes_ascii/*.stl -> package://robot_arm_description/meshes/*.stl, (2) <robot name> 속성만
      robot_arm으로 변경. origin/axis/limit 등 수치는 100% 원본 그대로.
-     팔 조인트 이름과 base_link -> link_051 체인은 원본 그대로 유지한다. 2026-08-22 털털이
-     ZIP은 base_link mesh만 유효하게 export되어 이를 cleaner_base_link로 link_051에 fixed
+     팔 조인트 이름과 base_link -> link_051 체인은 원본 그대로 유지한다. 2026-08-26
+     ee_description.zip은 base_link 하나만 URDF에 정의되어 이를 ee_base_link로 이름 충돌을
+     피하여 link_051에 fixed
      장착했다. cleaning_link/revolute joint/axis/origin은 ZIP에 없으므로 추측하지 않는다.
      mesh는 USD 안에 임베드된 원본 STL geometry(node_STL_BINARY_ prim)를 pxr(usd-core)로 직접
      추출 — meshes_ascii 폴더가 실제로는 어디에도 없어서(Isaac Sim exporter가 USD에만 지오메트리를
@@ -1054,7 +1055,7 @@
     <parent link="link_041" />
     <child link="link_051" />
   </joint>
-  <link name="cleaner_base_link">
+  <link name="ee_base_link">
     <inertial>
       <origin xyz="0.03408736703414403 -0.06697726813792948 0.008478684890740218" rpy="0 0 0" />
       <mass value="0.3359541709234757" />
@@ -1062,19 +1063,20 @@
     </inertial>
     <visual>
       <geometry>
-        <mesh filename="package://robot_arm_description/meshes/cleaner_base_link.stl" scale="0.001 0.001 0.001" />
+        <mesh filename="package://robot_arm_description/meshes/ee_description/base_link.stl" scale="0.001 0.001 0.001" />
       </geometry>
     </visual>
     <collision>
       <geometry>
-        <mesh filename="package://robot_arm_description/meshes/cleaner_base_link.stl" scale="0.001 0.001 0.001" />
+        <mesh filename="package://robot_arm_description/meshes/ee_description/base_link.stl" scale="0.001 0.001 0.001" />
       </geometry>
     </collision>
   </link>
-  <!-- TODO(털털이 CAD): 장착 xyz/rpy를 실측/재export 값으로 교체한다. -->
-  <joint name="wrist_to_cleaner" type="fixed">
+  <!-- TODO(ee_description CAD): ZIP에 장착 transform/TCP가 없다. xyz/rpy를 실측 또는
+       mating-coordinate 포함 CAD 재export 값으로 교체할 때까지 실제 모션에 사용하지 않는다. -->
+  <joint name="wrist_to_ee" type="fixed">
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="link_051" />
-    <child link="cleaner_base_link" />
+    <child link="ee_base_link" />
   </joint>
 </robot>
