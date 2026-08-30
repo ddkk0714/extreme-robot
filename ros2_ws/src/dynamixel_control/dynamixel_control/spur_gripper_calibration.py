@@ -20,6 +20,8 @@ ADDR_TORQUE_ENABLE = 64
 ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_PRESENT_LOAD = 126
 ADDR_PRESENT_POSITION = 132
+ADDR_PRESENT_INPUT_VOLTAGE = 144
+ADDR_PRESENT_TEMPERATURE = 146
 ADDR_GOAL_POSITION = 116
 PROTOCOL_VERSION = 2.0
 
@@ -104,6 +106,8 @@ class Bus:
             'hardware_error': self.read(ADDR_HARDWARE_ERROR_STATUS, 1),
             'torque': self.read(ADDR_TORQUE_ENABLE, 1),
             'operating_mode': self.read(ADDR_OPERATING_MODE, 1),
+            'input_voltage_raw': self.read(ADDR_PRESENT_INPUT_VOLTAGE, 2),
+            'temperature_c': self.read(ADDR_PRESENT_TEMPERATURE, 1),
         }
 
     def disable(self):
@@ -135,8 +139,9 @@ class Bus:
         if result != 0 or error != 0:
             raise CalibrationError('torque enable failed')
 
-    def close(self):
-        self.disable()
+    def close(self, disable_torque=False):
+        if disable_torque:
+            self.disable()
         self.port.closePort()
 
 
@@ -161,6 +166,12 @@ def run(args):
         initial = bus.snapshot()
         print(f'diagnostic: id={args.actuator_id} {initial}')
         if args.read_only:
+            if initial['torque'] != 0:
+                raise CalibrationError(
+                    'read-only check found torque enabled; do not proceed')
+            if initial['hardware_error'] != 0:
+                raise CalibrationError(
+                    f'hardware error 0x{initial["hardware_error"]:02x}')
             return 0
         if not args.armed:
             raise CalibrationError(
@@ -205,7 +216,7 @@ def run(args):
         return 0
     finally:
         try:
-            bus.close()
+            bus.close(disable_torque=not args.read_only)
         except Exception as exc:
             print(f'WARNING: final torque-off failed: {exc}', file=sys.stderr)
 

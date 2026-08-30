@@ -273,9 +273,14 @@ class State(Enum):
     PERCEIVE = auto()
     PLAN = auto()
     APPROACH = auto()
+    # Pick-place flow compatibility states.  The live handlers still use these
+    # names, and external tests/clients observe the enum as part of the FSM API.
+    DESCEND = auto()
+    DESCEND_STOPPED = auto()
     TOOL_ACTION = auto()
     GRASP = auto()
     GRASP_CHECK = auto()
+    LIFT = auto()
     CLEAN_START = auto()
     CONTACT_CHECK = auto()
     CLEAN = auto()
@@ -292,8 +297,6 @@ class State(Enum):
     # 기존 파워트레인 계약에서 유지하는 감독/안전 상태.
     GRIP_LOST = auto()
     LOWER_RELEASE = auto()
-    RELEASE = auto()
-    DONE = auto()
     STOWING = auto()
     STOWED_LOCKED = auto()
     LOCKED = auto()

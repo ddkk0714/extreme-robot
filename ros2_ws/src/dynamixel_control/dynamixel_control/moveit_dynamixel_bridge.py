@@ -13,7 +13,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32MultiArray, String
 from control_msgs.action import FollowJointTrajectory
 from robot_arm_msgs.action import ArmRecordedPath, ArmTestMove, EndEffectorRotate
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
@@ -23,6 +23,15 @@ from dynamixel_control.tool_manager import (
     ParameterToolIdentityProvider, ToolManager)
 from dynamixel_control.tool_profiles import (
     load_profiles, ToolProfileError, validate_control_scope)
+from dynamixel_control import calib_math
+from dynamixel_control import joint_limits
+from dynamixel_control import bus_lock
+from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+from dynamixel_control.calibration_session import CalibrationSession
+from dynamixel_control.dual_manual_recovery import (
+    DualManualRecovery, DualManualRecoveryError)
+from dynamixel_control.dual_calibration_session import (
+    DualCalibrationSession, DualCalibrationError)
 
 ADDR_TORQUE_ENABLE = 64
 ADDR_OPERATING_MODE = 11
@@ -366,6 +375,15 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("temporary_jog_safe_max_tick", 3807)
         self.declare_parameter("temporary_jog_mechanical_open_tick", 2817)
         self.declare_parameter("temporary_jog_mechanical_close_tick", 3857)
+        # 1모터 스퍼기어 벤치 검증 전용의 보수적 프로파일이다. 토크는 여기서
+        # 절대 켜지 않으며, GUI의 명시적 Enable 요청으로만 인가된다.
+        self.declare_parameter("temporary_jog_profile_velocity", 5)
+        self.declare_parameter("temporary_jog_profile_acceleration", 1)
+        # ID5 endpoint calibration is deliberately separate from the old
+        # temporary range: it never configures a register at startup and it
+        # has no invented endpoint values.
+        self.declare_parameter("calibration_jog_mode", False)
+        self.declare_parameter("calibration_max_jog_ticks", 12)
         self.declare_parameter("gripper_target_tolerance_ticks", 20)
         default_profiles = str(Path(get_package_share_directory(
             'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
@@ -415,6 +433,8 @@ class MoveItDynamixelBridge(Node):
         self.tool_type = str(self.get_parameter("tool_type").value)
         self.control_scope = validate_control_scope(
             self.get_parameter("control_scope").value)
+        # The isolated end-effector stack must never poll or command arm IDs.
+        self.gripper_only_mode = self.control_scope == 'END_EFFECTOR_ONLY'
         self.temporary_jog_mode = bool(
             self.get_parameter("temporary_jog_mode").value)
         self.temporary_jog_safe_min = int(
@@ -426,10 +446,38 @@ class MoveItDynamixelBridge(Node):
             and self.control_scope == 'END_EFFECTOR_ONLY'
             and self.tool_type == 'spur_1motor_gripper'
             and self.temporary_jog_safe_min < self.temporary_jog_safe_max)
+        self.temporary_jog_profile_velocity = int(
+            self.get_parameter("temporary_jog_profile_velocity").value)
+        self.temporary_jog_profile_acceleration = int(
+            self.get_parameter("temporary_jog_profile_acceleration").value)
+        self.calibration_jog_mode = bool(
+            self.get_parameter("calibration_jog_mode").value)
+        self.calibration_max_jog_ticks = int(
+            self.get_parameter("calibration_max_jog_ticks").value)
+        self.calibration_jog_enabled = bool(
+            self.calibration_jog_mode and self.tool_type == 'spur_1motor_gripper'
+            and self.control_scope == 'END_EFFECTOR_ONLY'
+            and self.calibration_max_jog_ticks in (6, 12))
+        self.calibration_endpoints = {}
         self.gripper_target_tolerance = int(
             self.get_parameter("gripper_target_tolerance_ticks").value)
         if self.gripper_target_tolerance < 0:
             raise ValueError('gripper_target_tolerance_ticks must be non-negative')
+        try:
+            profiles = load_profiles(
+                self.get_parameter('tool_profile_file').value)
+            self.tool_manager = ToolManager(
+                profiles, ParameterToolIdentityProvider(self.tool_type),
+                mock_mode=self.mock_mode)
+            self.tool_selection = self.tool_manager.refresh('IDLE')
+            self.tool_profile = self.tool_selection.profile
+            self.tool_motion_allowed = self.tool_selection.valid
+        except ToolProfileError as exc:
+            self.get_logger().error(f'tool profile rejected: {exc}')
+            self.tool_manager = None
+            self.tool_selection = None
+            self.tool_profile = {}
+            self.tool_motion_allowed = False
         self.control_mode = 'FSM'
         self.emergency_stop_active = False
         self.tool_detached = False
@@ -477,7 +525,8 @@ class MoveItDynamixelBridge(Node):
         # /dev/ttyUSB0 을 잡으므로 "동시에 띄우지 말 것"이 계약인데, 지금까지는
         # 규율로만 지켜졌고 어기면 축 하나만 조용히 빠지는 형태로 망가졌다
         # (bus_lock 모듈 docstring 참고). fd 는 살려둬야 잠금이 유지된다.
-        self._bus_lock_fd = bus_lock.acquire(DEVICENAME, self.get_logger())
+        self._bus_lock_fd = None if self.mock_mode else bus_lock.acquire(
+            DEVICENAME, self.get_logger())
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -527,12 +576,41 @@ class MoveItDynamixelBridge(Node):
 
         self.tool_ids = list(self.tool_profile.get('actuator_ids', []))
         self.tool_discovered = self.mock_mode
+        if self.mock_mode:
+            # Provide a deterministic, in-range feedback sample so the GUI can
+            # capture its zero/reference without touching a serial device.
+            seed_tick = 3320
+            joint_names = self.tool_profile.get('joint_names') or ['']
+            for dxl_id in self.tool_ids:
+                self._tool_samples[dxl_id] = {
+                    'id': dxl_id, 'joint': joint_names[0],
+                    'position': seed_tick, 'effort': 0.0, 'online': True,
+                    'hardware_error': 0, 'torque_state': 'OFF'}
         if not self.mock_mode and self.port_connected:
             self.tool_discovered = self._discover_tool_ids()
             if self.read_only:
                 for dxl_id in self.tool_ids:
                     self.group_sync_read.addParam(dxl_id)
                     self.active_ids.add(dxl_id)
+            elif self.tool_type == 'spur_1motor_gripper' and self.tool_ids == [5]:
+                # A spur startup is observation-only.  It must never rewrite
+                # torque, operating mode, profile, or a goal before an
+                # operator explicitly uses the calibration/FSM controls.
+                self.group_sync_read.addParam(5)
+                self.active_ids.add(5)
+            elif self.tool_type == 'dual_motor_gripper' and self.tool_ids == [3, 4]:
+                # Preserve the dual FollowJointTrajectory architecture while
+                # making startup observation-only.  Torque/mode/profile writes
+                # are an explicit operator action, never a GUI launch side
+                # effect.
+                for dxl_id in self.tool_ids:
+                    self.group_sync_read.addParam(dxl_id)
+                    self.active_ids.add(dxl_id)
+            elif self.calibration_jog_enabled:
+                # Calibration observes the pre-existing hardware state first.
+                # In particular, do not disable torque or rewrite mode/profile.
+                self.group_sync_read.addParam(5)
+                self.active_ids.add(5)
             elif self.tool_motion_allowed and self.tool_discovered:
                 if self.temporary_jog_enabled:
                     self._configure_temporary_jog_actuator()
@@ -540,6 +618,36 @@ class MoveItDynamixelBridge(Node):
                     self._configure_tool_actuators()
             elif self.tool_ids and not self.tool_discovered:
                 self.tool_motion_allowed = False
+
+        # These are command adapters, not action clients.  In particular, the
+        # spur path never re-enters legacy FollowJointTrajectory policy.
+        self.tool_fsm = None
+        self.calibration_session = None
+        self.dual_manual_recovery = None
+        self.dual_calibration_session = None
+        if self.tool_type == 'spur_1motor_gripper' and self.tool_manager:
+            self.tool_fsm = self.tool_manager.create_fsm(self)
+            self.tool_fsm.startup()
+            # Startup validation is read-only.  Preserve its actual ID5
+            # observations for status even when the regular SyncRead path is
+            # unavailable, rather than substituting torque ownership cache.
+            snapshot = getattr(self.tool_fsm, 'snapshot', None)
+            if isinstance(snapshot, dict):
+                self._tool_samples[5] = {
+                    'id': 5,
+                    'joint': (self.tool_profile.get('joint_names') or [''])[0],
+                    'position': snapshot.get('position'),
+                    'effort': None,
+                    'online': True,
+                    'torque_state': ('ON' if snapshot.get('torque') == 1 else 'OFF'),
+                    'hardware_error': snapshot.get('hardware_error'),
+                    'model': snapshot.get('model'),
+                }
+            self.calibration_session = CalibrationSession(self, self.tool_profile)
+        elif self.tool_type == 'dual_motor_gripper':
+            self.dual_manual_recovery = DualManualRecovery(self)
+            self.dual_calibration_session = DualCalibrationSession(
+                self, self.tool_profile)
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -552,6 +660,8 @@ class MoveItDynamixelBridge(Node):
         self.create_subscription(Bool, "/tool/detached", self._on_tool_detached, 10)
         self.create_subscription(
             String, "/control/mode_status", self._on_control_mode, 10)
+        self.create_subscription(
+            String, "/control/mode", self._on_control_mode_request, 10)
 
         # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
         # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
@@ -565,6 +675,17 @@ class MoveItDynamixelBridge(Node):
         self.torque_request_sub = self.create_subscription(
             Int32MultiArray, "/dynamixel/torque_request",
             self.torque_request_callback, 10)
+        self.fsm_command_sub = self.create_subscription(
+            String, '/tool/fsm_command', self.fsm_command_callback, 10)
+        self.calibration_command_sub = self.create_subscription(
+            String, '/tool/calibration_command',
+            self.calibration_command_callback, 10)
+        self.manual_recovery_sub = self.create_subscription(
+            String, '/tool/manual_recovery_jog',
+            self.manual_recovery_callback, 10)
+        self.dual_calibration_command_sub = self.create_subscription(
+            String, '/tool/dual_calibration_command',
+            self.dual_calibration_command_callback, 10)
 
         self.teleop_goal_sub = self.create_subscription(
             Int32MultiArray,
@@ -592,41 +713,39 @@ class MoveItDynamixelBridge(Node):
             callback_group=ReentrantCallbackGroup(),
         )
 
-        self.rotate_action_server = ActionServer(
-            self,
-            EndEffectorRotate,
-            "/end_effector/rotate",
-            execute_callback=self.execute_rotate,
-            goal_callback=self.rotate_goal_callback,
-            cancel_callback=self.cancel_callback,
-            callback_group=self._action_group,
-        )
-
-        self.arm_test_action_server = ActionServer(
-            self,
-            ArmTestMove,
-            "/arm/test_move",
-            execute_callback=self.execute_arm_test_move,
-            goal_callback=self.arm_test_goal_callback,
-            cancel_callback=self.cancel_callback,
-            callback_group=self._action_group,
-        )
-
-        self.arm_recorded_path_action_server = ActionServer(
-            self,
-            ArmRecordedPath,
-            "/arm/recorded_path",
-            execute_callback=self.execute_arm_recorded_path,
-            goal_callback=self.arm_recorded_path_goal_callback,
-            cancel_callback=self.cancel_callback,
-            callback_group=self._action_group,
-        )
+        if (
+            not self.mock_mode
+            and not self.calibration_jog_enabled
+            and self.control_scope != 'END_EFFECTOR_ONLY'
+        ):
+            self.rotate_action_server = ActionServer(
+                self, EndEffectorRotate, "/end_effector/rotate",
+                execute_callback=self.execute_rotate,
+                goal_callback=self.rotate_goal_callback,
+                cancel_callback=self.cancel_callback,
+                callback_group=self._action_group)
+            self.arm_test_action_server = ActionServer(
+                self, ArmTestMove, "/arm/test_move",
+                execute_callback=self.execute_arm_test_move,
+                goal_callback=self.arm_test_goal_callback,
+                cancel_callback=self.cancel_callback,
+                callback_group=self._action_group)
+            self.arm_recorded_path_action_server = ActionServer(
+                self, ArmRecordedPath, "/arm/recorded_path",
+                execute_callback=self.execute_arm_recorded_path,
+                goal_callback=self.arm_recorded_path_goal_callback,
+                cancel_callback=self.cancel_callback,
+                callback_group=self._action_group)
 
         self.joint_state_pub = self.create_publisher(
             JointState,
             "/joint_states",
             10,
         )
+        self.tool_type_pub = self.create_publisher(String, '/tool/type', 10)
+        self.tool_status_pub = self.create_publisher(String, '/tool/status', 10)
+        self.control_mode_status_pub = self.create_publisher(
+            String, '/control/mode_status', 10)
 
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" 대응.
         # arm_fsm 이 CARRYING_LOCKED/STOWED_LOCKED 발행 전 게이트로 구독(내부용 — 파워트레인
@@ -646,7 +765,9 @@ class MoveItDynamixelBridge(Node):
         )
 
         self.feedback_timer = self.create_timer(0.05, self.publish_joint_states)
-        self.tool_status_timer = self.create_timer(0.5, self.publish_tool_status)
+        self.tool_status_timer = self.create_timer(
+            0.5, self._publish_tool_status_safely,
+            callback_group=ReentrantCallbackGroup())
 
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
@@ -750,12 +871,37 @@ class MoveItDynamixelBridge(Node):
 
         enable = 1 if data[0] else 0
         ids = data[1:] or sorted(self.active_ids)
+        if enable and (self.emergency_stop_active or self.tool_detached):
+            self.get_logger().warn(
+                'torque enable rejected: emergency stop or tool-detached latch is active')
+            return
+        if self.mock_mode:
+            # Mock must exercise the same explicit-enable state machine, while
+            # remaining strictly free of serial/register writes.
+            if set(ids) - set(self.tool_ids):
+                self.get_logger().warn(
+                    f"Mock torque request rejected outside selected tool IDs: {ids}")
+                return
+            if enable:
+                self.torque_enabled_ids.update(ids)
+            else:
+                self.torque_enabled_ids.difference_update(ids)
+            self.get_logger().info(
+                f"Mock torque {'enabled' if enable else 'disabled'}: ID {ids}")
+            return
         applied, failed = [], []
         for dxl_id in ids:
             if dxl_id not in self.active_ids:
                 self.get_logger().warn(f"torque_request 무시 — 등록 안 된 ID {dxl_id}")
                 continue
             if enable:
+                try:
+                    self._prepare_dual_gripper_enable(dxl_id)
+                except RuntimeError as exc:
+                    self.get_logger().error(
+                        f'ID {dxl_id} torque enable rejected: {exc}')
+                    failed.append(dxl_id)
+                    continue
                 # ⚠️ 토크를 켜기 **전에** Goal Position 을 현재 위치로 덮어쓴다.
                 # 토크가 꺼진 동안 팔은 중력으로 처지는데 Goal 레지스터에는 마지막
                 # 명령값이 그대로 남아 있다 — 그냥 켜면 서보가 그 옛 목표로 **튄다**
@@ -786,6 +932,277 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().warn(f"토크 {word}: ID {applied}")
         if failed:
             self.get_logger().error(f"토크 {word} 실패: ID {failed}")
+
+    def _prepare_dual_gripper_enable(self, dxl_id):
+        """Apply only validated dual RAM profile on an explicit enable request.
+
+        Startup remains observation-only.  This runs only after the operator
+        presses enable, with torque still OFF, and never touches non-tool IDs.
+        """
+        if self.tool_type != 'dual_motor_gripper':
+            return
+        if self.tool_ids != [3, 4] or dxl_id not in self.tool_ids:
+            raise RuntimeError('dual profile setup is restricted to IDs [3, 4]')
+        required = (self.tool_profile.get('required_operating_modes') or {}).get(
+            dxl_id, (self.tool_profile.get('required_operating_modes') or {}).get(
+                str(dxl_id)))
+        accel = int(self.tool_profile['profile_acceleration'])
+        velocity = int(self.tool_profile['profile_velocity'])
+        goal_pwm = int(self.tool_profile['goal_pwm'])
+        with self._bus_lock:
+            torque, comm, packet_error = self.packet_handler.read1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE)
+            if comm != 0 or packet_error != 0 or torque != TORQUE_DISABLE:
+                raise RuntimeError('actual torque must be OFF before profile setup')
+            mode, comm, packet_error = self.packet_handler.read1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+            if comm != 0 or packet_error != 0 or mode != int(required):
+                raise RuntimeError(
+                    f'operating mode {mode} does not match required {required}')
+            for address, value, size, label in (
+                    (ADDR_PROFILE_ACCELERATION, accel, 4, 'profile acceleration'),
+                    (ADDR_PROFILE_VELOCITY, velocity, 4, 'profile velocity'),
+                    (ADDR_GOAL_PWM, goal_pwm, 2, 'goal PWM')):
+                writer = (self.packet_handler.write2ByteTxRx
+                          if size == 2 else self.packet_handler.write4ByteTxRx)
+                comm, packet_error = writer(
+                    self.port_handler, dxl_id, address, value)
+                if comm != 0 or packet_error != 0:
+                    raise RuntimeError(f'{label} write failed')
+                reader = (self.packet_handler.read2ByteTxRx
+                          if size == 2 else self.packet_handler.read4ByteTxRx)
+                actual, comm, packet_error = reader(
+                    self.port_handler, dxl_id, address)
+                if (comm != 0 or packet_error != 0 or int(actual) != value):
+                    raise RuntimeError(f'{label} readback failed: {actual} != {value}')
+
+    def fsm_command_callback(self, msg):
+        """Normal spur commands enter only the selected single-motor FSM."""
+        if self.tool_type != 'spur_1motor_gripper' or self.tool_fsm is None:
+            self.get_logger().warn('tool FSM command rejected for non-spur tool')
+            return
+        try:
+            state = self.tool_fsm.command(msg.data)
+            self.get_logger().info(f'spur FSM command {msg.data!r} -> {state.name}')
+        except Exception as exc:  # command rejection makes no register write
+            self.get_logger().warn(f'spur FSM command rejected: {exc}')
+
+    def manual_recovery_callback(self, msg):
+        """Manual dual resync ingress; never participates in OPEN/CLOSE policy."""
+        if (self.dual_manual_recovery is None
+                or self.tool_type != 'dual_motor_gripper'
+                or self.tool_ids != [3, 4]
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_mode != 'MANUAL'
+                or self.read_only or self.emergency_stop_active
+                or self.tool_detached):
+            self.get_logger().warn('manual dual recovery jog rejected by safety gate')
+            return
+        try:
+            request = json.loads(msg.data)
+            target = self.dual_manual_recovery.jog(
+                request['actuator_id'], request['delta_deg'])
+            self.get_logger().info(
+                f'manual dual recovery: ID{request["actuator_id"]} -> {target}')
+        except (KeyError, TypeError, ValueError, RuntimeError,
+                DualManualRecoveryError) as exc:
+            self.get_logger().warn(f'manual dual recovery jog rejected: {exc}')
+
+    def dual_calibration_command_callback(self, msg):
+        """Narrow ingress for witnessed dual endpoint calibration only."""
+        session = self.dual_calibration_session
+        if (session is None or self.tool_type != 'dual_motor_gripper'
+                or self.tool_ids != [3, 4]
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_mode != 'MANUAL' or self.read_only
+                or self.emergency_stop_active or self.tool_detached):
+            self.get_logger().warn('dual calibration command rejected by safety gate')
+            return
+        try:
+            request = json.loads(msg.data)
+            command = str(request['command']).lower()
+            if command == 'start':
+                session.start()
+            elif command == 'stop':
+                session.stop()
+            elif command == 'jog_motor_degrees':
+                session.jog_motor_degrees(
+                    request['actuator_id'], request['delta_deg'])
+            elif command == 'capture_open':
+                session.capture_open()
+            elif command == 'capture_close':
+                session.capture_close()
+            elif command == 'validate':
+                session.validate()
+            elif command == 'save':
+                session.save(self.get_parameter('tool_profile_file').value)
+                self._reload_dual_profile()
+            else:
+                raise ValueError(f'unsupported dual calibration command {command!r}')
+            self.get_logger().info(f'dual calibration command completed: {command}')
+        except (KeyError, TypeError, ValueError, RuntimeError,
+                DualCalibrationError) as exc:
+            self.get_logger().warn(f'dual calibration command rejected: {exc}')
+
+    def _reload_dual_profile(self):
+        if self.tool_type != 'dual_motor_gripper':
+            raise RuntimeError('only dual profile may reload here')
+        profiles = load_profiles(self.get_parameter('tool_profile_file').value)
+        manager = ToolManager(
+            profiles, ParameterToolIdentityProvider(self.tool_type),
+            mock_mode=self.mock_mode)
+        selection = manager.refresh('IDLE')
+        if selection.profile.get('actuator_ids') != [3, 4]:
+            raise RuntimeError('saved dual profile actuator allowlist is not [3, 4]')
+        self.tool_manager = manager
+        self.tool_selection = selection
+        self.tool_profile = selection.profile
+        self.tool_ids = [3, 4]
+        self.tool_motion_allowed = selection.valid
+        self.dual_calibration_session.reload(self.tool_profile)
+
+    def calibration_command_callback(self, msg):
+        """Narrow JSON ingress for one CalibrationSession operation at a time."""
+        session = self.calibration_session
+        if session is None:
+            self.get_logger().warn('calibration command rejected: ID5 session unavailable')
+            return
+        try:
+            request = json.loads(msg.data)
+            command = str(request['command']).lower()
+            operations = {
+                'start': session.start, 'stop': session.stop,
+                'enable': session.enable, 'disable': session.disable,
+                'capture_open': session.capture_open,
+                'capture_close': session.capture_close,
+            }
+            if command == 'jog_motor_degrees':
+                session.jog_motor_degrees(request['delta_deg'])
+            elif command == 'validate':
+                session.validate()
+            elif command == 'save':
+                session.save(self.get_parameter('tool_profile_file').value)
+                self._reload_spur_profile()
+            elif command in operations:
+                operations[command]()
+            else:
+                raise ValueError(f'unsupported calibration command {command!r}')
+        except Exception as exc:
+            self.get_logger().warn(f'calibration command rejected: {exc}')
+
+    def _reload_spur_profile(self):
+        """Reload only an explicitly saved ID5 profile, then revalidate FSM."""
+        if self.tool_type != 'spur_1motor_gripper':
+            raise RuntimeError('only spur ID5 profile may be reloaded here')
+        profiles = load_profiles(self.get_parameter('tool_profile_file').value)
+        manager = ToolManager(
+            profiles, ParameterToolIdentityProvider(self.tool_type),
+            mock_mode=self.mock_mode)
+        selection = manager.refresh('IDLE')
+        if selection.profile.get('actuator_ids') != [5]:
+            raise RuntimeError('saved spur profile actuator allowlist is not [5]')
+        self.tool_manager = manager
+        self.tool_selection = selection
+        self.tool_profile = selection.profile
+        self.tool_ids = [5]
+        self.tool_motion_allowed = selection.valid
+        self.tool_fsm = self.tool_manager.create_fsm(self)
+        state = self.tool_fsm.startup()
+        if state.name != 'READY':
+            raise RuntimeError(f'saved profile did not produce READY: {state.name}')
+        self.calibration_session.profile = dict(self.tool_profile)
+
+    def _manual_recovery_id_allowed(self, dxl_id):
+        if (self.tool_type != 'dual_motor_gripper' or self.tool_ids != [3, 4]
+                or int(dxl_id) not in (3, 4)):
+            raise ValueError('manual recovery actuator is outside dual allowlist')
+
+    def read_dual_calibration_state(self):
+        """Fresh actual state for capture/validation; never cached GUI data."""
+        if (self.tool_type != 'dual_motor_gripper' or self.tool_ids != [3, 4]
+                or self.control_scope != 'END_EFFECTOR_ONLY'):
+            raise RuntimeError('dual calibration is restricted to IDs [3, 4]')
+        state = {}
+        with self._bus_lock:
+            for dxl_id in self.tool_ids:
+                state[dxl_id] = {
+                    'position': self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        'dual calibration present position', signed=True),
+                    'torque': self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        'dual calibration torque'),
+                    'hardware_error': self._read_register(
+                        dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                        'dual calibration hardware error'),
+                    'model': self._read_register(
+                        dxl_id, 0, 2, 'dual calibration model'),
+                }
+        return state
+
+    def dual_calibration_jog(self, dxl_id, delta_deg):
+        session = self.dual_calibration_session
+        if session is None or not session.active:
+            raise RuntimeError('dual calibration session is not active')
+        return self.dual_manual_recovery.jog(
+            dxl_id, delta_deg, allowed_degrees=session.ALLOWED_DEGREES,
+            goal_writer=self.dual_calibration_goal_position)
+
+    def read_manual_position(self, dxl_id):
+        self._manual_recovery_id_allowed(dxl_id)
+        return self._read_register(
+            dxl_id, ADDR_PRESENT_POSITION, 4,
+            'manual recovery present position', signed=True)
+
+    def read_manual_torque(self, dxl_id):
+        self._manual_recovery_id_allowed(dxl_id)
+        return self._read_register(
+            dxl_id, ADDR_TORQUE_ENABLE, 1, 'manual recovery torque')
+
+    def read_manual_hardware_error(self, dxl_id):
+        self._manual_recovery_id_allowed(dxl_id)
+        return self._read_register(
+            dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+            'manual recovery hardware error')
+
+    def manual_goal_position(self, dxl_id, tick):
+        self._manual_recovery_id_allowed(dxl_id)
+        if self.read_only:
+            raise RuntimeError('read-only bridge rejects manual recovery goal')
+        endpoint = (self.tool_profile.get('motor_endpoints') or {}).get(
+            int(dxl_id), (self.tool_profile.get('motor_endpoints') or {}).get(
+                str(dxl_id)))
+        if not endpoint:
+            raise RuntimeError(f'missing manual recovery endpoint for ID {dxl_id}')
+        low, high = sorted((int(endpoint['open']), int(endpoint['close'])))
+        current = self.read_manual_position(dxl_id)
+        tick = int(tick)
+        # A motor that is already outside its calibrated span may only move
+        # inward.  Once in range, every recovery target must remain in range.
+        if ((current < low and not current < tick <= high)
+                or (current > high and not low <= tick < current)
+                or (low <= current <= high and not low <= tick <= high)):
+            raise RuntimeError(
+                f'ID{dxl_id} recovery target {tick} is not inward/in-range '
+                f'for [{low}, {high}] from current {current}')
+        self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
+                             tick & 0xffffffff,
+                             'manual recovery goal position')
+
+    def dual_calibration_goal_position(self, dxl_id, tick):
+        """One witnessed calibration click: selected ID only, no old endpoints.
+
+        Existing endpoint normalization is deliberately not an ingress gate
+        here.  Its purpose is to calibrate a mechanism whose old endpoints no
+        longer describe reality; the normal OPEN/CLOSE paths retain that gate.
+        """
+        self._manual_recovery_id_allowed(dxl_id)
+        session = self.dual_calibration_session
+        if self.read_only or session is None or not session.active:
+            raise RuntimeError('dual calibration relative goal is unavailable')
+        self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
+                             int(tick) & 0xffffffff,
+                             'dual calibration relative goal position')
 
     def _check_gripper_in_calibrated_range(self, dxl_id):
         """그리퍼가 캘리브 tick 범위 **밖**에 있으면 크게 경고한다.
@@ -1001,6 +1418,71 @@ class MoveItDynamixelBridge(Node):
             raise RuntimeError(
                 f"ID {dxl_id} {label} write failed: result={result}, error={error}")
 
+    # Narrow hardware API for tool FSMs.  These methods contain no endpoint or
+    # OPEN/CLOSE policy; allowlist enforcement lives at this boundary.
+    def set_allowlist(self, actuator_ids):
+        ids = tuple(int(item) for item in actuator_ids)
+        if set(ids) - set(self.tool_ids):
+            raise ValueError('tool FSM requested actuator outside selected profile')
+        self._fsm_allowlist = set(ids)
+
+    def _fsm_id_allowed(self, dxl_id):
+        if int(dxl_id) not in getattr(self, '_fsm_allowlist', set()):
+            raise ValueError(f'FSM actuator ID {dxl_id} is not allowlisted')
+
+    def read_position(self, dxl_id):
+        self._fsm_id_allowed(dxl_id)
+        if self.mock_mode:
+            return self._tool_samples.get(int(dxl_id), {}).get('position')
+        return self._read_register(dxl_id, ADDR_PRESENT_POSITION, 4,
+                                   'FSM present position', signed=True)
+
+    def read_torque(self, dxl_id):
+        self._fsm_id_allowed(dxl_id)
+        if self.mock_mode:
+            return int(self._tool_samples.get(int(dxl_id), {}).get(
+                'torque_state') == 'ON')
+        return self._read_register(dxl_id, ADDR_TORQUE_ENABLE, 1, 'FSM torque')
+
+    def read_hardware_error(self, dxl_id):
+        self._fsm_id_allowed(dxl_id)
+        if self.mock_mode:
+            return int(self._tool_samples.get(int(dxl_id), {}).get(
+                'hardware_error', 0) or 0)
+        return self._read_register(dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                   'FSM hardware error')
+
+    def read_model(self, dxl_id):
+        self._fsm_id_allowed(dxl_id)
+        if self.mock_mode:
+            return self._tool_samples.get(int(dxl_id), {}).get('model')
+        model, result, error = self.packet_handler.ping(self.port_handler, dxl_id)
+        if result != 0 or error != 0:
+            raise RuntimeError(f'ID {dxl_id} model read failed')
+        return model
+
+    def goal_position(self, dxl_id, tick):
+        self._fsm_id_allowed(dxl_id)
+        if self.read_only:
+            raise RuntimeError('read-only bridge rejects goal write')
+        if self.mock_mode:
+            self._tool_samples[int(dxl_id)]['position'] = int(tick)
+            return
+        self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
+                             int(tick) & 0xffffffff, 'FSM goal position')
+
+    def set_torque(self, dxl_id, enabled):
+        self._fsm_id_allowed(dxl_id)
+        if self.read_only:
+            raise RuntimeError('read-only bridge rejects torque write')
+        if self.mock_mode:
+            self._tool_samples[int(dxl_id)]['torque_state'] = (
+                'ON' if enabled else 'OFF')
+            return
+        self._write_register(dxl_id, ADDR_TORQUE_ENABLE, 1,
+                             TORQUE_ENABLE if enabled else TORQUE_DISABLE,
+                             'FSM torque')
+
     def _discover_tool_ids(self):
         """Ping every configured actuator; any missing ID closes the backend."""
         if not self.tool_ids:
@@ -1078,6 +1560,18 @@ class MoveItDynamixelBridge(Node):
             return
         self.control_mode = mode
 
+    def _on_control_mode_request(self, msg):
+        """Echo ownership requests; this is ROS state only, never a motor write."""
+        self._on_control_mode(msg)
+        self.control_mode_status_pub.publish(String(data=self.control_mode))
+
+    def _publish_tool_status_safely(self):
+        """Keep a status serialization fault from silently stopping updates."""
+        try:
+            self.publish_tool_status()
+        except Exception as exc:  # pragma: no cover - hardware/runtime guard
+            self.get_logger().error(f'/tool/status publish failed: {exc}')
+
     def publish_tool_status(self):
         self.tool_type_pub.publish(String(data=self.tool_type))
         reason = ''
@@ -1089,6 +1583,10 @@ class MoveItDynamixelBridge(Node):
             reason = 'actuator not discovered'
         elif self.read_only:
             reason = 'read-only diagnostic mode'
+        id5 = self._tool_samples.get(5, {})
+        fsm_fault = (self.tool_fsm.fault_reason
+                     if self.tool_fsm and self.tool_fsm.state.name == 'FAULT'
+                     else None)
         status = {
             'control_scope': self.control_scope,
             'tool_type': self.tool_type,
@@ -1097,6 +1595,13 @@ class MoveItDynamixelBridge(Node):
             'calibrated': bool(self.tool_profile.get('calibrated')),
             'temporary_jog_mode': self.temporary_jog_enabled,
             'temporary_jog_ready': self._tool_backend_ready(),
+            'tool_enable_allowed': self._tool_enable_allowed(),
+            # This is a register observation, never the bridge's ownership
+            # bookkeeping.  UNKNOWN stays distinct from OFF in the GUI.
+            'tool_torque_state': self._tool_samples.get(5, {}).get('torque_state',
+                                                                     'UNKNOWN'),
+            'tool_torque_enabled': self._tool_samples.get(5, {}).get(
+                'torque_state') == 'ON',
             'actuators_discovered': self.tool_discovered,
             'motion_allowed': self._tool_backend_ready(),
             'read_only': self.read_only, 'mock_mode': self.mock_mode,
@@ -1110,6 +1615,24 @@ class MoveItDynamixelBridge(Node):
                 'effort': 0.0 if self.mock_mode else None,
                 'online': self.mock_mode}) for dxl_id in self.tool_ids],
             'reason': reason,
+            'calibration_jog_enabled': bool(self.calibration_session),
+            'calibration': (self.calibration_session.snapshot()
+                            if self.calibration_session else None),
+            'dual_calibration': (self.dual_calibration_session.snapshot()
+                                 if self.dual_calibration_session else None),
+            'fsm_state': (self.tool_fsm.state.name if self.tool_fsm else
+                          (self.dual_calibration_session.state
+                           if self.dual_calibration_session else None)),
+            # Flat ID5 fields are retained alongside the older actuator list
+            # so a GUI can safely render a read-only single-motor diagnosis.
+            'actuator_id': 5 if self.tool_ids == [5] else None,
+            'online': id5.get('online'),
+            'position': id5.get('position'),
+            'torque_enabled': ({'ON': True, 'OFF': False}.get(
+                id5.get('torque_state'))),
+            'hardware_error': id5.get('hardware_error'),
+            'model': id5.get('model'),
+            'fault': fsm_fault,
         }
         self.tool_status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
 
@@ -1123,6 +1646,38 @@ class MoveItDynamixelBridge(Node):
             for dxl_id in self.tool_ids)
 
     def _tool_backend_ready(self):
+        if self.tool_type == 'spur_1motor_gripper' and self.tool_ids == [5]:
+            return bool(
+                self._tool_enable_allowed()
+                and self._tool_samples.get(5, {}).get('online')
+                and self._tool_samples.get(5, {}).get('torque_state') == 'ON')
+        dual_ready = (self.dual_calibration_session is None
+                      or self.dual_calibration_session.is_ready)
+        return bool(
+            self._tool_enable_allowed()
+            and set(self.tool_ids).issubset(self.torque_enabled_ids)
+            and dual_ready)
+
+    def _calibration_motion_ready(self):
+        """Fail closed unless ID5 is already safely configured by the operator.
+
+        No torque/mode/profile write is made here.  The velocity and
+        acceleration registers must already hold the conservative values.
+        """
+        sample = self._tool_samples.get(5, {})
+        return bool(
+            self.calibration_jog_enabled and not self.read_only
+            and self.tool_ids == [5] and self.tool_discovered
+            and sample.get('online') and sample.get('torque_state') == 'ON'
+            and sample.get('operating_mode') == MODE_POSITION
+            and sample.get('profile_velocity') is not None
+            and sample.get('profile_acceleration') is not None
+            and 0 < sample['profile_velocity'] <= 5
+            and 0 < sample['profile_acceleration'] <= 1
+            and not self.emergency_stop_active and not self.tool_detached)
+
+    def _tool_enable_allowed(self):
+        """Safety gate for explicit torque enable; does not require torque yet."""
         if self.mock_mode:
             return True
         profile_ready = bool(self.tool_selection and self.tool_selection.valid
@@ -1138,15 +1693,44 @@ class MoveItDynamixelBridge(Node):
             and not self.emergency_stop_active and not self.tool_detached)
 
     def _configure_temporary_jog_actuator(self):
+        """Register only ID 5 for a guarded, torque-off bench session."""
         if self.tool_ids != [5]:
             self.tool_motion_allowed = False
             return
         dxl_id = self.tool_ids[0]
-        if self._enable_torque(dxl_id, 'spur temporary jog'):
-            self.group_sync_read.addParam(dxl_id)
-            self.active_ids.add(dxl_id)
-        else:
+        if (self.temporary_jog_profile_velocity <= 0
+                or self.temporary_jog_profile_acceleration <= 0):
             self.tool_motion_allowed = False
+            self.get_logger().error('temporary jog profile must be positive')
+            return
+        with self._bus_lock:
+            # Operating-mode/profile writes require torque OFF.  Do not call
+            # _enable_torque here: activation must be a deliberate GUI action.
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+            mode_result, mode_error = self.packet_handler.write1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_OPERATING_MODE, 3)
+            if mode_result != 0 or mode_error != 0:
+                self.tool_motion_allowed = False
+                self.get_logger().error('temporary jog position-mode setup failed')
+                return
+            for address, value in (
+                    (ADDR_PROFILE_ACCELERATION,
+                     self.temporary_jog_profile_acceleration),
+                    (ADDR_PROFILE_VELOCITY,
+                     self.temporary_jog_profile_velocity)):
+                result, error = self.packet_handler.write4ByteTxRx(
+                    self.port_handler, dxl_id, address, value)
+                if result != 0 or error != 0:
+                    self.tool_motion_allowed = False
+                    self.get_logger().error('temporary jog profile setup failed')
+                    return
+        self.group_sync_read.addParam(dxl_id)
+        self.active_ids.add(dxl_id)
+        self.torque_enabled_ids.discard(dxl_id)
+        self.get_logger().info(
+            'spur temporary jog ready: ID 5 is torque-disabled; '
+            'use the GUI Enable button before sending a goal')
 
     def _configure_cleaning_actuator(self):
         """Dynamixel Protocol 2.0 velocity mode(Operating Mode=1)로 설정한다."""
@@ -1265,16 +1849,6 @@ class MoveItDynamixelBridge(Node):
         return self.end_effector_kind == "gripper" \
             and self._gripper_commands_allowed()
 
-    def gripper_goal_callback(self, goal_request):
-        """모드와 끝점의 시운전이 끝날 때까지 그리퍼 동작을 거부한다."""
-        if (getattr(self, "gripper_disabled", False)
-                or self.end_effector_kind != "gripper" or self.read_only
-                or not self._gripper_commands_allowed()):
-            self.get_logger().warn(
-                "Rejecting gripper goal: command calibration/mode gate closed")
-            return GoalResponse.REJECT
-        return self.goal_callback(goal_request)
-
     def rotate_goal_callback(self, goal_request):
         """선택한 단일축 회전 프리셋에 대해서만 회전을 수락한다."""
         if (self.read_only or self.end_effector_kind != "rotary"
@@ -1385,15 +1959,31 @@ class MoveItDynamixelBridge(Node):
         return CancelResponse.ACCEPT
 
     def gripper_goal_callback(self, goal_request):
+        if self.tool_type == 'spur_1motor_gripper':
+            self.get_logger().warn(
+                'spur gripper action rejected: use the FSM or CalibrationSession ingress')
+            return GoalResponse.REJECT
         if self.tool_profile.get('backend') != 'gripper':
             self.get_logger().error('gripper goal rejected: selected tool is not a gripper')
             return GoalResponse.REJECT
-        if (not self.mock_mode and
-                (self.control_mode != 'MANUAL' or not self._tool_backend_ready())):
+        ready = (self._calibration_motion_ready()
+                 if self.calibration_jog_enabled else self._tool_backend_ready())
+        if self.control_mode != 'MANUAL' or not ready:
             self.get_logger().error(
                 'gripper goal rejected: MANUAL ownership or tool backend '
                 'interlock not ready')
             return GoalResponse.REJECT
+        if self.tool_type == 'dual_motor_gripper':
+            try:
+                _fractions, spread = self._dual_normalized_spread()
+            except RuntimeError as exc:
+                self.get_logger().error(
+                    f'gripper goal rejected: cannot verify dual spread: {exc}')
+                return GoalResponse.REJECT
+            if spread > 0.05:
+                self.get_logger().error(
+                    f'gripper goal rejected: normalized spread {spread:.4f} > 0.0500')
+                return GoalResponse.REJECT
         with self._gripper_goal_lock:
             if self._gripper_goal_active:
                 self.get_logger().warn(
@@ -1424,12 +2014,37 @@ class MoveItDynamixelBridge(Node):
             goal_handle.abort()
             return result
         if self.mock_mode:
+            if self.temporary_jog_enabled:
+                target = int(round(trajectory.points[-1].positions[0]))
+                if not (self.temporary_jog_safe_min <= target
+                        <= self.temporary_jog_safe_max):
+                    result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+                    result.error_string = 'mock target outside temporary jog range'
+                    goal_handle.abort()
+                    return result
+                self._tool_samples[self.tool_ids[0]]['position'] = target
             result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
             result.error_string = 'mock gripper action'
             goal_handle.succeed()
             return result
         position = float(trajectory.points[-1].positions[0])
-        if self.temporary_jog_enabled:
+        if self.calibration_jog_enabled:
+            target = int(round(position))
+            if len(self.calibration_endpoints) == 2:
+                if target not in self.calibration_endpoints.values():
+                    result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+                    result.error_string = 'target is not a captured ID5 endpoint'
+                    goal_handle.abort()
+                    return result
+            else:
+                current = self._tool_samples.get(5, {}).get('position')
+                if current is None or abs(target - int(current)) > self.calibration_max_jog_ticks:
+                    result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+                    result.error_string = 'calibration jog exceeds one-click limit'
+                    goal_handle.abort()
+                    return result
+            targets = {5: target}
+        elif self.temporary_jog_enabled:
             target = int(round(position))
             if not (self.temporary_jog_safe_min <= target
                     <= self.temporary_jog_safe_max):
@@ -1444,12 +2059,12 @@ class MoveItDynamixelBridge(Node):
             targets = {self.tool_ids[0]: target}
         else:
             targets = None
-        open_pos = (1.0 if self.temporary_jog_enabled else
+        open_pos = (1.0 if (self.temporary_jog_enabled or self.calibration_jog_enabled) else
                     float(self.tool_profile.get('open_position', 1.0)))
-        close_pos = (0.0 if self.temporary_jog_enabled else
+        close_pos = (0.0 if (self.temporary_jog_enabled or self.calibration_jog_enabled) else
                      float(self.tool_profile.get('close_position', 0.0)))
         denominator = open_pos - close_pos
-        if self.temporary_jog_enabled:
+        if self.temporary_jog_enabled or self.calibration_jog_enabled:
             denominator = 1.0
         if denominator == 0.0:
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
@@ -1461,7 +2076,10 @@ class MoveItDynamixelBridge(Node):
             self.tool_ids[0]: {
                 'open': self.tool_profile['open_tick'],
                 'close': self.tool_profile['close_tick']}}
-        if self.temporary_jog_enabled:
+        if self.calibration_jog_enabled:
+            low, high = sorted(self.calibration_endpoints.values()) if len(
+                self.calibration_endpoints) == 2 else (0, 4095)
+        elif self.temporary_jog_enabled:
             low, high = self.temporary_jog_safe_min, self.temporary_jog_safe_max
         else:
             low = int(self.tool_profile['safe_min_tick'])
@@ -1470,7 +2088,7 @@ class MoveItDynamixelBridge(Node):
         try:
             with self._bus_lock:
                 for dxl_id in self.tool_ids:
-                    if self.temporary_jog_enabled:
+                    if self.temporary_jog_enabled or self.calibration_jog_enabled:
                         tick = targets[dxl_id]
                     else:
                         ep = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
@@ -1508,6 +2126,13 @@ class MoveItDynamixelBridge(Node):
                             raise RuntimeError(
                                 f'id {dxl_id} effort limit exceeded')
                         errors[dxl_id] = targets[dxl_id] - position
+                    if self.tool_type == 'dual_motor_gripper':
+                        _fractions, spread = self._dual_normalized_spread(
+                            positions={dxl_id: targets[dxl_id] - errors[dxl_id]
+                                       for dxl_id in self.tool_ids})
+                        if spread > 0.05:
+                            raise RuntimeError(
+                                f'normalized spread {spread:.4f} > 0.0500')
                 if all(abs(error) <= self.gripper_target_tolerance
                        for error in errors.values()):
                     result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
@@ -1537,8 +2162,41 @@ class MoveItDynamixelBridge(Node):
             self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
         if (comm != 0 or error != 0 or load_comm != 0 or load_error != 0
                 or pos_comm != 0 or pos_error != 0 or hw != 0):
-            raise RuntimeError(f'fault reading id {dxl_id}')
+            raise RuntimeError(
+                f'fault reading id {dxl_id}: hw={hw}, '
+                f'comm/error={(comm, error)}, '
+                f'load={(load_comm, load_error)}, '
+                f'position={(pos_comm, pos_error)}')
         return self._tool_position_tick(dxl_id, position), to_signed(load, 2)
+
+    def _dual_normalized_spread(self, positions=None):
+        """Return fresh dual normalized progress and its strict spread limit.
+
+        Motor endpoint signs/directions are encoded in the validated profile,
+        so this works for mirrored pinions without assuming tick ordering.
+        """
+        if self.tool_type != 'dual_motor_gripper' or self.tool_ids != [3, 4]:
+            raise RuntimeError('dual normalized spread requested outside IDs [3, 4]')
+        endpoints = self.tool_profile.get('motor_endpoints') or {}
+        if positions is None:
+            # Goal callbacks run independently of the feedback timer.  Keep
+            # the three direct reads per motor serialized with SyncRead so a
+            # spread safety check cannot manufacture a serial collision.
+            with self._bus_lock:
+                positions = {
+                    dxl_id: self._read_tool_state(dxl_id)[0]
+                    for dxl_id in self.tool_ids}
+        fractions = {}
+        for dxl_id in self.tool_ids:
+            endpoint = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
+            if not endpoint:
+                raise RuntimeError(f'missing dual endpoint for ID {dxl_id}')
+            span = int(endpoint['open']) - int(endpoint['close'])
+            if span == 0:
+                raise RuntimeError(f'zero dual endpoint span for ID {dxl_id}')
+            fractions[dxl_id] = (
+                (float(positions[dxl_id]) - int(endpoint['close'])) / span)
+        return fractions, max(fractions.values()) - min(fractions.values())
 
     def _hold_tool_position(self):
         with self._bus_lock:
@@ -1668,61 +2326,6 @@ class MoveItDynamixelBridge(Node):
 
         self.group_sync_write.clearParam()
 
-    # ------------------------------------------------------------------ gripper
-    def execute_gripper(self, goal_handle):
-        trajectory = goal_handle.request.trajectory
-
-        result = FollowJointTrajectory.Result()
-
-        if not self.gripper_ids:
-            self.get_logger().warn("Gripper goal received but gripper_ids is empty — ignored")
-            goal_handle.succeed()
-            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
-            return result
-
-        if trajectory.points:
-            point = trajectory.points[-1]
-            name_to_pos = dict(zip(trajectory.joint_names, point.positions))
-            # 단일 구동 조인트(gripper_left_pinion_joint)만 사용 — 나머지 3개(우 피니언·좌우 랙)는
-            # URDF <mimic> 으로 종속된다. 두 서보(id 3,4)에는 같은 goal_tick 을 보낸다.
-            target_rad = None
-            for jn in self.gripper_joints:
-                if jn in name_to_pos:
-                    target_rad = name_to_pos[jn]
-                    break
-            if target_rad is not None:
-                self._write_gripper(target_rad)
-            else:
-                self.get_logger().warn(
-                    f"Gripper goal has no known finger joint {self.gripper_joints}"
-                )
-
-        goal_handle.succeed()
-        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
-        result.error_string = "Gripper command sent to Dynamixel"
-        return result
-
-    def _write_gripper(self, rad):
-        if self.read_only:
-            self.get_logger().warn("Read-only mode: ignoring gripper command")
-            return
-        goal_tick = self.gripper_pos_to_tick(rad)
-        # Overload 재부팅 뒤 되걸 목표. REBOOT 은 Goal Position 도 날리므로 마지막
-        # 명령을 기억해 두지 않으면 되살아난 그리퍼가 **아무것도 안 쥔 채로** 선다.
-        self._last_gripper_goal_tick = goal_tick
-        for gid in self.gripper_ids:
-            result, error = self.packet_handler.write4ByteTxRx(
-                self.port_handler, gid, ADDR_GOAL_POSITION, goal_tick
-            )
-            if result != 0 or error != 0:
-                self.get_logger().warn(
-                    f"Gripper write failed: id={gid}, result={result}, error={error}"
-                )
-        self.get_logger().info(
-            f"gripper -> {rad:.4f} rad -> tick {goal_tick} "
-            f"(ids {self.gripper_ids})"
-        )
-
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
         if self.mock_mode:
@@ -1786,75 +2389,107 @@ class MoveItDynamixelBridge(Node):
                 msg.position.append(float(to_signed(tick, LEN_PRESENT_POSITION)))
                 msg.effort.append(float(load_raw))
 
-        if self.tool_profile.get('backend') == 'gripper':
+        # The spur tool has exactly one feedback topology.  Do not fall through
+        # to the legacy rack/pinion aggregation below: that path assumes the
+        # ID3/ID4 pair and manufactures a controller fault when those IDs are
+        # intentionally absent from an ID5-only process.
+        if self.tool_ids == [5]:
             joint_names = self.tool_profile.get('joint_names', [])
-            loads = []
-            positions = []
-            for dxl_id in self.tool_ids:
-                if dxl_id not in self.active_ids:
-                    fault = True
-                    self._tool_samples[dxl_id] = {
-                        'id': dxl_id, 'joint': '', 'position': None,
-                        'effort': None, 'online': False}
-                    continue
+            dxl_id = 5
+            if dxl_id not in self.active_ids:
+                fault = True
+                self._tool_samples[dxl_id] = {
+                    'id': dxl_id, 'joint': joint_names[0] if joint_names else '',
+                    'position': None, 'effort': None, 'online': False,
+                    'hardware_error': None, 'torque_state': 'UNKNOWN',
+                    'operating_mode': None, 'profile_velocity': None,
+                    'profile_acceleration': None}
+            else:
                 sample = self._read_sample(dxl_id)
                 if sample is None:
                     fault = True
                     self._tool_samples[dxl_id] = {
-                        'id': dxl_id, 'joint': '', 'position': None,
-                        'effort': None, 'online': False}
-                    continue
-                feedback_raw, tick, hw_error, velocity_raw = sample
-                if hw_error != 0:
-                    fault = True
-                # Extended Position 축은 tick 이 4095 를 넘고 음수로도 내려가므로
-                # 부호 있는 정수로 해석해야 한다 — 안 하면 다회전 축이 한 바퀴 넘는
-                # 순간 위치가 갑자기 +2^32 쪽으로 튄다.
-                signed_tick = to_signed(tick, LEN_PRESENT_POSITION)
-                msg.name.append(joint_name)
-                msg.position.append(self.tick_to_rad(joint_name, signed_tick))
-                # 속도도 위치와 같은 관절 도메인으로 맞춘다 — 기어비만큼 관절이 느리다.
-                msg.velocity.append(
-                    velocity_raw * VELOCITY_LSB_TO_RAD_S
-                    / (config["direction"] * self._joint_gear_ratio(joint_name))
-                )
-                msg.effort.append(float(feedback_raw))
+                        'id': dxl_id, 'joint': joint_names[0] if joint_names else '',
+                        'position': None, 'effort': None, 'online': False,
+                        'hardware_error': None, 'torque_state': 'UNKNOWN',
+                        'operating_mode': None, 'profile_velocity': None,
+                        'profile_acceleration': None}
+                else:
+                    load_raw, tick, hw_error = sample
+                    control = self._read_tool_control_state(dxl_id)
+                    fault = fault or hw_error != 0
+                    self._tool_samples[dxl_id] = {
+                        'id': dxl_id,
+                        'joint': joint_names[0] if joint_names else '',
+                        'position': self._tool_position_tick(dxl_id, tick),
+                        'effort': float(load_raw), 'online': hw_error == 0,
+                        'hardware_error': int(hw_error),
+                        # Model identity is obtained by the startup ping and
+                        # remains valid across periodic position reads.
+                        'model': self._tool_samples.get(dxl_id, {}).get('model'),
+                        **control}
 
-        # XL430-W250 그리퍼: 주소 126은 signed Present Load(0.1% 추정 부하)다.
+        # Legacy dual-gripper feedback is deliberately isolated from ID5.  It
+        # retains the existing ID3/ID4 tuple aggregation for the dual profile.
+        # XL430-W250 그리퍼: 주소 126은 signed Present Load(0.1% 추정 부하다).
         # 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 논리 조인트(gripper_left_pinion_joint)로
         # 보고한다 — position(rad)=대표(첫 응답) 모터 tick, effort=가장 큰 abs(load).
         # 한 모터라도 부하가 크면 파지로 보는 보수적(안전 측) 집계이며, FSM 이 이 effort 로
         # 파지/DROP 을 판정한다.
-        gripper_samples = []
-        for gid in self.gripper_ids:
-            if gid not in self.active_ids:
-                fault = True
-                continue
-            sample = self._read_sample(gid)
-            if sample is None:
-                fault = True
-                continue
-            load_raw, tick, hw_error, velocity_raw = sample
-            if hw_error != 0:
-                fault = True
-            # Overload(0x20) 는 파지 중 가장 흔한 트립이고, 나면 REBOOT 전까지 서보가
-            # 죽어 있다. 자동 복구를 켜 뒀으면 여기서 되살린다.
-            if (hw_error & HWERR_OVERLOAD) and self.gripper_overload_reboot \
-                    and not self._gripper_recovering and not self.read_only:
-                self._recover_gripper_overload(gid)
-            gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
+        if self.tool_type == 'dual_motor_gripper':
+            gripper_samples = []
+            for gid in self.gripper_ids:
+                if gid not in self.active_ids:
+                    fault = True
+                    continue
+                sample = self._read_sample(gid)
+                if sample is None:
+                    fault = True
+                    continue
+                load_raw, tick, hw_error = sample
+                velocity_raw = 0
+                if hw_error != 0:
+                    fault = True
+                # Overload(0x20) 는 파지 중 가장 흔한 트립이고, 나면 REBOOT 전까지 서보가
+                # 죽어 있다. 자동 복구를 켜 뒀으면 여기서 되살린다.
+                if (hw_error & HWERR_OVERLOAD) and self.gripper_overload_reboot \
+                        and not self._gripper_recovering and not self.read_only:
+                    self._recover_gripper_overload(gid)
+                control = self._read_tool_control_state(gid)
+                self._tool_samples[gid] = {
+                    'id': gid,
+                    'joint': self.gripper_joints[0] if self.gripper_joints else '',
+                    'position': self._tool_position_tick(gid, tick),
+                    'effort': float(load_raw), 'online': hw_error == 0,
+                    'hardware_error': int(hw_error), **control}
+                gripper_samples.append(
+                    (load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
 
-        if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
-            representative_tick = gripper_samples[0][1]
-            representative_velocity_raw = gripper_samples[0][2]
-            max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
-            finger_rad = self.gripper_tick_to_pos(representative_tick)
-            finger_vel = self.gripper_velocity_to_rad_s(representative_velocity_raw)
-            for jn in self.gripper_joints:
-                msg.name.append(jn)
-                msg.position.append(finger_rad)
-                msg.velocity.append(finger_vel)
-                msg.effort.append(float(max_abs_load))
+            if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
+                representative_tick = gripper_samples[0][1]
+                max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
+                # Dual geometry remains profile-driven.  ID3 is the legacy
+                # representative feedback motor; do not reuse any spur-ID5
+                # conversion or manufacture a calibration endpoint here.
+                endpoints = self.tool_profile.get('motor_endpoints') or {}
+                endpoint = endpoints.get(3, endpoints.get('3'))
+                if not endpoint or endpoint['open'] == endpoint['close']:
+                    raise RuntimeError('dual gripper representative endpoint missing')
+                close_position = float(self.tool_profile['close_position'])
+                open_position = float(self.tool_profile['open_position'])
+                fraction = ((representative_tick - endpoint['close']) /
+                            (endpoint['open'] - endpoint['close']))
+                finger_rad = close_position + fraction * (
+                    open_position - close_position)
+                # PRESENT_VELOCITY is not currently extracted from the
+                # SyncRead tuple, so publish an explicit zero rather than
+                # calling the removed legacy conversion helper.
+                finger_vel = 0.0
+                for jn in self.gripper_joints:
+                    msg.name.append(jn)
+                    msg.position.append(finger_rad)
+                    msg.velocity.append(finger_vel)
+                    msg.effort.append(float(max_abs_load))
 
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=fault))
@@ -1888,8 +2523,41 @@ class MoveItDynamixelBridge(Node):
                 dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION)
         return feedback_raw, tick, hw_error
 
+    def _read_tool_control_state(self, dxl_id):
+        """Read-only control-table observation for the selected tool only."""
+        if dxl_id not in self.tool_ids:
+            return {'torque_state': 'UNKNOWN', 'operating_mode': None,
+                    'profile_velocity': None, 'profile_acceleration': None}
+        with self._bus_lock:
+            torque, tr, te = self.packet_handler.read1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE)
+            if dxl_id != 5:
+                return {
+                    'torque_state': ('ON' if torque == 1 else 'OFF')
+                    if tr == 0 and te == 0 else 'UNKNOWN',
+                    'operating_mode': None, 'profile_velocity': None,
+                    'profile_acceleration': None}
+            mode, mr, me = self.packet_handler.read1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+            accel, ar, ae = self.packet_handler.read4ByteTxRx(
+                self.port_handler, dxl_id, ADDR_PROFILE_ACCELERATION)
+            velocity, vr, ve = self.packet_handler.read4ByteTxRx(
+                self.port_handler, dxl_id, ADDR_PROFILE_VELOCITY)
+        return {
+            'torque_state': ('ON' if torque == 1 else 'OFF')
+                if tr == 0 and te == 0 else 'UNKNOWN',
+            'operating_mode': int(mode) if mr == 0 and me == 0 else None,
+            'profile_acceleration': int(accel) if ar == 0 and ae == 0 else None,
+            'profile_velocity': int(velocity) if vr == 0 and ve == 0 else None,
+        }
+
     def destroy_node(self):
-        if not self.read_only and not self.mock_mode:
+        # A calibration-monitor window must not change the pre-existing torque
+        # state merely because the GUI is closed.  Explicit STOP/DISABLE and
+        # E-stop still call _stop_tool while it is running.
+        if (not self.read_only and not self.mock_mode
+                and not self.calibration_jog_enabled
+                and self.tool_profile.get('backend') != 'gripper'):
             self._stop_tool('node shutdown')
             if self.cleaning_configured:
                 self.packet_handler.write4ByteTxRx(

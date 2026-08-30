@@ -71,11 +71,17 @@ def validate_profile(tool_type, profile, mock_mode=False):
             not isinstance(item, int) or not 0 <= item <= 252 for item in ids):
         errors.append('actuator_ids must contain unique IDs in [0,252]')
     if expected_backend == 'gripper':
+        # The single-motor FSM uses endpoint motion only.  Contact/load
+        # thresholds belong to a separate grasp calibration and must not make
+        # an operator invent values just to save a witnessed endpoint pair.
         required = (
             'open_tick', 'close_tick', 'safe_min_tick', 'safe_max_tick',
-            'profile_velocity', 'profile_acceleration', 'no_load_effort',
-            'grasp_effort', 'grasp_threshold', 'release_drop_threshold',
-            'action_time', 'direction')
+            'direction')
+        if tool_type != 'spur_1motor_gripper':
+            required += (
+                'profile_velocity', 'profile_acceleration', 'no_load_effort',
+                'grasp_effort', 'grasp_threshold', 'release_drop_threshold',
+                'action_time')
         for key in required:
             if profile.get(key) is None:
                 errors.append(f'{key} is required')
@@ -95,15 +101,19 @@ def validate_profile(tool_type, profile, mock_mode=False):
                     errors.append(f'actuator {dxl_id} endpoint outside safe range')
             if profile['direction'] not in (-1, 1):
                 errors.append('direction must be -1 or 1')
-            if profile['profile_velocity'] <= 0:
+            if (tool_type != 'spur_1motor_gripper'
+                    and profile['profile_velocity'] <= 0):
                 errors.append('profile_velocity must be positive')
-            if profile['profile_acceleration'] <= 0:
+            if (tool_type != 'spur_1motor_gripper'
+                    and profile['profile_acceleration'] <= 0):
                 errors.append('profile_acceleration must be positive')
-            if not (profile['no_load_effort'] < profile['grasp_threshold']
-                    <= profile['grasp_effort']):
+            if (tool_type != 'spur_1motor_gripper' and not (
+                    profile['no_load_effort'] < profile['grasp_threshold']
+                    <= profile['grasp_effort'])):
                 errors.append('grasp threshold must separate no-load and grasp')
-            if not (profile['no_load_effort'] <
-                    profile['release_drop_threshold'] < profile['grasp_effort']):
+            if (tool_type != 'spur_1motor_gripper' and not (
+                    profile['no_load_effort'] <
+                    profile['release_drop_threshold'] < profile['grasp_effort'])):
                 errors.append('drop threshold must separate no-load and grasp')
     else:
         if profile.get('direction') not in (-1, 1):

@@ -1,6 +1,5 @@
 """PyQt5 widgets for manual robot validation."""
 
-import shlex
 import time
 
 from PyQt5.QtCore import QProcess, QTimer, Qt
@@ -37,6 +36,23 @@ class ManualMainWindow(QMainWindow):
         self.arm_widgets = {}
         self.gripper_busy = False
         self.gripper_target_ticks = {}
+        self.spur_torque_enabled = False
+        self.spur_torque_state = 'UNKNOWN'
+        self.spur_endpoints = {}
+        self.spur_zero_tick = None
+        self.dual_calibration_buttons = []
+        self.dual_calibration_step = None
+        self.dual_calibration_state = None
+        self.dual_start_calibration = None
+        self.dual_capture_open = None
+        self.dual_capture_close = None
+        self.dual_validate_calibration = None
+        self.dual_save_calibration = None
+        self.dual_capture_label = None
+        # External spur gears reverse rotation.  This is deliberately shown in
+        # the GUI instead of being hidden in a raw-tick jog control.
+        self.spur_output_direction = -1
+        self.spur_gear_ratio = 1.0
         self.temporary_jog_safe_min = getattr(
             self.node, 'temporary_jog_safe_min', 2867)
         self.temporary_jog_safe_max = getattr(
@@ -191,17 +207,94 @@ class ManualMainWindow(QMainWindow):
         self.open_button = QPushButton('OPEN')
         self.close_button = QPushButton('CLOSE')
         self.tool_stop = QPushButton('STOP')
-        self.open_button.clicked.connect(lambda: self.node.command_gripper(
-            float(self.profile.get('open_position', 1.0))))
-        self.close_button.clicked.connect(lambda: self.node.command_gripper(
-            float(self.profile.get('close_position', 0.0))))
-        self.tool_stop.clicked.connect(self.node.stop_gripper)
+        self.open_button.clicked.connect(lambda: self._command_tool('OPEN'))
+        self.close_button.clicked.connect(lambda: self._command_tool('CLOSE'))
+        self.tool_stop.clicked.connect(self._stop_tool)
         row.addWidget(self.open_button)
         row.addWidget(self.close_button)
         row.addWidget(self.tool_stop)
         layout.addLayout(row)
+        self.spur_enable = QPushButton('ENABLE ID5')
+        self.spur_disable = QPushButton('DISABLE ID5')
+        self.spur_enable.clicked.connect(self._enable_spur_motor)
+        self.spur_disable.clicked.connect(self._disable_spur_motor)
+        enable_row = QHBoxLayout()
+        enable_row.addWidget(self.spur_enable)
+        enable_row.addWidget(self.spur_disable)
+        self.dual_enable = QPushButton('ENABLE ID3/ID4')
+        self.dual_disable = QPushButton('DISABLE ID3/ID4')
+        self.dual_enable.clicked.connect(self._enable_dual_motors)
+        self.dual_disable.clicked.connect(self._disable_dual_motors)
+        enable_row.addWidget(self.dual_enable)
+        enable_row.addWidget(self.dual_disable)
+        layout.addLayout(enable_row)
+        self.dual_recovery_buttons = []
+        if self.node.selected_tool == 'dual_motor_gripper':
+            recovery = QGroupBox('MANUAL DUAL MOTOR RECOVERY (one click only)')
+            recovery_layout = QGridLayout(recovery)
+            for row, dxl_id in enumerate((3, 4)):
+                recovery_layout.addWidget(QLabel(f'ID{dxl_id}'), row, 0)
+                for column, delta in enumerate((-0.5, 0.5), 1):
+                    button = QPushButton(f'ID{dxl_id} {delta:+.1f}°')
+                    button.setAutoRepeat(False)
+                    button.clicked.connect(
+                        lambda _checked=False, motor=dxl_id, step=delta:
+                        self._manual_dual_recovery_jog(motor, step))
+                    recovery_layout.addWidget(button, row, column)
+                    self.dual_recovery_buttons.append((dxl_id, button))
+            layout.addWidget(recovery)
+            calibration = QGroupBox('DUAL ENDPOINT CALIBRATION')
+            calibration_layout = QGridLayout(calibration)
+            self.dual_start_calibration = QPushButton('START DUAL CALIBRATION')
+            self.dual_start_calibration.clicked.connect(self._start_dual_calibration)
+            self.dual_calibration_state = QLabel('RECALIBRATION_REQUIRED')
+            calibration_layout.addWidget(self.dual_start_calibration, 0, 0, 1, 2)
+            calibration_layout.addWidget(self.dual_calibration_state, 0, 2, 1, 2)
+            calibration_layout.addWidget(QLabel('Calibration step (motor degree)'), 1, 0, 1, 2)
+            self.dual_calibration_step = QComboBox()
+            self.dual_calibration_step.addItems(['0.5', '1', '2', '5'])
+            calibration_layout.addWidget(self.dual_calibration_step, 1, 2, 1, 2)
+            for row, dxl_id in enumerate((3, 4), 2):
+                calibration_layout.addWidget(QLabel(f'ID{dxl_id}'), row, 0)
+                for column, direction in enumerate((-1.0, 1.0), 1):
+                    button = QPushButton(f'ID{dxl_id} {"−" if direction < 0 else "+"} step')
+                    button.setAutoRepeat(False)
+                    button.clicked.connect(
+                        lambda _checked=False, motor=dxl_id, sign=direction:
+                        self._jog_dual_calibration_motor(motor, sign))
+                    calibration_layout.addWidget(button, row, column)
+                    self.dual_calibration_buttons.append((dxl_id, button))
+            self.dual_capture_open = QPushButton('CAPTURE OPEN')
+            self.dual_capture_close = QPushButton('CAPTURE CLOSE')
+            self.dual_capture_open.clicked.connect(
+                lambda: self._command_dual_calibration('capture_open'))
+            self.dual_capture_close.clicked.connect(
+                lambda: self._command_dual_calibration('capture_close'))
+            calibration_layout.addWidget(self.dual_capture_open, 4, 0, 1, 2)
+            calibration_layout.addWidget(self.dual_capture_close, 4, 2, 1, 2)
+            self.dual_capture_label = QLabel('Captured OPEN: — | CLOSE: —')
+            calibration_layout.addWidget(self.dual_capture_label, 5, 0, 1, 4)
+            self.dual_validate_calibration = QPushButton('VALIDATE DUAL CALIBRATION')
+            self.dual_save_calibration = QPushButton('SAVE DUAL CALIBRATION')
+            self.dual_validate_calibration.clicked.connect(
+                lambda: self._command_dual_calibration('validate'))
+            self.dual_save_calibration.clicked.connect(
+                lambda: self._command_dual_calibration('save'))
+            calibration_layout.addWidget(self.dual_validate_calibration, 6, 0, 1, 2)
+            calibration_layout.addWidget(self.dual_save_calibration, 6, 2, 1, 2)
+            calibration_layout.addWidget(QLabel(
+                'Captured endpoint pairs become the only OPEN/CLOSE targets. '
+                'Capture itself performs reads only.'), 7, 0, 1, 4)
+            bypass = QLabel(
+                'CALIBRATION JOG: spread protection bypassed\n'
+                'Normal OPEN/CLOSE and legacy gripper JOG remain blocked until READY.')
+            bypass.setStyleSheet(FALSE_STYLE)
+            bypass.setWordWrap(True)
+            calibration_layout.addWidget(bypass, 8, 0, 1, 4)
+            layout.addWidget(calibration)
         jog = QGroupBox('GRIPPER JOG')
         jog_layout = QGridLayout(jog)
+        self.spur_minus_5 = self.spur_zero = self.spur_plus_5 = None
         if self.node.selected_tool == 'spur_1motor_gripper':
             left_label, right_label = 'LEFT / −  (OPEN)', 'RIGHT / +  (CLOSE)'
         else:
@@ -229,13 +322,52 @@ class ManualMainWindow(QMainWindow):
         jog_layout.addWidget(self.gripper_feedback_label, 4, 0, 1, 2)
         shortcut_row = 5
         if self.node.selected_tool == 'spur_1motor_gripper':
+            self.spur_actual_state = QLabel('ID5: position=UNKNOWN torque=UNKNOWN load=UNKNOWN')
+            jog_layout.addWidget(self.spur_actual_state, 5, 0, 1, 2)
+            self.capture_open = QPushButton('SET CURRENT AS OPEN')
+            self.capture_close = QPushButton('SET CURRENT AS CLOSE')
+            self.capture_open.clicked.connect(lambda: self._capture_spur_endpoint('open'))
+            self.capture_close.clicked.connect(lambda: self._capture_spur_endpoint('close'))
+            jog_layout.addWidget(self.capture_open, 6, 0)
+            jog_layout.addWidget(self.capture_close, 6, 1)
+            self.captured_endpoints_label = QLabel('Captured OPEN: — | CLOSE: —')
+            jog_layout.addWidget(self.captured_endpoints_label, 7, 0, 1, 2)
+            self.validate_calibration = QPushButton('VALIDATE CALIBRATION')
+            self.save_calibration = QPushButton('SAVE CALIBRATION')
+            self.validate_calibration.clicked.connect(self._validate_spur_calibration)
+            self.save_calibration.clicked.connect(self._save_spur_calibration)
+            jog_layout.addWidget(self.validate_calibration, 8, 0)
+            jog_layout.addWidget(self.save_calibration, 8, 1)
+            self.motor_minus_half = QPushButton('MOTOR −0.5°')
+            self.motor_plus_half = QPushButton('MOTOR +0.5°')
+            self.motor_minus_one = QPushButton('MOTOR −1°')
+            self.motor_plus_one = QPushButton('MOTOR +1°')
+            for button, degrees in ((self.motor_minus_half, -0.5),
+                                    (self.motor_plus_half, 0.5),
+                                    (self.motor_minus_one, -1.0),
+                                    (self.motor_plus_one, 1.0)):
+                button.clicked.connect(
+                    lambda _checked=False, delta=degrees: self._jog_spur_motor(delta))
+            jog_layout.addWidget(self.motor_minus_half, 9, 0)
+            jog_layout.addWidget(self.motor_plus_half, 9, 1)
+            jog_layout.addWidget(self.motor_minus_one, 10, 0)
+            jog_layout.addWidget(self.motor_plus_one, 10, 1)
             jog_layout.addWidget(QLabel(
-                f'Safe range: {self.temporary_jog_safe_min} ~ '
-                f'{self.temporary_jog_safe_max}\n'
-                f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
-                f'{self.temporary_jog_mechanical_close}\n'
-                'Direction: OPEN ← [−]   [+] → CLOSE'), 5, 0, 1, 2)
-            shortcut_row = 6
+                'Safety policy: captured OPEN/CLOSE are the command limits; '
+                'no hidden endpoint or temporary range is used.'), 11, 0, 1, 2)
+            self.spur_mapping = QLabel('Output mapping: waiting for ID5 feedback')
+            self.spur_mapping.setWordWrap(True)
+            jog_layout.addWidget(self.spur_mapping, 12, 0, 1, 2)
+            self.spur_minus_5 = QPushButton('OUTPUT −5°')
+            self.spur_zero = QPushButton('OUTPUT 0°')
+            self.spur_plus_5 = QPushButton('OUTPUT +5°')
+            self.spur_minus_5.clicked.connect(lambda: self._command_spur_output_deg(-5.0))
+            self.spur_zero.clicked.connect(lambda: self._command_spur_output_deg(0.0))
+            self.spur_plus_5.clicked.connect(lambda: self._command_spur_output_deg(5.0))
+            jog_layout.addWidget(self.spur_minus_5, 13, 0)
+            jog_layout.addWidget(self.spur_zero, 13, 1)
+            jog_layout.addWidget(self.spur_plus_5, 14, 0, 1, 2)
+            shortcut_row = 15
         jog_layout.addWidget(shortcut, shortcut_row, 0, 1, 2)
         layout.addWidget(jog)
         cleaner = QHBoxLayout()
@@ -289,6 +421,7 @@ class ManualMainWindow(QMainWindow):
         self.tool_status = status
         self.last_status_time = time.monotonic()
         self.status_labels['tool_type'].setText(status.get('tool_type', 'UNKNOWN'))
+        self._update_fsm(status.get('fsm_state', 'UNKNOWN'))
         self._set_bool(
             self.status_labels['u2d2'], bool(status.get('u2d2_connected')))
         for key in ('profile_valid', 'actuators_discovered', 'motion_allowed'):
@@ -332,20 +465,107 @@ class ManualMainWindow(QMainWindow):
         profile_ok = bool(self.tool_status.get('profile_valid'))
         motion = self._tool_motion_ready()
         gripper = self.node.selected_tool.endswith('gripper')
-        calibrated = bool(self.profile.get('calibrated')) or self.mock_mode
+        spur = self.node.selected_tool == 'spur_1motor_gripper'
+        dual = self.node.selected_tool == 'dual_motor_gripper'
+        calibrated = bool(self.tool_status.get('calibrated')) or self.mock_mode
+        captured = (set(self.spur_endpoints) == {'open', 'close'}
+                    and self.spur_endpoints['open'] != self.spur_endpoints['close'])
+        dual_calibration = self.tool_status.get('dual_calibration') or {}
+        dual_ready = dual_calibration.get('state') == 'READY'
         preset_ready = (manual and gripper and profile_ok and motion
-                        and calibrated and not self.gripper_busy)
+                        and calibrated and not self.gripper_busy
+                        and (not spur or self.fsm_state == 'READY')
+                        and (not dual or dual_ready))
+        # Captures are only a candidate.  They never silently turn an
+        # uncalibrated live profile into a normal-motion profile.
         self.open_button.setEnabled(preset_ready)
         self.close_button.setEnabled(preset_ready)
+        self.spur_enable.setVisible(spur)
+        self.spur_disable.setVisible(spur)
+        self.dual_enable.setVisible(dual)
+        self.dual_disable.setVisible(dual)
+        calibration = self.tool_status.get('calibration') or {}
+        self.spur_enable.setEnabled(
+            spur and manual and calibration.get('active', False)
+            and self._tool_enable_ready() and not calibration.get('enabled', False))
+        self.spur_disable.setEnabled(
+            spur and calibration.get('active', False)
+            and self.spur_torque_state == 'ON')
+        dual_samples = self._gripper_samples()
+        dual_online = all(dual_samples.get(dxl_id, {}).get('online')
+                          for dxl_id in (3, 4))
+        dual_healthy = all(dual_samples.get(dxl_id, {}).get('hardware_error') == 0
+                           for dxl_id in (3, 4))
+        dual_torque_on = all(dual_samples.get(dxl_id, {}).get('torque_state') == 'ON'
+                             for dxl_id in (3, 4))
         self.tool_stop.setEnabled(
-            manual and gripper and profile_ok
-            and (self.gripper_busy or motion))
+            (spur and not bool(self.tool_status.get('read_only'))
+             and bool(self.tool_status.get('online')))
+            or (dual and dual_online
+                and not bool(self.tool_status.get('read_only'))))
+        self.dual_enable.setEnabled(
+            dual and manual and dual_online and dual_healthy
+            and not dual_torque_on and not bool(self.tool_status.get('read_only')))
+        self.dual_disable.setEnabled(
+            dual and dual_online and not bool(self.tool_status.get('read_only')))
+        recovery_base = (
+            dual and manual and self.node.control_scope == 'END_EFFECTOR_ONLY'
+            and not bool(self.tool_status.get('read_only'))
+            and not bool(self.tool_status.get('emergency_stop'))
+            and not bool(self.tool_status.get('tool_detached')))
+        for dxl_id, button in self.dual_recovery_buttons:
+            sample = dual_samples.get(dxl_id, {})
+            button.setEnabled(
+                recovery_base and sample.get('online')
+                and sample.get('hardware_error') == 0
+                and sample.get('torque_state') == 'ON')
+        dual_calibration_active = bool(dual_calibration.get('active'))
+        dual_calibration_capture_ready = (
+            dual and manual and end_effector_only
+            and not bool(self.tool_status.get('read_only'))
+            and not bool(self.tool_status.get('emergency_stop'))
+            and not bool(self.tool_status.get('tool_detached'))
+            and dual_online and dual_healthy)
+        dual_calibration_jog_ready = (
+            dual_calibration_capture_ready and dual_torque_on)
+        if self.dual_calibration_state is not None:
+            self.dual_calibration_state.setText(
+                dual_calibration.get('state', 'RECALIBRATION_REQUIRED'))
+        if self.dual_capture_label is not None:
+            captures = dual_calibration.get('captures') or {}
+            self.dual_capture_label.setText(
+                f'Captured OPEN: {captures.get("open", "—")} | '
+                f'CLOSE: {captures.get("close", "—")}')
+        if self.dual_start_calibration is not None:
+            self.dual_start_calibration.setEnabled(
+                dual and manual and end_effector_only
+                and not bool(self.tool_status.get('read_only'))
+                and not bool(self.tool_status.get('emergency_stop'))
+                and not bool(self.tool_status.get('tool_detached'))
+                and not dual_calibration_active)
+        for _dxl_id, button in self.dual_calibration_buttons:
+            button.setEnabled(dual_calibration_active and dual_calibration_jog_ready)
+        if self.dual_calibration_step is not None:
+            self.dual_calibration_step.setEnabled(
+                dual_calibration_active and dual_calibration_jog_ready)
+        if self.dual_capture_open is not None:
+            self.dual_capture_open.setEnabled(
+                dual_calibration_active and dual_calibration_capture_ready)
+            self.dual_capture_close.setEnabled(
+                dual_calibration_active and dual_calibration_capture_ready)
+            captured_pairs = dual_calibration.get('captures') or {}
+            both_pairs = set(captured_pairs) == {'open', 'close'}
+            self.dual_validate_calibration.setEnabled(
+                dual_calibration_active and dual_calibration_capture_ready and both_pairs)
+            self.dual_save_calibration.setEnabled(
+                dual_calibration_active and bool(dual_calibration.get('validated')))
         jog_ready = (manual and not self.gripper_busy
                      and self.node.control_scope == 'END_EFFECTOR_ONLY'
                      and self.node.selected_tool in (
                          'dual_motor_gripper', 'spur_1motor_gripper')
                      and self._tool_motion_ready()
-                     and self._gripper_positions_synchronized())
+                     and self._gripper_positions_synchronized()
+                     and (not dual or dual_ready))
         # When the measured position is outside the temporary range, expose
         # only the inward recovery direction.  This prevents a disabled
         # direction from being retried by either a click or a key shortcut.
@@ -359,17 +579,39 @@ class ManualMainWindow(QMainWindow):
                     spur_close_allowed = False
                 elif current < self.temporary_jog_safe_min:
                     spur_open_allowed = False
-        self.jog_close.setEnabled(jog_ready and spur_open_allowed)
-        self.jog_open.setEnabled(jog_ready and spur_close_allowed)
+        self.jog_close.setEnabled(not spur and jog_ready and spur_open_allowed)
+        self.jog_open.setEnabled(not spur and jog_ready and spur_close_allowed)
         self.gripper_jog_step.setEnabled(not self.gripper_busy)
         cleaner = self.node.selected_tool == 'cleaner'
         configured = bool(self.tool_status.get('actuators_discovered'))
         self.clean_start.setEnabled(manual and cleaner and profile_ok
                                     and motion and configured)
         self.clean_stop.setEnabled(manual and cleaner and profile_ok and motion)
-        spur = self.node.selected_tool == 'spur_1motor_gripper'
+        for widget in (self.spur_minus_5, self.spur_zero, self.spur_plus_5):
+            if widget is not None:
+                widget.setEnabled(False)
+        if spur:
+            calibration_ready = (manual and calibration.get('active', False)
+                                 and self.spur_torque_state == 'ON'
+                                 and calibration.get('enabled', False)
+                                 and bool(self.tool_status.get('calibration_jog_enabled'))
+                                 and self._gripper_positions_synchronized())
+            for widget in (self.motor_minus_half, self.motor_plus_half,
+                           self.motor_minus_one, self.motor_plus_one,
+                           self.capture_open, self.capture_close):
+                widget.setEnabled(calibration_ready)
+            captures = calibration.get('captures', {})
+            both_captured = (set(captures) == {'open', 'close'}
+                             and captures['open'] != captures['close'])
+            self.validate_calibration.setEnabled(
+                manual and calibration.get('active', False) and both_captured)
+            self.save_calibration.setEnabled(
+                manual and calibration.get('active', False)
+                and calibration.get('validated', False))
         self.read_diag.setEnabled(spur and not self.mock_mode)
-        self.start_cal.setEnabled(spur and not self.mock_mode)
+        self.start_cal.setEnabled(
+            spur and manual and bool(self.tool_status.get('calibration_jog_enabled'))
+            and not calibration.get('active', False))
 
     def _tool_motion_ready(self):
         fresh = time.monotonic() - self.last_status_time < 1.5
@@ -386,6 +628,17 @@ class ManualMainWindow(QMainWindow):
         return (fresh and bool(self.tool_status.get('bridge_connected'))
                 and bool(self.tool_status.get('motion_allowed')) and scope_ok
                 and actuators_ok and (profile_ready or temporary_ready)
+                and not bool(self.tool_status.get('read_only'))
+                and not bool(self.tool_status.get('emergency_stop'))
+                and not bool(self.tool_status.get('tool_detached')))
+
+    def _tool_enable_ready(self):
+        """Readiness before torque is enabled; used only by ENABLE ID5."""
+        fresh = time.monotonic() - self.last_status_time < 1.5
+        return (fresh and bool(self.tool_status.get('bridge_connected'))
+                and bool(self.tool_status.get('online'))
+                and self.tool_status.get('position') is not None
+                and self.tool_status.get('hardware_error') == 0
                 and not bool(self.tool_status.get('read_only'))
                 and not bool(self.tool_status.get('emergency_stop'))
                 and not bool(self.tool_status.get('tool_detached')))
@@ -448,6 +701,30 @@ class ManualMainWindow(QMainWindow):
                 f'{self.temporary_jog_safe_max}\n'
                 f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
                 f'{self.temporary_jog_mechanical_close}')
+            self.spur_torque_state = self.tool_status.get(
+                'tool_torque_state', 'UNKNOWN')
+            self.spur_torque_enabled = self.spur_torque_state == 'ON'
+            self.spur_endpoints = dict((self.tool_status.get('calibration') or {}).get(
+                'captures', self.spur_endpoints))
+            self.captured_endpoints_label.setText(
+                f'Captured OPEN: {self.spur_endpoints.get("open", "—")} | '
+                f'CLOSE: {self.spur_endpoints.get("close", "—")}')
+            self.spur_actual_state.setText(
+                f'ID5: position={current} torque={self.spur_torque_state} '
+                f'load={sample.get("effort")} mode={sample.get("operating_mode")} '
+                f'velocity={sample.get("profile_velocity")} '
+                f'acceleration={sample.get("profile_acceleration")} '
+                f'hardware_error={self.tool_status.get("hardware_error")} '
+                f'model={self.tool_status.get("model")} '
+                f'fsm={self.fsm_state} calibrated={self.tool_status.get("calibrated")}')
+            zero = 'UNSET' if self.spur_zero_tick is None else str(self.spur_zero_tick)
+            self.spur_mapping.setText(
+                'Output mapping: zero offset/reference tick=' + zero + '\n'
+                'GUI output angle → motor tick: motor_deg = '
+                f'output_deg × {self.spur_gear_ratio:.3f} / '
+                f'({self.spur_output_direction:+d}); '
+                'tick = zero + motor_deg × 4096 / 360.\n'
+                'External spur pair: output direction is the inverse of motor direction.')
             return
         fractions = self._normalized_positions()
         if fractions:
@@ -471,7 +748,9 @@ class ManualMainWindow(QMainWindow):
             lines.append(
                 f'ID{dxl_id}: current={current}, target={target}, '
                 f'error={error}, current/load={sample.get("effort")}, '
-                f'online={sample.get("online", False)}')
+                f'online={sample.get("online", False)}, '
+                f'actual torque={sample.get("torque_state", "UNKNOWN")}, '
+                f'hardware error={sample.get("hardware_error")}')
         self.gripper_feedback_label.setText('\n'.join(lines) or 'No actuator data')
 
     def _jog_gripper(self, direction):
@@ -524,6 +803,10 @@ class ManualMainWindow(QMainWindow):
             self._update_gripper_feedback()
 
     def _gripper_jog_block_reason(self):
+        if (self.node.selected_tool == 'dual_motor_gripper'
+                and (self.tool_status.get('dual_calibration') or {}).get('state')
+                != 'READY'):
+            return 'dual endpoint recalibration is required'
         if self.node.control_scope != 'END_EFFECTOR_ONLY':
             return 'control scope is not END_EFFECTOR_ONLY'
         if self.node.selected_tool not in (
@@ -565,6 +848,101 @@ class ManualMainWindow(QMainWindow):
             self.gripper_target_ticks = {5: target}
             self._update_gripper_feedback()
 
+    def _jog_spur_motor(self, degrees):
+        sample = self._gripper_samples().get(5, {})
+        current = sample.get('position')
+        if current is None or self.spur_torque_state != 'ON':
+            self._append_log('Motor jog blocked: ID5 position/actual torque unavailable')
+            return
+        if self.node.command_calibration('jog_motor_degrees', delta_deg=float(degrees)):
+            self._append_log(f'ID5 CalibrationSession jog {degrees:+.1f}° requested')
+
+    def _capture_spur_endpoint(self, label):
+        sample = self._gripper_samples().get(5, {})
+        current = sample.get('position')
+        if current is None:
+            self._append_log(f'Capture {label} blocked: ID5 position unavailable')
+            return
+        if self.node.command_calibration(f'capture_{label}'):
+            self._append_log(f'CalibrationSession capture {label.upper()} requested (read only)')
+            self._refresh_buttons()
+
+    def _validate_spur_calibration(self):
+        if self.node.command_calibration('validate'):
+            self._append_log('CalibrationSession validation requested (no motor write)')
+
+    def _save_spur_calibration(self):
+        if self.node.command_calibration('save'):
+            self._append_log(
+                'Calibration save requested; bridge will atomically reload and require READY')
+
+    def _command_tool(self, command):
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            self.node.command_spur_fsm(command)
+            return
+        position = float(self.profile.get(
+            'open_position' if command == 'OPEN' else 'close_position',
+            1.0 if command == 'OPEN' else 0.0))
+        self.node.command_gripper(position)
+
+    def _stop_tool(self):
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            self.node.command_spur_fsm('STOP')
+            return
+        if self.node.selected_tool == 'dual_motor_gripper':
+            self.node.set_dual_motor_enabled(False, self.profile.get('actuator_ids', []))
+            return
+        self.node.stop_gripper()
+
+    def _enable_spur_motor(self):
+        sample = self._gripper_samples().get(5, {})
+        current = sample.get('position')
+        if current is None:
+            self._append_log('ID5 Enable blocked: current tick feedback unavailable')
+            return
+        self.node.command_calibration('enable')
+        self._append_log('CalibrationSession ENABLE ID5 requested')
+
+    def _disable_spur_motor(self):
+        self.node.command_calibration('disable')
+        self._append_log('CalibrationSession DISABLE ID5 requested')
+
+    def _enable_dual_motors(self):
+        if self.node.set_dual_motor_enabled(True, self.profile.get('actuator_ids', [])):
+            self._append_log('Operator requested dual torque enable for IDs [3, 4]')
+
+    def _disable_dual_motors(self):
+        if self.node.set_dual_motor_enabled(False, self.profile.get('actuator_ids', [])):
+            self._append_log('Operator requested dual torque disable for IDs [3, 4]')
+
+    def _manual_dual_recovery_jog(self, actuator_id, delta_deg):
+        if self.node.manual_dual_recovery_jog(actuator_id, delta_deg):
+            self._append_log(
+                f'Operator requested one-click recovery jog: ID{actuator_id} '
+                f'{delta_deg:+.1f}° (bridge re-reads actual position)')
+
+    def _start_dual_calibration(self):
+        if self.node.command_dual_calibration('start'):
+            self._append_log('Dual endpoint calibration started (no motor write)')
+
+    def _jog_dual_calibration_motor(self, actuator_id, direction):
+        if self.dual_calibration_step is None:
+            return
+        degrees = float(self.dual_calibration_step.currentText()) * float(direction)
+        if self.node.command_dual_calibration(
+                'jog_motor_degrees', actuator_id=int(actuator_id),
+                delta_deg=degrees):
+            self._append_log(
+                f'Dual calibration one-click jog requested: ID{actuator_id} '
+                f'{degrees:+.1f}°')
+
+    def _command_dual_calibration(self, command):
+        if self.node.command_dual_calibration(command):
+            self._append_log(f'Dual calibration command requested: {command}')
+
+    def _command_spur_output_deg(self, output_deg):
+        self._append_log('Output-angle command is unavailable during ID5 calibration')
+
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
             event.ignore()
@@ -575,8 +953,11 @@ class ManualMainWindow(QMainWindow):
         enabled = (self.node.control_scope == 'END_EFFECTOR_ONLY'
                    and self.control_mode == 'MANUAL')
         if enabled and event.key() == Qt.Key_Space:
-            self.node.stop_gripper()
+            self._stop_tool()
             event.accept()
+            return
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            event.ignore()
             return
         if enabled and not editing and event.key() == Qt.Key_Left:
             self._jog_gripper(-1)
@@ -599,8 +980,12 @@ class ManualMainWindow(QMainWindow):
         self._append_log(
             f'Mode request clicked: requested={requested}, '
             f'approved={self.control_mode}')
-        if (requested == 'MANUAL'
-                and self.fsm_state not in ToolManager.SAFE_CHANGE_STATES):
+        if (not self.mock_mode and requested == 'MANUAL'
+                and self.fsm_state not in ToolManager.SAFE_CHANGE_STATES
+                and not (self.node.selected_tool == 'spur_1motor_gripper'
+                         and self.fsm_state == 'CALIBRATION_REQUIRED')
+                and not (self.node.selected_tool == 'dual_motor_gripper'
+                         and self.node.control_scope == 'END_EFFECTOR_ONLY')):
             QMessageBox.warning(
                 self, 'Ownership denied',
                 f'MANUAL is allowed only in IDLE/STOWED; current={self.fsm_state}')
@@ -662,27 +1047,8 @@ class ManualMainWindow(QMainWindow):
             '--actuator-id', str(ids[0]), '--read-only'])
 
     def _start_calibration(self):
-        answer = QMessageBox.warning(
-            self, 'Powered calibration confirmation',
-            'Calibration can move the gripper. Stop the bridge first, clear the '
-            'mechanism, prepare emergency power-off, and continue in a terminal. '
-            'Launch the guarded calibration terminal now?',
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
-            return
-        if time.monotonic() - self.last_status_time < 1.5:
-            QMessageBox.critical(
-                self, 'Serial bus still owned',
-                'The bridge is still running. Stop the bridge/stack first; calibration '
-                'will not be launched while another serial owner is active.')
-            return
-        actuator_id = self.profile.get('actuator_ids', [5])[0]
-        command = (
-            'source /opt/ros/humble/setup.bash; '
-            'source /home/asd/extreme-robot/ros2_ws/install/setup.bash; '
-            'ros2 run dynamixel_control spur_gripper_calibration '
-            f'--actuator-id {shlex.quote(str(actuator_id))} --armed')
-        self._run_process('x-terminal-emulator', ['-e', 'bash', '-lc', command])
+        if self.node.command_calibration('start'):
+            self._append_log('CalibrationSession started (no register write)')
 
     def _rebuild_diagnostics(self, actuators, joint_values=None):
         joint_values = joint_values or {}

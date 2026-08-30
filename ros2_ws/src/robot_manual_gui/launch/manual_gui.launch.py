@@ -14,6 +14,7 @@ def generate_launch_description():
     mock_mode = LaunchConfiguration('mock_mode')
     read_only = LaunchConfiguration('read_only')
     start_stack = LaunchConfiguration('start_stack')
+    start_fsm = LaunchConfiguration('start_fsm')
     tool_type = LaunchConfiguration('tool_type')
     control_scope = LaunchConfiguration('control_scope')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
@@ -22,12 +23,17 @@ def generate_launch_description():
     temporary_safe_max = LaunchConfiguration('temporary_jog_safe_max_tick')
     mechanical_open = LaunchConfiguration('temporary_jog_mechanical_open_tick')
     mechanical_close = LaunchConfiguration('temporary_jog_mechanical_close_tick')
+    temporary_velocity = LaunchConfiguration('temporary_jog_profile_velocity')
+    temporary_acceleration = LaunchConfiguration(
+        'temporary_jog_profile_acceleration')
+    calibration_jog_mode = LaunchConfiguration('calibration_jog_mode')
     stack = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
             FindPackageShare('dynamixel_control'), 'launch',
             'interchangeable_tool.launch.py'])),
         launch_arguments={
             'mock_mode': mock_mode,
+            'start_fsm': start_fsm,
             'read_only': read_only,
             'tool_type': tool_type,
             'control_scope': control_scope,
@@ -37,6 +43,9 @@ def generate_launch_description():
             'temporary_jog_safe_max_tick': temporary_safe_max,
             'temporary_jog_mechanical_open_tick': mechanical_open,
             'temporary_jog_mechanical_close_tick': mechanical_close,
+            'temporary_jog_profile_velocity': temporary_velocity,
+            'temporary_jog_profile_acceleration': temporary_acceleration,
+            'calibration_jog_mode': calibration_jog_mode,
         }.items(),
         condition=IfCondition(start_stack),
     )
@@ -49,10 +58,13 @@ def generate_launch_description():
             'start_stack', default_value='true',
             description='Set false when bridge/FSM are already running.'),
         DeclareLaunchArgument(
+            'start_fsm', default_value='false',
+            description='The bridge owns the ID5 tool FSM; arm_fsm is not needed for END_EFFECTOR_ONLY.'),
+        DeclareLaunchArgument(
             'tool_type', default_value='spur_1motor_gripper'),
         DeclareLaunchArgument(
-            'control_scope', default_value='FULL_ROBOT',
-            description='FULL_ROBOT or explicit END_EFFECTOR_ONLY test scope.'),
+            'control_scope', default_value='END_EFFECTOR_ONLY',
+            description='Defaults to ID5-only END_EFFECTOR_ONLY; FULL_ROBOT is explicit.'),
         DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
@@ -62,11 +74,16 @@ def generate_launch_description():
             'temporary_jog_mechanical_open_tick', default_value='2817'),
         DeclareLaunchArgument(
             'temporary_jog_mechanical_close_tick', default_value='3857'),
+        DeclareLaunchArgument('temporary_jog_profile_velocity', default_value='5'),
+        DeclareLaunchArgument(
+            'temporary_jog_profile_acceleration', default_value='1'),
+        DeclareLaunchArgument('calibration_jog_mode', default_value='false'),
         stack,
         Node(
             package='robot_manual_gui', executable='manual_gui', output='screen',
             parameters=[{
                 'mock_mode': ParameterValue(mock_mode, value_type=bool),
+                'read_only': ParameterValue(read_only, value_type=bool),
                 'tool_type': tool_type,
                 'control_scope': control_scope,
                 'temporary_jog_mode': ParameterValue(
@@ -79,6 +96,8 @@ def generate_launch_description():
                     mechanical_open, value_type=int),
                 'temporary_jog_mechanical_close_tick': ParameterValue(
                     mechanical_close, value_type=int),
+                'calibration_jog_mode': ParameterValue(
+                    calibration_jog_mode, value_type=bool),
             }],
         ),
     ])

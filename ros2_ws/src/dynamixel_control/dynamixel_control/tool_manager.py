@@ -55,3 +55,13 @@ class ToolManager:
         self._selection = ToolSelection(
             requested, profile, not errors, '; '.join(errors))
         return self._selection
+
+    def create_fsm(self, bridge, state='IDLE'):
+        """Select the mechanism FSM without making a Dynamixel write.
+
+        An uncalibrated profile still receives its FSM so it can enter the
+        explicit CALIBRATION_REQUIRED state; it is not motion-valid.
+        """
+        from dynamixel_control.tool_fsm.registry import create_tool_fsm
+        selection = self.refresh(state)
+        return create_tool_fsm(selection.tool_type, selection.profile, bridge)

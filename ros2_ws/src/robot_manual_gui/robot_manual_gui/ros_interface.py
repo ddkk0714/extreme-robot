@@ -8,7 +8,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
@@ -37,6 +37,7 @@ class ManualGuiNode(Node):
         super().__init__('robot_manual_gui')
         self.signals = signals
         self.declare_parameter('mock_mode', False)
+        self.declare_parameter('read_only', False)
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         self.declare_parameter('control_scope', 'FULL_ROBOT')
         self.declare_parameter('temporary_jog_mode', False)
@@ -44,7 +45,9 @@ class ManualGuiNode(Node):
         self.declare_parameter('temporary_jog_safe_max_tick', 3807)
         self.declare_parameter('temporary_jog_mechanical_open_tick', 2817)
         self.declare_parameter('temporary_jog_mechanical_close_tick', 3857)
+        self.declare_parameter('calibration_jog_mode', False)
         self.mock_mode = bool(self.get_parameter('mock_mode').value)
+        self.read_only = bool(self.get_parameter('read_only').value)
         self.selected_tool = str(self.get_parameter('tool_type').value)
         self.control_scope = validate_control_scope(
             self.get_parameter('control_scope').value)
@@ -54,6 +57,8 @@ class ManualGuiNode(Node):
             self.get_parameter('temporary_jog_safe_min_tick').value)
         self.temporary_jog_safe_max = int(
             self.get_parameter('temporary_jog_safe_max_tick').value)
+        self.calibration_jog_mode = bool(
+            self.get_parameter('calibration_jog_mode').value)
         self.positions = {name: 0.0 for name in ARM_JOINTS}
         self.efforts = {name: 0.0 for name in ARM_JOINTS}
         self.control_mode = 'FSM'
@@ -77,6 +82,15 @@ class ManualGuiNode(Node):
         self.estop_pub = self.create_publisher(Bool, '/tool/emergency_stop', 10)
         self.detach_pub = self.create_publisher(Bool, '/tool/detached', 10)
         self.mode_pub = self.create_publisher(String, '/control/mode', 10)
+        self.fsm_command_pub = self.create_publisher(String, '/tool/fsm_command', 10)
+        self.calibration_command_pub = self.create_publisher(
+            String, '/tool/calibration_command', 10)
+        self.torque_pub = self.create_publisher(
+            Int32MultiArray, '/dynamixel/torque_request', 10)
+        self.manual_recovery_pub = self.create_publisher(
+            String, '/tool/manual_recovery_jog', 10)
+        self.dual_calibration_pub = self.create_publisher(
+            String, '/tool/dual_calibration_command', 10)
         self.gripper = ActionClient(
             self, FollowJointTrajectory,
             '/gripper_controller/follow_joint_trajectory')
@@ -140,6 +154,9 @@ class ManualGuiNode(Node):
                 joint: {'position': float(target_rad), 'effort': 0.0}})
 
     def command_gripper(self, position):
+        if self.read_only:
+            self.signals.log.emit('Gripper command blocked: GUI is read-only')
+            return False
         if self.control_mode != 'MANUAL':
             self.signals.log.emit('Gripper command blocked: ownership is not MANUAL')
             return False
@@ -168,6 +185,91 @@ class ManualGuiNode(Node):
             f'Sending gripper goal: logical_position={float(position):.9f}')
         future = self.gripper.send_goal_async(goal)
         future.add_done_callback(self._gripper_goal_response)
+        return True
+
+    def set_spur_motor_enabled(self, enabled):
+        """Route ID5 torque through CalibrationSession, never raw torque topic."""
+        if (self.selected_tool != 'spur_1motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'):
+            self.signals.log.emit('Motor enable blocked: not in spur ID5-only scope')
+            return False
+        self.command_calibration('enable' if enabled else 'disable')
+        return True
+
+    def capture_spur_endpoint(self, label, tick):
+        """Compatibility wrapper; bridge reads the present tick itself."""
+        if (self.selected_tool != 'spur_1motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'):
+            return False
+        command = 'capture_open' if str(label).lower() == 'open' else 'capture_close'
+        self.command_calibration(command)
+        return True
+
+    def command_spur_fsm(self, command):
+        if self.read_only:
+            self.signals.log.emit('FSM command blocked: GUI is read-only')
+            return False
+        if (self.selected_tool != 'spur_1motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'):
+            return False
+        self.fsm_command_pub.publish(String(data=str(command).upper()))
+        return True
+
+    def command_calibration(self, command, **values):
+        if self.read_only:
+            self.signals.log.emit('Calibration command blocked: GUI is read-only')
+            return False
+        if (self.selected_tool != 'spur_1motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'):
+            return False
+        payload = {'command': command, **values}
+        self.calibration_command_pub.publish(String(data=json.dumps(payload)))
+        return True
+
+    def set_dual_motor_enabled(self, enabled, actuator_ids):
+        """Explicit GUI-only dual torque request; never sent at startup."""
+        ids = [int(item) for item in actuator_ids]
+        if self.read_only:
+            self.signals.log.emit('Dual torque request blocked: GUI is read-only')
+            return False
+        if (self.selected_tool != 'dual_motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or ids != [3, 4]):
+            self.signals.log.emit('Dual torque request blocked: expected IDs [3, 4]')
+            return False
+        message = Int32MultiArray()
+        message.data = [1 if enabled else 0, *ids]
+        self.torque_pub.publish(message)
+        return True
+
+    def manual_dual_recovery_jog(self, actuator_id, delta_deg):
+        """One explicit GUI click; bridge re-reads actual state before writing."""
+        if self.read_only:
+            self.signals.log.emit('Manual recovery jog blocked: GUI is read-only')
+            return False
+        if (self.selected_tool != 'dual_motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or int(actuator_id) not in (3, 4)
+                or float(delta_deg) not in (-0.5, 0.5)
+                or self.control_mode != 'MANUAL'):
+            self.signals.log.emit('Manual recovery jog blocked by GUI safety gate')
+            return False
+        self.manual_recovery_pub.publish(String(data=json.dumps({
+            'actuator_id': int(actuator_id), 'delta_deg': float(delta_deg)})))
+        return True
+
+    def command_dual_calibration(self, command, **values):
+        """Publish an operator request; bridge owns fresh reads and all writes."""
+        if self.read_only:
+            self.signals.log.emit('Dual calibration command blocked: GUI is read-only')
+            return False
+        if (self.selected_tool != 'dual_motor_gripper'
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_mode != 'MANUAL'):
+            self.signals.log.emit('Dual calibration command blocked by GUI safety gate')
+            return False
+        payload = {'command': str(command), **values}
+        self.dual_calibration_pub.publish(String(data=json.dumps(payload)))
         return True
 
     def _gripper_goal_response(self, future):
@@ -206,9 +308,12 @@ class ManualGuiNode(Node):
         self.signals.gripper_state.emit(False, state)
 
     def stop_gripper(self):
+        # Torque-off is deliberately first: a queued/canceling action must not
+        # keep driving while the cancellation handshake completes.
+        self.set_spur_motor_enabled(False)
         if not self.gripper_busy or self.last_gripper_goal is None:
-            self.signals.log.emit('Gripper STOP: no active goal')
-            return False
+            self.signals.log.emit('Gripper STOP: torque disabled; no active goal')
+            return True
         self.signals.gripper_state.emit(True, 'STOPPING')
         self.signals.log.emit('Gripper STOP requested')
         future = self.last_gripper_goal.cancel_goal_async()
@@ -246,6 +351,7 @@ class ManualGuiNode(Node):
             trajectory.points = [point]
             self.arm_pub.publish(trajectory)
         self.cleaner_pub.publish(Bool(data=False))
+        self.set_spur_motor_enabled(False)
         self.estop_pub.publish(Bool(data=True))
 
     def tool_detached(self):

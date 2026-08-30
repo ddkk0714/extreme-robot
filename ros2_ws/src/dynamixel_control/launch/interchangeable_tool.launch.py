@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -13,6 +14,7 @@ def generate_launch_description():
     tool_type = LaunchConfiguration('tool_type')
     profile_file = LaunchConfiguration('tool_profile_file')
     mock_mode = LaunchConfiguration('mock_mode')
+    start_fsm = LaunchConfiguration('start_fsm')
     read_only = LaunchConfiguration('read_only')
     control_scope = LaunchConfiguration('control_scope')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
@@ -21,6 +23,10 @@ def generate_launch_description():
     temporary_safe_max = LaunchConfiguration('temporary_jog_safe_max_tick')
     mechanical_open = LaunchConfiguration('temporary_jog_mechanical_open_tick')
     mechanical_close = LaunchConfiguration('temporary_jog_mechanical_close_tick')
+    temporary_velocity = LaunchConfiguration('temporary_jog_profile_velocity')
+    temporary_acceleration = LaunchConfiguration(
+        'temporary_jog_profile_acceleration')
+    calibration_jog_mode = LaunchConfiguration('calibration_jog_mode')
     cleaner_joint = LaunchConfiguration('cleaning_actuator_joint')
     cleaner_id = LaunchConfiguration('cleaning_actuator_id')
     cleaner_direction = LaunchConfiguration('cleaning_direction')
@@ -37,8 +43,9 @@ def generate_launch_description():
                 FindPackageShare('dynamixel_control'), 'config',
                 'tool_profiles.yaml'])),
         DeclareLaunchArgument('mock_mode', default_value='false'),
+        DeclareLaunchArgument('start_fsm', default_value='true'),
         DeclareLaunchArgument('read_only', default_value='false'),
-        DeclareLaunchArgument('control_scope', default_value='FULL_ROBOT'),
+        DeclareLaunchArgument('control_scope', default_value='END_EFFECTOR_ONLY'),
         DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
@@ -48,6 +55,10 @@ def generate_launch_description():
             'temporary_jog_mechanical_open_tick', default_value='2817'),
         DeclareLaunchArgument(
             'temporary_jog_mechanical_close_tick', default_value='3857'),
+        DeclareLaunchArgument('temporary_jog_profile_velocity', default_value='5'),
+        DeclareLaunchArgument(
+            'temporary_jog_profile_acceleration', default_value='1'),
+        DeclareLaunchArgument('calibration_jog_mode', default_value='false'),
         DeclareLaunchArgument('cleaning_actuator_joint', default_value=''),
         DeclareLaunchArgument('cleaning_actuator_id', default_value='-1'),
         DeclareLaunchArgument('cleaning_direction', default_value='0'),
@@ -71,6 +82,12 @@ def generate_launch_description():
                     mechanical_open, value_type=int),
                 'temporary_jog_mechanical_close_tick': ParameterValue(
                     mechanical_close, value_type=int),
+                'temporary_jog_profile_velocity': ParameterValue(
+                    temporary_velocity, value_type=int),
+                'temporary_jog_profile_acceleration': ParameterValue(
+                    temporary_acceleration, value_type=int),
+                'calibration_jog_mode': ParameterValue(
+                    calibration_jog_mode, value_type=bool),
                 'cleaning_actuator_joint': cleaner_joint,
                 'cleaning_actuator_id': ParameterValue(cleaner_id, value_type=int),
                 'cleaning_direction': ParameterValue(
@@ -92,5 +109,6 @@ def generate_launch_description():
                 'clean_duration': 0.1,
                 'locked_dwell': 0.0,
             }],
+            condition=IfCondition(start_fsm),
         ),
     ])
