@@ -11,7 +11,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', 'MASTER_SLAVE_BENCH.md']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
@@ -38,9 +38,14 @@ setup(
             'yolo_bridge = dynamixel_control.yolo_to_dynamixel_bridge:main',
             'yolo_detection = dynamixel_control.yolo_detection_node:main',
             'arm_fsm = dynamixel_control.arm_fsm_node:main',
+            'mission_console = dynamixel_control.mission_console_node:main',
             'teleop_core = dynamixel_control.teleop_core_node:main',
             'keyboard_teleop = dynamixel_control.keyboard_teleop_node:main',
             'joystick_teleop = dynamixel_control.joystick_teleop_node:main',
+            'master_slave_master = '
+            'dynamixel_control.master_slave_master_client:main',
+            'master_slave_slave = '
+            'dynamixel_control.master_slave_slave_server:main',
         ],
     },
 )

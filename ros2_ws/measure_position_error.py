@@ -9,6 +9,7 @@
 """
 import argparse
 import statistics
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -17,23 +18,18 @@ from robot_arm_msgs.msg import DetectedObjectArray
 
 
 class PositionSampler(Node):
-    def __init__(self, class_name, duration):
+    def __init__(self, class_name):
         super().__init__('position_sampler')
         self.class_name = class_name
-        self.duration = duration
         self.samples = []
         self.sub = self.create_subscription(
             DetectedObjectArray, '/detected_objects', self._cb, 10)
-        self.timer = self.create_timer(duration, self._done)
 
     def _cb(self, msg):
         for obj in msg.objects:
             if obj.class_name == self.class_name and obj.pose.position.z != 0.0:
                 p = obj.pose.position
                 self.samples.append((p.x, p.y, p.z, obj.confidence))
-
-    def _done(self):
-        rclpy.shutdown()
 
 
 def main():
@@ -43,8 +39,16 @@ def main():
     args = ap.parse_args()
 
     rclpy.init()
-    node = PositionSampler(args.class_name, args.duration)
-    rclpy.spin(node)
+    node = PositionSampler(args.class_name)
+    # rclpy.spin(node) + create_timer(duration, rclpy.shutdown)로 종료하던 이전 버전은
+    # 타이머 콜백에서 shutdown()을 불러도 spin()의 wait-set 대기가 즉시 깨어나지
+    # 않아 duration이 지나도 프로세스가 안 죽는 버그가 있었다(2026-07-22 실측). 대신
+    # 짧은 timeout의 spin_once를 직접 루프 돌며 wall clock으로 종료 시점을 판단한다.
+    deadline = time.time() + args.duration
+    while time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_node()
+    rclpy.shutdown()
 
     n = len(node.samples)
     print(f'\n샘플 수: {n} (class={args.class_name}, {args.duration}s)')

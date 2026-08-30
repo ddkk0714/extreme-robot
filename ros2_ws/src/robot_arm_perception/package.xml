@@ -14,6 +14,16 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <!-- RViz 캘리브 도구(camera_tf_tuner / detection_markers / ground_truth_markers) -->
+  <depend>visualization_msgs</depend>
+  <depend>interactive_markers</depend>
+  <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
+  <exec_depend>robot_arm_description</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>xacro</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -9,7 +9,16 @@
      ee_description.zip에는 joint/TCP가 전혀 없다. 따라서 MoveIt joint를 만들지 않으며,
      별도 actuator는 하드웨어 사양이 주어질 때까지 fail-closed로 둔다. -->
 <robot name="robot_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="end_effector_preset" default="dual_motor_gripper"/>
 
-  <xacro:include filename="$(find robot_arm_description)/urdf/robot_arm.urdf"/>
+  <xacro:if value="${'$(arg end_effector_preset)' == 'dual_motor_gripper'}">
+    <xacro:include filename="$(find robot_arm_description)/urdf/robot_arm.urdf"/>
+  </xacro:if>
+  <xacro:if value="${'$(arg end_effector_preset)' == 'single_motor_gripper'}">
+    <xacro:include filename="$(find robot_arm_description)/urdf/robot_arm.single_motor_gripper.urdf"/>
+  </xacro:if>
+  <xacro:unless value="${'$(arg end_effector_preset)' in ['dual_motor_gripper', 'single_motor_gripper']}">
+    <xacro:include filename="$(find robot_arm_description)/urdf/robot_arm.urdf"/>
+  </xacro:unless>
 
 </robot>

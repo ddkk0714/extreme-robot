@@ -13,6 +13,13 @@ def generate_launch_description():
 
     robot_description = xacro.process_file(xacro_file).toxml()
 
+    # 저장된 RViz 설정이 없으면 Fixed Frame/RobotModel/Durability를 매번 손으로 잡아야 해서
+    # rviz/robot_arm.rviz를 기본으로 넘긴다.
+    rviz_config = os.path.join(
+        get_package_share_directory('robot_arm_description'),
+        'rviz', 'robot_arm.rviz'
+    )
+
     return LaunchDescription([
         Node(
             package='robot_state_publisher',
@@ -26,5 +33,6 @@ def generate_launch_description():
         Node(
             package='rviz2',
             executable='rviz2',
+            arguments=['-d', rviz_config],
         ),
     ])

@@ -10,7 +10,7 @@
          ee_description에는 joint 정보가 없어 MoveIt planning group에서 제외하고
          별도 Dynamixel actuator로 제어한다. -->
     <group name="arm">
-        <chain base_link="base_link" tip_link="link_051"/>
+        <chain base_link="base_link" tip_link="link_043"/>
     </group>
     <group_state name="home" group="arm">
         <joint name="arm_joint_1" value="0"/>

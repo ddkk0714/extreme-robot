@@ -5,23 +5,25 @@
 teleop_core 로 보낸다. 시리얼/모터 로직은 전혀 없다 — 순수 입력 어댑터.
 키보드 프론트엔드(keyboard_teleop_node)와 같은 토픽을 쓰므로 서로 대체 가능하다.
 
-키맵 (DualSense 기본값 — 축·버튼 인덱스는 전부 파라미터)
-  L1 (hold)    데드맨. 누르고 있는 동안만 움직인다. 떼면 전 축 즉시 0.
-  왼스틱  ↔    joint_1 (베이스 회전)
-  왼스틱  ↕    joint_2 (어깨)
-  오른스틱 ↕   joint_3 (팔꿈치)
-  오른스틱 ↔   joint_4 (손목 pitch)
-  L3 / R3      joint_5 (손목 roll)  − / +
-  R1           터보 (속도 배율)
-  △            home  — 전 관절 0 복귀
-  ○            stop  — 현재 위치 고정
-  ✕            비상정지 (latched). 해제 전까지 전 축 0. ○(stop)으로 해제.
-  PS           DRIVE/ARM 전환 — 지금은 로그만 남기는 스텁
+키맵 (2026-07-29 DualSense 블루투스 실측 — 축·버튼 인덱스는 전부 파라미터)
+  buttons[9] (hold)  데드맨. 누르고 있는 동안만 움직인다. 떼면 전 축 즉시 0.
+  왼스틱  ↔ (axes 0)  arm_joint_1
+  왼스틱  ↕ (axes 1)  arm_joint_2
+  오른스틱 ↕ (axes 3) arm_joint_3
+  오른스틱 ↔ (axes 2) arm_joint_4
+  buttons[2] / [0]    arm_joint_5        + / −
+  buttons[3] / [1]    gripper_left_pinion_joint 열기 / 닫기
 
-  L2 / R2      [예약] 그리퍼 — 이번 범위 제외. gripper_* 파라미터 기본 -1(비활성).
+  이산 명령(home/stop/estop/mode)은 기본 비활성(-1) — 위 버튼들과 겹친다.
+  터보도 비활성.
 
 ⚠️ 실물 패드의 축·버튼 인덱스는 커널 드라이버(hid-sony vs hid-playstation)에 따라
-   다르다. 실물이 오면 `ros2 topic echo /joy` 로 확인해 **파라미터만** 바꾸면 된다.
+   다르다. 위 값은 이 패드에서 직접 재서 확정한 것이고, joy 문서의 표준 배치와
+   다르다(표준은 axes 2=L2, 3=오른스틱X, 4=오른스틱Y). 패드가 바뀌면
+   `ros2 topic echo /joy` 로 다시 확인해 **파라미터만** 바꾸면 된다.
+
+⚠️ L2/R2 축(4·5)은 **안 누른 상태에서 +1.0** 을 낸다(첫 조작 전에만 0.0).
+   관절에 물리면 아무도 안 만졌는데 풀속으로 돈다 — 쓰려면 오프셋 보정이 필요하다.
 
 ⚠️ 벤치 전용 — 이 경로(teleop_core → /dynamixel/goal_position → position_node)는
    파워트레인 계약상 "direct dynamixel goal publisher" 라 production 금지다.
@@ -34,17 +36,32 @@ from std_msgs.msg import String
 from control_msgs.msg import JointJog
 
 
-DEFAULT_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5']
+DEFAULT_JOINT_NAMES = [
+    'arm_joint_1', 'arm_joint_2', 'arm_joint_3', 'arm_joint_4', 'arm_joint_5',
+    'gripper_left_pinion_joint',
+]
 
 #: 관절별 축 인덱스. -1 = 축 없음(버튼으로 조작).
-#: DualSense: 0=왼스틱X, 1=왼스틱Y, 2=L2, 3=오른스틱X, 4=오른스틱Y, 5=R2
-DEFAULT_AXIS_IDS = [0, 1, 4, 3, -1]
+#: 실측(2026-07-29, DualSense BT + joy 3.3): 0=왼스틱X, 1=왼스틱Y,
+#: 2=오른스틱X, 3=오른스틱Y, 4=L2, 5=R2 — joy 문서의 표준 배치와 다르다.
+#: (표준은 2=L2, 3=오른스틱X, 4=오른스틱Y 다. 이 패드는 legacy joydev 배치.)
+DEFAULT_AXIS_IDS = [0, 1, 3, 2, -1, -1]
 
 #: 풀 스틱일 때의 속도 [rad/s]. teleop_core 가 velocities 를 rad/s 로 해석한다.
-DEFAULT_AXIS_SCALES = [0.6, 0.4, 0.4, 0.6, 0.8]
+DEFAULT_AXIS_SCALES = [0.6, 0.4, 0.4, 0.6, 0.8, 0.5]
 
 #: 축 방향 반전. 스틱을 위로 밀었을 때 관절이 의도한 방향으로 가도록.
-DEFAULT_AXIS_INVERTED = [False, True, False, False, False]
+DEFAULT_AXIS_INVERTED = [False, True, False, False, False, False]
+
+#: 축이 없는 관절(-1)을 굴릴 버튼. 관절별로 따로 둔다 — 예전엔 joint5_plus/minus
+#: 하나를 축 없는 **모든** 관절이 공유해서, 손목과 그리퍼가 같이 움직였다.
+#: -1 = 버튼 없음.
+#:
+#: 그리퍼를 L2/R2 **축**(4·5)에 물리지 않은 이유: 이 패드의 트리거 축은 안 누른
+#: 상태에서 **+1.0** 을 낸다(첫 조작 전에만 0.0). 축으로 쓰면 아무도 안 만졌는데
+#: 그리퍼가 풀속으로 돈다.
+DEFAULT_BUTTON_PLUS_IDS = [-1, -1, -1, -1, 2, 3]
+DEFAULT_BUTTON_MINUS_IDS = [-1, -1, -1, -1, 0, 1]
 
 
 class JoystickTeleop(Node):
@@ -59,18 +76,22 @@ class JoystickTeleop(Node):
         self.declare_parameter('deadzone', 0.15)
 
         # ── 버튼 ──────────────────────────────────
-        self.declare_parameter('deadman_button', 4)      # L1 — 누르고 있어야 움직임
-        self.declare_parameter('turbo_button', 5)        # R1
+        self.declare_parameter('deadman_button', 9)      # 실측 확정 — 누르고 있어야 움직임
+        self.declare_parameter('turbo_button', -1)       # 비활성
         self.declare_parameter('turbo_scale', 2.5)
-        self.declare_parameter('joint5_minus_button', 11)   # L3
-        self.declare_parameter('joint5_plus_button', 12)    # R3
-        self.declare_parameter('home_button', 2)         # △ — 벤치 전용(계약상 production 금지)
-        self.declare_parameter('stop_button', 1)         # ○ — E-stop 해제도 겸함
-        self.declare_parameter('estop_button', 0)        # ✕ — latched
-        self.declare_parameter('mode_button', 10)        # PS — DRIVE/ARM 전환(스텁)
+        self.declare_parameter('button_plus_ids', DEFAULT_BUTTON_PLUS_IDS)
+        self.declare_parameter('button_minus_ids', DEFAULT_BUTTON_MINUS_IDS)
+        # 이산 명령은 전부 비활성(-1)이 기본이다. 버튼 0·1·2·3 을 joint_5/그리퍼에
+        # 배정했더니 예전 기본값(✕=estop, ○=stop, △=home)과 정면으로 겹쳤다 —
+        # joint_5 를 내리려다 비상정지가 걸리는 식. 안전은 **데드맨**이 맡는다
+        # (놓으면 전 축 즉시 0). 쓰려면 안 겹치는 인덱스를 파라미터로 지정할 것.
+        self.declare_parameter('home_button', -1)        # 벤치 전용(계약상 production 금지)
+        self.declare_parameter('stop_button', -1)        # E-stop 해제도 겸함
+        self.declare_parameter('estop_button', -1)       # latched
+        self.declare_parameter('mode_button', -1)        # DRIVE/ARM 전환(스텁)
 
         # ── 그리퍼 (이번 범위 제외 — 자리만 예약) ──
-        # 그리퍼는 moveit_dynamixel_bridge 가 이미 같은 서보(id 5)를 구동한다.
+        # 그리퍼는 moveit_dynamixel_bridge 가 이미 같은 서보(랙피니언 2모터 id 3,4)를 구동한다.
         # 여기서 또 구동하면 같은 버스의 같은 서보를 두 노드가 만지게 된다(owner 중복).
         # 배선하려면 그리퍼 경로를 한 곳으로 먼저 정리할 것.
         # ⚠️ 그때 반드시: Profile Acceleration(108)/Velocity(112) 를 25/80 으로 설정할 것.
@@ -80,7 +101,7 @@ class JoystickTeleop(Node):
         self.declare_parameter('gripper_open_axis', -1)    # R2 = 5 (비활성)
 
         # ── 타이밍 ────────────────────────────────
-        self.declare_parameter('publish_rate_hz', 20.0)
+        self.declare_parameter('publish_rate_hz', 50.0)
         # /joy 가 이 시간 넘게 안 오면 패드 사망으로 보고 전 축 0 → 폭주 방지.
         self.declare_parameter('joy_timeout_s', 0.5)
 
@@ -91,16 +112,19 @@ class JoystickTeleop(Node):
         self.axis_inverted = [bool(v) for v in g('axis_inverted').value]
         self.deadzone = float(g('deadzone').value)
 
+        self.btn_plus = [int(v) for v in g('button_plus_ids').value]
+        self.btn_minus = [int(v) for v in g('button_minus_ids').value]
+
         n = len(self.joint_names)
-        if not (len(self.axis_ids) == len(self.axis_scales) == len(self.axis_inverted) == n):
+        if not (len(self.axis_ids) == len(self.axis_scales) == len(self.axis_inverted)
+                == len(self.btn_plus) == len(self.btn_minus) == n):
             raise RuntimeError(
-                'joint_names/axis_ids/axis_scales/axis_inverted 길이가 서로 다릅니다')
+                'joint_names/axis_ids/axis_scales/axis_inverted/'
+                'button_plus_ids/button_minus_ids 길이가 서로 다릅니다')
 
         self.deadman_button = int(g('deadman_button').value)
         self.turbo_button = int(g('turbo_button').value)
         self.turbo_scale = float(g('turbo_scale').value)
-        self.j5_minus = int(g('joint5_minus_button').value)
-        self.j5_plus = int(g('joint5_plus_button').value)
         self.home_button = int(g('home_button').value)
         self.stop_button = int(g('stop_button').value)
         self.estop_button = int(g('estop_button').value)
@@ -130,7 +154,9 @@ class JoystickTeleop(Node):
             f'joystick_teleop started (joints={self.joint_names}, '
             f'axes={self.axis_ids}, deadman=button[{self.deadman_button}], '
             f'rate={self.rate}Hz)')
-        self.get_logger().info('L1 을 누르고 있어야 팔이 움직입니다. ✕ = 비상정지, ○ = 해제/정지')
+        self.get_logger().info(
+            f'buttons[{self.deadman_button}] 을 누르고 있어야 팔이 움직입니다 '
+            f'(놓으면 전 축 즉시 0).')
 
     # ------------------------------------------------------------------ 입력
     def _on_joy(self, msg):
@@ -231,11 +257,11 @@ class JoystickTeleop(Node):
                 if self.axis_inverted[i]:
                     v = -v
             else:
-                # 축이 없는 관절(joint_5)은 버튼으로. 누르는 동안 등속.
+                # 축이 없는 관절은 관절별 +/- 버튼으로. 누르는 동안 등속.
                 v = 0.0
-                if self._btn(self.j5_plus):
+                if self._btn(self.btn_plus[i]):
                     v += self.axis_scales[i]
-                if self._btn(self.j5_minus):
+                if self._btn(self.btn_minus[i]):
                     v -= self.axis_scales[i]
             vels.append(v * scale)
 
