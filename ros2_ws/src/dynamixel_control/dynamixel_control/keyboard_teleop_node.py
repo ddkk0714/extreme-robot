@@ -502,7 +502,9 @@ class KeyboardTeleop(Node):
 
             line = f"{i + 1:>2}  {name:<28}{marker:^6}{deg_s:>12}{rad_s:>12}"
             self._addstr(stdscr, row, 0, line[: max(w - 1, 0)], attr)
-            self._addstr(stdscr, row, min(len(line), max(w - 1, 0)), f"{status:>10}", status_attr | attr)
+            self._addstr(
+                stdscr, row, min(len(line), max(w - 1, 0)),
+                f"{status:>10}", status_attr | attr)
 
         sep = "-" * min(w - 1, 100)
 
@@ -538,7 +540,9 @@ class KeyboardTeleop(Node):
         row += 1
         row = _sep(row)
 
-        poses_text = "저장된 자세: " + (", ".join(self.known_poses) if self.known_poses else "(없음 — p 로 저장)")
+        poses_text = "저장된 자세: " + (
+            ", ".join(self.known_poses)
+            if self.known_poses else "(없음 — p 로 저장)")
         self._addstr(stdscr, row, 0, poses_text[: max(w - 1, 0)])
         row += 1
         row = _sep(row)

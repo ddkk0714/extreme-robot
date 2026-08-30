@@ -77,7 +77,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'port', default_value='/dev/ttyUSB0',
             description='position_node 가 열 시리얼 포트. USB 재연결로 번호가 '
-                         '밀리면(/dev/ttyUSB1 등) 바꿔서 넘길 것',
+                        '밀리면(/dev/ttyUSB1 등) 바꿔서 넘길 것',
         ),
 
         # 게임패드 드라이버.

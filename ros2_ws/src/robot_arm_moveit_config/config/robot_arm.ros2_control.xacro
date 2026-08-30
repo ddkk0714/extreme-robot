@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-    <xacro:macro name="robot_arm_ros2_control" params="name initial_positions_file">
+    <xacro:macro name="robot_arm_ros2_control" params="name initial_positions_file end_effector_preset">
         <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
 
         <ros2_control name="${name}" type="system">
@@ -43,13 +43,24 @@
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="gripper_left_pinion_joint">
-                <command_interface name="position"/>
-                <state_interface name="position">
-                  <param name="initial_value">${initial_positions['gripper_left_pinion_joint']}</param>
-                </state_interface>
-                <state_interface name="velocity"/>
-            </joint>
+            <xacro:if value="${end_effector_preset == 'dual_motor_gripper'}">
+                <joint name="gripper_left_pinion_joint">
+                    <command_interface name="position"/>
+                    <state_interface name="position">
+                      <param name="initial_value">${initial_positions['gripper_left_pinion_joint']}</param>
+                    </state_interface>
+                    <state_interface name="velocity"/>
+                </joint>
+            </xacro:if>
+            <xacro:if value="${end_effector_preset == 'single_motor_gripper'}">
+                <joint name="gripper_drive_joint">
+                    <command_interface name="position"/>
+                    <state_interface name="position">
+                      <param name="initial_value">${initial_positions['gripper_drive_joint']}</param>
+                    </state_interface>
+                    <state_interface name="velocity"/>
+                </joint>
+            </xacro:if>
         </ros2_control>
     </xacro:macro>
 </robot>

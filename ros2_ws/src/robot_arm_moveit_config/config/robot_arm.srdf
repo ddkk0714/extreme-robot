@@ -669,4 +669,5 @@
     <disable_collisions link1="link_048" link2="wrist_camera_link" reason="adjacent-cluster" />
     <disable_collisions link1="link_049" link2="link_050" reason="adjacent-cluster" />
     <disable_collisions link1="link_049" link2="wrist_camera_link" reason="adjacent-cluster" />
+    <disable_collisions link1="link_046" link2="link_047" reason="TemporaryTest"/>
 </robot>

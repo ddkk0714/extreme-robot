@@ -31,7 +31,11 @@ setup(
             'position_node = dynamixel_control.dynamixel_position_node:main',
             'dynamixel_position_node = dynamixel_control.dynamixel_position_node:main',
             'moveit_dynamixel_bridge = dynamixel_control.moveit_dynamixel_bridge:main',
+            'mock_moveit_dynamixel_bridge = '
+            'dynamixel_control.mock_moveit_dynamixel_bridge:main',
             'gripper_calibration = dynamixel_control.gripper_calibration:main',
+            'recorded_path_replay = '
+            'dynamixel_control.recorded_path_replay:main',
             'gripper_load_calibration = dynamixel_control.gripper_load_calibration:main',
             'yolo_bridge = dynamixel_control.yolo_to_dynamixel_bridge:main',
             'yolo_detection = dynamixel_control.yolo_detection_node:main',

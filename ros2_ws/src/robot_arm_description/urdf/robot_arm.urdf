@@ -1045,7 +1045,7 @@
     <parent link="link_009" />
     <child link="link_010" />
     <axis xyz="1.0 0.0 0.0" />
-    <limit upper="3.141593" lower="0.0" effort="100" velocity="100" />
+    <limit upper="3.141593" lower="-0.2" effort="100" velocity="100" />
   </joint>
   <joint name="fixed_joint_009" type="fixed">
     <origin xyz="0.0148 0.0 0.0" rpy="0 0 0" />
