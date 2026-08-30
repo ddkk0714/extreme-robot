@@ -68,6 +68,7 @@ from std_msgs.msg import Int32MultiArray
 from robot_arm_msgs.msg import ArmStatus, ArrivalStatus, ChassisMode, DetectedObject
 
 from . import contract
+from . import joint_limits
 from .qos_profiles import ARRIVAL_QOS, HEARTBEAT_QOS
 
 #: chassis_mode heartbeat 주기. FSM 의 chassis_mode_timeout(1.0s)보다 충분히 빨라야
@@ -212,7 +213,34 @@ class MissionConsole(Node):
             f'  base_link 좌표: ({tx:+.4f}, {ty:+.4f}, {tz:+.4f}) m\n'
             f'  방위각/반경   : {t_az:+7.1f}° / {t_r:.3f} m\n'
             + tip_line
+            + self._reach_line((tx, ty, tz))
         )
+
+    @staticmethod
+    def _reach_line(xyz):
+        """목표가 top-down 도달 범위 안인지 — pick 을 누르기 **전에** 걸러준다.
+
+        ⚠️ 왜 있는가 (2026-08-19 실기): pick 을 눌렀는데 팔이 전혀 안 움직였다. 원인은
+        목표가 도달 범위 밖(y 로 10cm 초과)이라 APPROACH 의 IK 가 실패한 것이었는데,
+        그 이유가 `arm_fsm` 로그 → launch 로그 **파일**에만 남아서(run_pick.sh 가 스택
+        출력을 /tmp 로 돌린다) 콘솔에는 arm_status=FAILED 밖에 안 보였다. 즉 사용자
+        입장에서는 "그냥 안 움직인다" 였다. 여기서 미리 알려주면 팔을 돌리기 전에 안다.
+
+        판정 근거는 `joint_limits.REACH_TOPDOWN` (관절 리밋 + URDF FK 산출물, 단일 출처).
+        경계상자는 **필요조건**이라 "밖 = 확실히 불가" 만 단정하고, 안쪽은 IK 에 맡긴다.
+        """
+        breaches = joint_limits.outside_topdown_reach(xyz)
+        if not breaches:
+            return ('  도달 판정     : 범위 안 — 시도해도 좋습니다 '
+                    '(최종 판정은 IK 가 합니다)\n')
+        detail = ', '.join(
+            f'{ax}={val:+.3f} 이 [{lo:+.3f}, {hi:+.3f}] 밖 ({over * 100:.1f}cm 초과)'
+            for ax, val, lo, hi, over in breaches)
+        return ('  도달 판정     : ❌ **도달 불가** — ' + detail + '\n'
+                '                  pick 을 눌러도 IK 가 실패해 팔이 안 움직입니다. '
+                '박스를 팔 쪽으로 당기거나 차체를 붙이세요.\n'
+                '                  (팔은 base_link -Y 로만 뻗습니다 — '
+                'arm_joint_1 이 ±14.3° 뿐이라 방위 회전으로 거리를 못 법니다)\n')
 
     def status_report(self):
         return (

@@ -55,7 +55,12 @@ fi
 #      먼저 뜬 브릿지는 SerialException("multiple access on port")으로 죽는다.
 #      증상이 "팔은 가는데 그리퍼가 안 닫힌다"로 보여서 원인을 찾기 어렵다.
 CONFLICT_PATTERN='(^|/| )(position_node|dynamixel_position_node|teleop_core|keyboard_teleop|joystick_teleop)( |$)'
-STACK_PATTERN='(^|/| )(arm_fsm|moveit_dynamixel_bridge|perception_node|move_group|robot_state_publisher|static_transform_publisher)( |$)'
+#      ⚠️ **pick.launch.py 가 띄우는 노드를 하나라도 빠뜨리면 안 된다.** 2026-08-19 에
+#      `wrist_camera`/`rviz2` 를 launch 에 추가하면서 이 목록을 같이 안 고쳤더니,
+#      새 스택을 띄워도 **옛 손목캠 프로세스가 살아남아 /dev/video8 을 계속 잡고**
+#      있었다 → 새 wrist_camera 는 장치를 못 열고, 화면에는 그냥 '손목캠이 안 나온다'
+#      로 보인다. RViz 도 두 창이 겹쳐 어느 쪽을 보는지 알 수 없게 된다.
+STACK_PATTERN='(^|/| )(arm_fsm|moveit_dynamixel_bridge|perception_node|move_group|robot_state_publisher|static_transform_publisher|wrist_camera|rviz2|detection_markers)( |$)'
 CONFLICTS="$(pgrep -f "${CONFLICT_PATTERN}|${STACK_PATTERN}" 2>/dev/null | grep -vx "$$" || true)"
 if [ -n "${CONFLICTS}" ]; then
   echo "[run_pick] 이미 떠 있는 텔레옵/픽 스택을 정리합니다: ${CONFLICTS}"
@@ -83,7 +88,11 @@ cleanup() {
     sleep 2
   fi
   # launch 가 놓친 자식(유령)까지. 이 저장소에서 반복된 실패 모드다.
-  pgrep -f '(^|/| )(arm_fsm|moveit_dynamixel_bridge|perception_node)( |$)' 2>/dev/null \
+  # wrist_camera 를 넣는 이유: 얘가 살아남으면 /dev/video8 을 계속 잡아 **다음 기동의
+  # 손목캠이 조용히 죽는다**(2026-08-19 에 실제로 걸렸다). rviz2 는 일부러 뺐다 —
+  # 위 프로세스그룹 kill 이 이 launch 의 rviz 는 이미 정리하고, 여기 넣으면 사용자가
+  # 따로 띄운 RViz 창까지 같이 죽는다.
+  pgrep -f '(^|/| )(arm_fsm|moveit_dynamixel_bridge|perception_node|wrist_camera)( |$)' 2>/dev/null \
     | grep -vx "$$" | xargs -r kill 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

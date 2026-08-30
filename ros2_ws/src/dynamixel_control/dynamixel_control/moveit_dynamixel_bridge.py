@@ -26,6 +26,10 @@ from dynamixel_control.tool_profiles import (
 
 ADDR_TORQUE_ENABLE = 64
 ADDR_OPERATING_MODE = 11
+#: Hardware Error Status(70) 의 Overload 비트. 파지 중 토크가 끊기는 주범이다.
+HWERR_OVERLOAD = 0x20
+MODE_POSITION = 3           # 단일회전 0~4095
+MODE_EXTENDED_POSITION = 4  # 다회전, tick 이 범위를 넘고 음수도 된다
 ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_GOAL_VELOCITY = 104
 ADDR_GOAL_PWM = 100
@@ -149,7 +153,14 @@ JOINT_CONFIG = {
     # 2026-08-07 실측: 4.040:1 — arm_joint_2 와 다른 감속기다(오타 아님)
     "arm_joint_3": {"id": 13, "center": 1855, "direction": 1,
                     "gear_ratio": 4.040, "extended": True},
-    "arm_joint_4": {"id": 12, "center": 1184, "direction": 1,
+    # 🔁 **2026-08-19 2차 정정: center 1184 → 1573.**
+    # zero_offset 실측(1184)으로는 이 축이 **34.2° 어긋나 있었다** — 발행값이 0 일 때
+    # 실물은 URDF -35° 자세였다(사용자 육안 대조). 영점을 잴 때 팔을 손으로 home 에
+    # 놓는데, 이 축은 그 판단이 그만큼 빗나가 있었던 것으로 보인다.
+    # ⚠️ 아래 리밋(joint_limits.py)도 같은 도메인에서 잰 값이라 **함께 이동**시켰다.
+    #    tick 자체는 안 바뀌므로 teleop_core 의 서보축 리밋은 손댈 필요가 없다
+    #    (그쪽은 center 가 아니라 tick 2048 에 앵커돼 있다).
+    "arm_joint_4": {"id": 12, "center": 1573, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
     "arm_joint_5": {"id": 16, "center": 675, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
@@ -289,6 +300,63 @@ class MoveItDynamixelBridge(Node):
     def __init__(self):
         super().__init__("moveit_dynamixel_bridge")
 
+        # --- 그리퍼 파라미터 (랙피니언 2모터 동일방향 구동, ID 3/4) ---
+        # gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
+        # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
+        self.declare_parameter("gripper_type", DEFAULT_GRIPPER)
+        self.gripper_type = self.get_parameter("gripper_type").value
+        preset = get_preset(self.gripper_type, self.get_logger())
+
+        self.declare_parameter("gripper_joints", preset["gripper_joints"])
+        self.declare_parameter("gripper_ids", preset["gripper_ids"])  # 빈 배열이면 그리퍼 비활성
+        self.declare_parameter("gripper_open_rad", preset["gripper_open_rad"])
+        self.declare_parameter("gripper_close_rad", preset["gripper_close_rad"])
+        self.declare_parameter("gripper_open_tick", preset["gripper_open_tick"])
+        self.declare_parameter("gripper_close_tick", preset["gripper_close_tick"])
+        # 다회전 그리퍼 여부. preset 에 없으면 단일회전으로 본다(보수적 — 다회전을
+        # 잘못 켜면 tick 이 wrap 없이 계속 나가 랙 끝단을 밀어붙인다).
+        self.declare_parameter("gripper_extended", bool(preset.get("extended", False)))
+        # 0 이면 쓰지 않는다(서보 기본 885=100% 유지). preset 주석에 값 근거 있음.
+        self.declare_parameter("gripper_goal_pwm", int(preset.get("gripper_goal_pwm", 0)))
+        # 캘리브 범위 밖으로 미끄러진 그리퍼 자동 복구(_recover_gripper_range 참고).
+        # 종료 시 토크가 풀리면 그리퍼가 닫힘 끝단을 지나쳐 미끄러지는데, 그 상태에서는
+        # gripper_goal_pwm 의 힘으로 못 빠져나온다 — 재기동마다 재발하므로 기본 활성.
+        # 모션 프로파일. 단위는 데이터시트 기준 Profile Velocity = 0.229 rev/min,
+        # Profile Acceleration = 214.577 rev/min^2.
+        # ⚠️ 팔 속도는 **여기서만** 정해진다(_write_motion_profile 주석 참고).
+        #    2026-08-12: 40(절반)으로 낮췄다가 **80 으로 되돌렸다.** 느리게 하면
+        #    arm_fsm 의 모션 완료 판정과 어긋난다 — `_publish_joint_trajectory` 가
+        #    `arm_move_speed`(0.5 rad/s)로 duration 을 추정해 그만큼만 기다리는데,
+        #    서보가 그보다 느려지면 **도착 전에 다음 상태로 넘어간다**(하강 도중
+        #    파지 등). 속도를 정말 낮추려면 arm_fsm 의 `arm_move_speed` 를 같은
+        #    비율로 낮춰 둘을 함께 맞춰야 한다.
+        self.declare_parameter("arm_profile_velocity", 80)
+        self.declare_parameter("gripper_profile_velocity", 80)
+        self.declare_parameter("profile_acceleration", 25)
+        self.declare_parameter("gripper_auto_recover", True)
+        # 파지 중 Overload(HW error 0x20) 트립이 나면 **REBOOT 로 되살리고 파지를 다시
+        # 건다**(2026-08-19 사용자 지시: "꽉 잡고 Overload 나면 재부팅해서 그 상태 유지").
+        #
+        # ⚠️ **이건 파지를 '유지' 하는 게 아니다.** 트립하는 순간 토크가 끊기므로 재부팅이
+        #    끝나기 전에 화물은 이미 떨어진다. 이 기능의 값어치는 "그리퍼가 죽은 채로
+        #    미션이 끝나는 것"을 막는 것이지, 화물을 붙잡아 두는 게 아니다.
+        # ⚠️ **Overload 를 반복해서 때리면 서보가 상한다.** 그 보호는 코일이 타는 걸
+        #    막으려고 있는 것이다. 그래서 무한 재부팅을 하지 않고
+        #    `gripper_overload_max_reboots` 회를 넘기면 포기하고 크게 알린다.
+        # ⚠️ **REBOOT 은 RAM 레지스터를 전부 날린다** — 특히 Goal PWM 이 885(무제한)로
+        #    돌아간다. 되살린 뒤 반드시 다시 써야 하며(_recover_gripper_overload), 안 하면
+        #    다음 파지는 885 로 물어 3.5초 만에 또 트립하는 악순환이 된다.
+        self.declare_parameter("gripper_overload_reboot", True)
+        self.declare_parameter("gripper_overload_max_reboots", 3)
+        self.declare_parameter("gripper_overload_window_s", 60.0)
+        # REBOOT 후 서보가 다시 응답하기까지 기다리는 시간 [s].
+        self.declare_parameter("gripper_reboot_settle_s", 1.0)
+        # ⚠️ 885(최대)로 두지 말 것. 2026-08-12 에 885 로 열림 끝단까지 밀어붙였다가
+        # **랙이 피니언에서 미끄러진** 것으로 보인다(직후 재캘리브에서 오프셋이 통째로
+        # ~1880 tick 이동). 실측상 500 이면 범위 밖에서 끌어내는 데 충분하다
+        # (PWM 500 으로 -938 → -434 를 1초). 끝단을 때리지 않는 것이 더 중요하다.
+        self.declare_parameter("gripper_recover_pwm", 500)
+        self.declare_parameter("gripper_recover_timeout", 6.0)
         self.declare_parameter("read_only", False)
         self.declare_parameter("mock_mode", False)
         self.declare_parameter("tool_type", "spur_1motor_gripper")
@@ -308,6 +376,40 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("cleaning_direction", 0)
         self.declare_parameter("cleaning_velocity_raw", 0)
 
+        self.gripper_joints = list(self.get_parameter("gripper_joints").value)
+        self.gripper_ids = list(self.get_parameter("gripper_ids").value)
+        self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
+        self.gripper_close_rad = float(self.get_parameter("gripper_close_rad").value)
+        self.gripper_open_tick = int(self.get_parameter("gripper_open_tick").value)
+        self.gripper_close_tick = int(self.get_parameter("gripper_close_tick").value)
+        self.gripper_extended = bool(self.get_parameter("gripper_extended").value)
+        self.gripper_goal_pwm = int(self.get_parameter("gripper_goal_pwm").value)
+        self.arm_profile_velocity = int(
+            self.get_parameter("arm_profile_velocity").value)
+        self.gripper_profile_velocity = int(
+            self.get_parameter("gripper_profile_velocity").value)
+        self.profile_acceleration = int(
+            self.get_parameter("profile_acceleration").value)
+        self.gripper_auto_recover = bool(
+            self.get_parameter("gripper_auto_recover").value)
+        self.gripper_overload_reboot = bool(
+            self.get_parameter("gripper_overload_reboot").value)
+        self.gripper_overload_max_reboots = int(
+            self.get_parameter("gripper_overload_max_reboots").value)
+        self.gripper_overload_window_s = float(
+            self.get_parameter("gripper_overload_window_s").value)
+        self.gripper_reboot_settle_s = float(
+            self.get_parameter("gripper_reboot_settle_s").value)
+        # Overload 재부팅 상태 — 마지막 그리퍼 goal tick(재부팅 후 되걸기용),
+        # 최근 재부팅 시각들(창 안 횟수 제한용), 복구 중 플래그.
+        self._last_gripper_goal_tick = None
+        self._gripper_reboot_times = []
+        self._gripper_recovering = False
+        self._gripper_overload_gave_up = False
+        self.gripper_recover_pwm = int(
+            self.get_parameter("gripper_recover_pwm").value)
+        self.gripper_recover_timeout = float(
+            self.get_parameter("gripper_recover_timeout").value)
         self.read_only = bool(self.get_parameter("read_only").value)
         self.mock_mode = bool(self.get_parameter("mock_mode").value)
         self.tool_type = str(self.get_parameter("tool_type").value)
@@ -343,33 +445,39 @@ class MoveItDynamixelBridge(Node):
             bool(self.cleaning_actuator_joint) and self.cleaning_actuator_id >= 0
             and self.cleaning_direction in (-1, 1) and self.cleaning_velocity_raw > 0
         )
-        try:
-            profiles = load_profiles(self.get_parameter('tool_profile_file').value)
-            if self.tool_type == 'cleaner' and self.cleaning_configured:
-                profiles['cleaner'].update({
-                    'calibrated': True,
-                    'actuator_ids': [self.cleaning_actuator_id],
-                    'joint_names': [self.cleaning_actuator_joint],
-                    'direction': self.cleaning_direction,
-                    'profile_velocity': self.cleaning_velocity_raw,
-                    'profile_acceleration': 1,
-                })
-            self.tool_manager = ToolManager(
-                profiles, ParameterToolIdentityProvider(self.tool_type),
-                mock_mode=self.mock_mode)
-            self.tool_selection = self.tool_manager.refresh('IDLE')
-        except (ToolProfileError, KeyError) as exc:
-            self.get_logger().error(f'tool profile rejected: {exc}')
-            self.tool_selection = None
-        self.tool_motion_allowed = bool(
-            self.tool_selection and self.tool_selection.valid
-            and not self.read_only and not self.mock_mode)
-        if self.temporary_jog_enabled and not self.read_only and not self.mock_mode:
-            # The calibrated profile remains invalid; temporary mode only permits
-            # the explicitly bounded single-actuator jog path below.
-            self.tool_motion_allowed = True
-        self.tool_profile = (
-            self.tool_selection.profile if self.tool_selection else {})
+        unregistered = [n for n in JOINT_CONFIG if joint_limits.get_limits(n) is None]
+        if unregistered:
+            self.get_logger().warn(
+                f"joint_limits 에 없는 축 {unregistered} — **리밋 없이 그대로 나간다.** "
+                "joint_limits.py 에 추가할 것."
+            )
+        provisional = [n for n in joint_limits.provisional_joints() if n in JOINT_CONFIG]
+        if provisional:
+            self.get_logger().warn(
+                f"관절 {provisional} 은 가동범위 실측이 없어 보수적으로 좁혀둔 상태다"
+                f"(±{joint_limits.PROVISIONAL_HALF_RANGE} rad). 이 축이 거의 안 움직이면 "
+                "리밋 탓이다 — scripts/measure_joint_limits.py 로 실측할 것."
+            )
+        # ⚠️ provisional 과 **위험 방향이 반대**라 따로 띄운다. 저쪽은 좁아서 축을 덜
+        # 쓰는 것(최악이 "조금밖에 안 돎")이고, 이쪽은 실측 스톱보다 넓혀둔 것이라
+        # 최악이 **하드스톱 충돌**이다. 같은 문장으로 뭉치면 심각도가 뒤바뀐다.
+        asserted = [n for n in joint_limits.user_asserted_joints() if n in JOINT_CONFIG]
+        if asserted:
+            spans = ', '.join(
+                f"{n}=[{joint_limits.get_limits(n)[0]:+.4f}, {joint_limits.get_limits(n)[1]:+.4f}]"
+                for n in asserted)
+            self.get_logger().warn(
+                f"관절 {asserted} 의 리밋은 **실측 하드스톱보다 넓혀둔 사용자 확인 값**이다 "
+                f"({spans}). 스윕 실측으로 확정된 값이 아니므로 이 축이 끝까지 갈 때 "
+                "기구가 부딪히지 않는지 눈으로 확인하면서 쓰고, "
+                "scripts/measure_joint_limits.py 로 재측정해 확정할 것."
+            )
+
+        # ⚠️ 포트를 열기 **전에** 배타 잠금. 이 브릿지와 position_node 는 같은
+        # /dev/ttyUSB0 을 잡으므로 "동시에 띄우지 말 것"이 계약인데, 지금까지는
+        # 규율로만 지켜졌고 어기면 축 하나만 조용히 빠지는 형태로 망가졌다
+        # (bus_lock 모듈 docstring 참고). fd 는 살려둬야 잠금이 유지된다.
+        self._bus_lock_fd = bus_lock.acquire(DEVICENAME, self.get_logger())
 
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -528,8 +636,14 @@ class MoveItDynamixelBridge(Node):
             "/dynamixel/controller_fault",
             10,
         )
-        self.tool_type_pub = self.create_publisher(String, '/tool/type', 10)
-        self.tool_status_pub = self.create_publisher(String, '/tool/status', 10)
+        # 그리퍼 Overload 재부팅 복구 중임을 알린다(내부용, DDS 계약과 무관).
+        # arm_fsm 이 이 구간의 effort 붕괴를 DROP 으로 오판해 GRIP_LOST 를 래치하지
+        # 않도록 게이트로 쓴다 — 복구 중엔 토크가 끊겨 effort 가 당연히 0 이다.
+        self.gripper_recovering_pub = self.create_publisher(
+            Bool,
+            "/dynamixel/gripper_recovering",
+            10,
+        )
 
         self.feedback_timer = self.create_timer(0.05, self.publish_joint_states)
         self.tool_status_timer = self.create_timer(0.5, self.publish_tool_status)
@@ -599,8 +713,218 @@ class MoveItDynamixelBridge(Node):
         return self.gripper_required_operating_modes.get(
             dxl_id, self.gripper_required_operating_mode)
 
-    def _enable_torque(self, dxl_id, label, required_mode=None):
-        """현재 위치를 goal로 검증 동기화한 뒤에만 해당 ID의 torque를 켠다."""
+    def _warn_if_torque_off(self):
+        """토크가 꺼진 채 모션 명령이 들어오면 크게 알린다.
+
+        ⚠️ 2026-08-12 실기: 콘솔이 종료하며 토크를 풀어둔 상태에서 픽을 돌렸더니
+        FSM 은 PERCEIVE→…→GRASP 전 구간을 정상 수행하고 브릿지도 goal 을 다 썼는데
+        **서보가 전부 무시**해서 팔이 한 tick 도 안 움직였다. 어디에도 에러가 없어
+        "프로그램은 도는데 안 움직인다" 로만 보인다 — 이 저장소가 반복해서 밟는
+        조용한 실패다. 여기서 한 번은 말해준다.
+
+        자동으로 토크를 켜지는 **않는다**. 사람이 팔을 만지려고 일부러 푼 것일 수
+        있고, 그때 명령 하나에 팔이 다시 잠기면 손을 다친다.
+        """
+        off = sorted(self.active_ids - self.torque_enabled_ids)
+        if not off:
+            return
+        self.get_logger().error(
+            f"모션 명령을 받았지만 ID {off} 의 토크가 꺼져 있습니다 — 서보가 무시하므로 "
+            "팔은 움직이지 않습니다(에러 없이 조용히). 켜려면 mission_console 의 "
+            "'torque on' 또는 /dynamixel/torque_request 에 [1] 발행.")
+
+    def torque_request_callback(self, msg):
+        """`[enable, id...]` → 해당 ID 토크 on/off. id 생략 시 등록된 전 축.
+
+        ⚠️ 끄면 팔이 중력으로 처진다. 그래서 "요청받았으니 끈다" 이상은 하지 않는다 —
+        여기서 자세를 미리 접거나 하는 배려를 넣으면, 정작 급히 끊고 싶을 때 그 동작이
+        먼저 나가버린다(안전 게이트에 부가 동작을 넣지 않는다는 이 저장소의 원칙).
+        """
+        data = list(msg.data)
+        if not data:
+            self.get_logger().error("torque_request: [enable, id...] 형식이어야 합니다")
+            return
+        if self.read_only:
+            self.get_logger().warn("torque_request 무시 — read_only 모드는 레지스터를 쓰지 않습니다")
+            return
+
+        enable = 1 if data[0] else 0
+        ids = data[1:] or sorted(self.active_ids)
+        applied, failed = [], []
+        for dxl_id in ids:
+            if dxl_id not in self.active_ids:
+                self.get_logger().warn(f"torque_request 무시 — 등록 안 된 ID {dxl_id}")
+                continue
+            if enable:
+                # ⚠️ 토크를 켜기 **전에** Goal Position 을 현재 위치로 덮어쓴다.
+                # 토크가 꺼진 동안 팔은 중력으로 처지는데 Goal 레지스터에는 마지막
+                # 명령값이 그대로 남아 있다 — 그냥 켜면 서보가 그 옛 목표로 **튄다**
+                # (teleop_core 의 resume 이 _sync_goal_to_measured 를 하는 것과 같은 이유).
+                pos, res, err = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+                if res == 0 and err == 0:
+                    self.packet_handler.write4ByteTxRx(
+                        self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
+                else:
+                    self.get_logger().error(
+                        f"ID {dxl_id} 현재 위치를 못 읽어 goal 동기화를 건너뜁니다 — "
+                        "토크 인가 시 팔이 옛 목표로 튈 수 있습니다")
+            result, error = self.packet_handler.write1ByteTxRx(
+                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
+                TORQUE_ENABLE if enable else TORQUE_DISABLE)
+            if result != 0 or error != 0:
+                failed.append(dxl_id)
+                continue
+            applied.append(dxl_id)
+            if enable:
+                self.torque_enabled_ids.add(dxl_id)
+            else:
+                self.torque_enabled_ids.discard(dxl_id)
+
+        word = "인가" if enable else "해제"
+        if applied:
+            self.get_logger().warn(f"토크 {word}: ID {applied}")
+        if failed:
+            self.get_logger().error(f"토크 {word} 실패: ID {failed}")
+
+    def _check_gripper_in_calibrated_range(self, dxl_id):
+        """그리퍼가 캘리브 tick 범위 **밖**에 있으면 크게 경고한다.
+
+        ⚠️ 2026-08-12 실기: 토크를 끄고 팔을 손으로 다루는 동안 그리퍼가 닫힘 끝단
+        (-401)보다 786 tick 아래(-1187)까지 밀려 들어갔다. 그 영역에서는
+        `gripper_goal_pwm`(280, 파지 토크 상한)의 힘으로 **되돌아 나올 수 없다** —
+        실측으로 tick -890 부근에서 전류 316 을 뽑으며 스톨했고, 양방향 모두 막혔다.
+        정상 범위 안에서는 같은 PWM 280 으로 전 구간을 2.5초에 여닫는다(실측).
+
+        증상이 지독하다: 그리퍼가 "안 닫히고", `/joint_states` effort 는 스톨 전류
+        316 을 계속 보고해 `grasp_effort_thresh`(250)를 넘으므로 FSM 은 **빈손인데
+        파지 성공으로 판정**한다. 어느 로그에도 에러가 안 뜬다.
+
+        복구는 Goal PWM 을 일시적으로 올려(500 이상) 범위 안으로 끌어낸 뒤 되돌리는
+        것이다. 자동으로 하지 않는 이유는 그 상한이 Overload 트립을 막는 안전장치라,
+        올릴지는 사람이 상황을 보고 정해야 하기 때문이다.
+        """
+        pos, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+        if result != 0 or error != 0:
+            return
+        tick = pos - (1 << 32) if pos >= (1 << 31) else pos
+        lo = min(self.gripper_close_tick, self.gripper_open_tick)
+        hi = max(self.gripper_close_tick, self.gripper_open_tick)
+        margin = max(1, int(0.05 * (hi - lo)))
+        if lo - margin <= tick <= hi + margin:
+            return
+        self.get_logger().error(
+            f"그리퍼(id={dxl_id})가 캘리브 범위 밖입니다: tick={tick} "
+            f"(정상 {lo}~{hi}). 이 상태에서는 Goal PWM {self.gripper_goal_pwm} 의 힘으로 "
+            "빠져나오지 못해 '안 닫히는' 것처럼 보이고, 스톨 전류가 파지 임계를 넘어 "
+            "**빈손인데 파지 성공으로 오판**합니다.")
+        if self.gripper_auto_recover:
+            self._recover_gripper_range(dxl_id, tick)
+        else:
+            self.get_logger().error(
+                "gripper_auto_recover=false 이므로 자동 복구하지 않습니다 — Goal PWM 을 "
+                "일시적으로 500 이상으로 올려 범위 안으로 되돌린 뒤 다시 시작하세요.")
+
+    def _recover_gripper_overload(self, dxl_id):
+        """파지 중 Overload 트립을 REBOOT 로 되살리고 마지막 파지 목표를 다시 건다.
+
+        2026-08-19 사용자 지시("꽉 잡고 Overload 나면 재부팅해서 그 상태 유지")로 추가.
+
+        ## 이게 무엇을 하고 무엇을 못 하는가
+
+        Overload(HW error 0x20)가 래치되면 서보는 **토크를 끊고** REBOOT 전까지 어떤
+        명령에도 응답하지 않는다. 즉 트립하는 순간 이미 손이 풀린 것이라, 재부팅은
+        **화물을 붙잡아 두지 못한다.** 이 함수의 값어치는 "그리퍼가 죽은 채로 남아
+        이후 미션이 전부 실패하는 것"을 막는 데 있다.
+
+        ## REBOOT 이 날리는 것 (제일 중요)
+
+        REBOOT 은 RAM 을 초기화한다 — **Goal PWM 이 885(무제한)로, Profile 이 0(최고속)
+        으로, 토크가 OFF 로, Goal Position 이 초기값으로** 돌아간다. 되살린 뒤 이걸 다시
+        안 써주면 다음 파지는 885 로 물어 **3.5초 만에 또 트립**하고, 프로파일 0 은
+        순간 과전류로 토크가 풀리는 별개의 알려진 실패(그리퍼 Profile 25/80 규칙)를
+        일으킨다. 그래서 기동 시와 **똑같은 순서**로 다시 세운다:
+            _enable_torque(모드/프로파일/토크) → _write_gripper_goal_pwm → Goal Position
+
+        Operating Mode(EEPROM)는 살아남지만 `_enable_torque` 가 어차피 확인·설정한다.
+
+        ## 왜 무한 재시도를 안 하는가
+
+        Overload 보호는 코일이 타는 걸 막으려고 있는 장치다. 반복해서 때리면 서보가
+        상한다. `gripper_overload_window_s` 안에서 `gripper_overload_max_reboots` 회를
+        넘기면 포기하고 크게 알린다 — 그 시점엔 파지력 설정이 그 물체에 안 맞는
+        것이므로, 재부팅이 아니라 사람이 PWM 을 낮추거나 마찰 패드를 붙여야 한다.
+        """
+        now = time.time()
+        self._gripper_reboot_times = [
+            t for t in self._gripper_reboot_times
+            if now - t <= self.gripper_overload_window_s]
+        if len(self._gripper_reboot_times) >= self.gripper_overload_max_reboots:
+            if not self._gripper_overload_gave_up:
+                self._gripper_overload_gave_up = True
+                self.get_logger().error(
+                    f"그리퍼(id={dxl_id}) Overload 가 "
+                    f"{self.gripper_overload_window_s:.0f}초 안에 "
+                    f"{len(self._gripper_reboot_times)}회 반복돼 자동 재부팅을 멈춥니다. "
+                    "재부팅을 더 반복하면 서보 코일이 상합니다. 지금 설정으로는 이 물체를 "
+                    "못 뭅니다 — gripper_goal_pwm 을 낮추고 손가락 마찰(고무/실리콘 패드)을 "
+                    "올리세요. 미끄럼 힘은 μ×법선력인데 PWM 은 법선력만 건드립니다.")
+            return
+        self._gripper_reboot_times.append(now)
+
+        self._gripper_recovering = True
+        self.gripper_recovering_pub.publish(Bool(data=True))
+        self.get_logger().error(
+            f"그리퍼(id={dxl_id}) Overload 트립 — 토크가 끊겼습니다(화물을 들고 있었다면 "
+            f"이미 놓쳤습니다). REBOOT 으로 되살립니다 "
+            f"({len(self._gripper_reboot_times)}/{self.gripper_overload_max_reboots}회).")
+        try:
+            self.packet_handler.reboot(self.port_handler, dxl_id)
+            time.sleep(self.gripper_reboot_settle_s)
+            # 기동 시와 같은 순서로 재설정. 하나라도 빠지면 다음 파지가 더 빨리 트립한다.
+            if not self._enable_torque(dxl_id, f"gripper(id {dxl_id}) 재부팅 후",
+                                       self.gripper_extended,
+                                       self.gripper_profile_velocity):
+                self.get_logger().error(
+                    f"그리퍼(id={dxl_id}) 재부팅 후 토크 인가 실패 — 그리퍼가 죽은 "
+                    "상태입니다. 스택을 재기동하세요.")
+                return
+            self._write_gripper_goal_pwm(dxl_id)
+            if self._last_gripper_goal_tick is not None:
+                self.packet_handler.write4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_POSITION,
+                    self._last_gripper_goal_tick & 0xFFFFFFFF)
+                self.get_logger().warn(
+                    f"그리퍼(id={dxl_id}) 되살아났습니다 — 마지막 목표 tick "
+                    f"{self._last_gripper_goal_tick} 로 다시 뭅니다. "
+                    "⚠️ 화물이 이미 떨어졌다면 빈손을 쥐는 것이니 눈으로 확인하세요.")
+        finally:
+            self._gripper_recovering = False
+            self.gripper_recovering_pub.publish(Bool(data=False))
+
+    def _recover_gripper_range(self, dxl_id, tick):
+        """캘리브 범위 밖으로 미끄러진 그리퍼를 열림 끝단으로 끌어낸다.
+
+        ⚠️ 왜 매번 필요한가: `destroy_node()` 가 종료 시 전 ID 토크를 해제하는데,
+        그리퍼는 힘을 잃으면 닫힘 방향으로 미끄러져 **끝단을 지나쳐 버린다**(2026-08-12
+        실측: +1070 → -1259). 즉 스택을 재기동할 때마다 재발한다. 사람이 매번 손으로
+        PWM 을 올려 빼내는 건 현실적이지 않아 자동화했다.
+
+        복구는 파지 토크 상한(`gripper_goal_pwm`)을 **일시적으로** 올려서 한다 — 그
+        상한은 물체를 문 채 무한정 미는 걸 막는 장치지, 빈 그리퍼를 옮기는 데 필요한
+        힘까지 제한하려던 게 아니다. 실측으로 PWM 885 에서 1.5초 만에 끝나고 움직이는
+        중 전류는 40~90(무부하 수준)까지 떨어진다. 끝나면 반드시 원래 값으로 되돌린다.
+        """
+        # 끝단(open_tick) 자체를 겨냥하지 않는다 — 거기는 기구적 스토퍼라 밀어붙이면
+        # 랙이 미끄러진다(2026-08-12, 그때 오프셋이 통째로 ~1880 tick 이동했다).
+        # 범위 안쪽 15% 지점이면 "밖에서 안으로" 라는 목적은 그대로 달성하면서
+        # 스토퍼를 때리지 않는다.
+        span = self.gripper_open_tick - self.gripper_close_tick
+        target = int(self.gripper_open_tick - 0.15 * span)
+        self.get_logger().warn(
+            f"자동 복구 시도: Goal PWM {self.gripper_goal_pwm} → "
+            f"{self.gripper_recover_pwm} 로 일시 상향, tick {tick} → {target} 로 이동")
         try:
             with self._bus_lock:
                 torque = self._read_register(
@@ -1344,6 +1668,61 @@ class MoveItDynamixelBridge(Node):
 
         self.group_sync_write.clearParam()
 
+    # ------------------------------------------------------------------ gripper
+    def execute_gripper(self, goal_handle):
+        trajectory = goal_handle.request.trajectory
+
+        result = FollowJointTrajectory.Result()
+
+        if not self.gripper_ids:
+            self.get_logger().warn("Gripper goal received but gripper_ids is empty — ignored")
+            goal_handle.succeed()
+            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+            return result
+
+        if trajectory.points:
+            point = trajectory.points[-1]
+            name_to_pos = dict(zip(trajectory.joint_names, point.positions))
+            # 단일 구동 조인트(gripper_left_pinion_joint)만 사용 — 나머지 3개(우 피니언·좌우 랙)는
+            # URDF <mimic> 으로 종속된다. 두 서보(id 3,4)에는 같은 goal_tick 을 보낸다.
+            target_rad = None
+            for jn in self.gripper_joints:
+                if jn in name_to_pos:
+                    target_rad = name_to_pos[jn]
+                    break
+            if target_rad is not None:
+                self._write_gripper(target_rad)
+            else:
+                self.get_logger().warn(
+                    f"Gripper goal has no known finger joint {self.gripper_joints}"
+                )
+
+        goal_handle.succeed()
+        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        result.error_string = "Gripper command sent to Dynamixel"
+        return result
+
+    def _write_gripper(self, rad):
+        if self.read_only:
+            self.get_logger().warn("Read-only mode: ignoring gripper command")
+            return
+        goal_tick = self.gripper_pos_to_tick(rad)
+        # Overload 재부팅 뒤 되걸 목표. REBOOT 은 Goal Position 도 날리므로 마지막
+        # 명령을 기억해 두지 않으면 되살아난 그리퍼가 **아무것도 안 쥔 채로** 선다.
+        self._last_gripper_goal_tick = goal_tick
+        for gid in self.gripper_ids:
+            result, error = self.packet_handler.write4ByteTxRx(
+                self.port_handler, gid, ADDR_GOAL_POSITION, goal_tick
+            )
+            if result != 0 or error != 0:
+                self.get_logger().warn(
+                    f"Gripper write failed: id={gid}, result={result}, error={error}"
+                )
+        self.get_logger().info(
+            f"gripper -> {rad:.4f} rad -> tick {goal_tick} "
+            f"(ids {self.gripper_ids})"
+        )
+
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
         if self.mock_mode:
@@ -1425,20 +1804,57 @@ class MoveItDynamixelBridge(Node):
                         'id': dxl_id, 'joint': '', 'position': None,
                         'effort': None, 'online': False}
                     continue
-                load_raw, tick, hw_error = sample
-                fault = fault or hw_error != 0
-                loads.append(abs(load_raw))
-                tick = self._tool_position_tick(dxl_id, tick)
-                positions.append(tick)
-                self._tool_samples[dxl_id] = {
-                    'id': dxl_id,
-                    'joint': (joint_names[0] if joint_names else ''),
-                    'position': int(tick), 'effort': float(abs(load_raw)),
-                    'online': hw_error == 0}
-            if joint_names and loads:
-                msg.name.append(joint_names[0])
-                msg.position.append(float(positions[0]))
-                msg.effort.append(float(max(loads)))
+                feedback_raw, tick, hw_error, velocity_raw = sample
+                if hw_error != 0:
+                    fault = True
+                # Extended Position 축은 tick 이 4095 를 넘고 음수로도 내려가므로
+                # 부호 있는 정수로 해석해야 한다 — 안 하면 다회전 축이 한 바퀴 넘는
+                # 순간 위치가 갑자기 +2^32 쪽으로 튄다.
+                signed_tick = to_signed(tick, LEN_PRESENT_POSITION)
+                msg.name.append(joint_name)
+                msg.position.append(self.tick_to_rad(joint_name, signed_tick))
+                # 속도도 위치와 같은 관절 도메인으로 맞춘다 — 기어비만큼 관절이 느리다.
+                msg.velocity.append(
+                    velocity_raw * VELOCITY_LSB_TO_RAD_S
+                    / (config["direction"] * self._joint_gear_ratio(joint_name))
+                )
+                msg.effort.append(float(feedback_raw))
+
+        # XL430-W250 그리퍼: 주소 126은 signed Present Load(0.1% 추정 부하)다.
+        # 랙피니언 2모터(ID 3,4)를 함께 읽어 하나의 논리 조인트(gripper_left_pinion_joint)로
+        # 보고한다 — position(rad)=대표(첫 응답) 모터 tick, effort=가장 큰 abs(load).
+        # 한 모터라도 부하가 크면 파지로 보는 보수적(안전 측) 집계이며, FSM 이 이 effort 로
+        # 파지/DROP 을 판정한다.
+        gripper_samples = []
+        for gid in self.gripper_ids:
+            if gid not in self.active_ids:
+                fault = True
+                continue
+            sample = self._read_sample(gid)
+            if sample is None:
+                fault = True
+                continue
+            load_raw, tick, hw_error, velocity_raw = sample
+            if hw_error != 0:
+                fault = True
+            # Overload(0x20) 는 파지 중 가장 흔한 트립이고, 나면 REBOOT 전까지 서보가
+            # 죽어 있다. 자동 복구를 켜 뒀으면 여기서 되살린다.
+            if (hw_error & HWERR_OVERLOAD) and self.gripper_overload_reboot \
+                    and not self._gripper_recovering and not self.read_only:
+                self._recover_gripper_overload(gid)
+            gripper_samples.append((load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
+
+        if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
+            representative_tick = gripper_samples[0][1]
+            representative_velocity_raw = gripper_samples[0][2]
+            max_abs_load = max(abs(sample[0]) for sample in gripper_samples)
+            finger_rad = self.gripper_tick_to_pos(representative_tick)
+            finger_vel = self.gripper_velocity_to_rad_s(representative_velocity_raw)
+            for jn in self.gripper_joints:
+                msg.name.append(jn)
+                msg.position.append(finger_rad)
+                msg.velocity.append(finger_vel)
+                msg.effort.append(float(max_abs_load))
 
         self.joint_state_pub.publish(msg)
         self.fault_pub.publish(Bool(data=fault))

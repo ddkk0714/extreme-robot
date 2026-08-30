@@ -35,9 +35,50 @@ GRIPPER_PRESETS = {
         # ⚠️ close_tick 이 **음수**다 → 다회전(Extended Position) 영역이라 아래 "extended"
         #    가 True 여야 한다. 단일회전으로 clamp 하면 완전 닫힘이 tick 0 에서 잘려
         #    401 tick(≈35°) 덜 닫힌다.
-        # 대표 논리 joint의 역변환은 ID3 endpoint를 사용한다.
-        "gripper_open_tick": 1056,
-        "gripper_close_tick": -526,
+        # 2026-08-12 재실측(measure_gripper_endpoints.py, 손으로 끝단 잡고 측정).
+        # 이전 값(2026-08-07): open=1083 / close=-401, stroke 1484.
+        # ⚠️ 두 가지가 동시에 바뀌었다 — 이건 그냥 "다시 쟀다" 가 아니다:
+        #   1) 오프셋이 통째로 ~1880 tick 내려갔다. 재측정 직전까지 그리퍼는 +1069 에
+        #      "열림"으로 앉아 있었는데 손으로 잡은 진짜 열림은 -805 였다 →
+        #      **랙이 피니언에서 미끄러졌다**고 볼 수밖에 없다(그 사이 한 일은 Goal PWM
+        #      885 로 열림 끝단까지 밀어붙인 것뿐이다 — 이 도구가 경고하는 바로 그 행위).
+        #   2) 스트로크가 1484 → 1098 로 26% 줄었다. 스트로크는 기구 치수라 미끄러짐만
+        #      으로는 안 변한다 → 옛 측정이 **양 끝단을 억지로 밀어 넣어** 부풀었을
+        #      가능성이 크다(오늘 그리퍼가 close 보다 786 tick 더 들어간 것과 같은 맥락).
+        # ⚠️ **아직 1회 측정이다.** 스트로크가 rad↔tick 환산 배율을 통째로 정하므로,
+        #    한 번 더 재서 재현되는지 확인할 것. 안 맞으면 끝단을 일관되게 못 잡은 것이다.
+        #    (사용자 판단으로 재현성 확인은 생략하고 이 값으로 진행 — 파지가 계통적으로
+        #     어긋나면 stroke 를 첫 번째 의심 대상으로 볼 것.)
+        # ⚠️ close_tick 은 손으로 잰 -1903 이 아니라 **서보가 실제로 도달하는 -1865** 다
+        #    (2026-08-12 실측). 손 힘으로는 -1903 까지 들어가지만 Goal PWM 280 으로는
+        #    마지막 38 tick(스트로크의 3.5%)을 못 민다. 도달 못 하는 값을 목표로 두면
+        #    서보가 **영원히 밀며 전류 210 을 유지**하고, 그게 파지 임계 250 에 40 밖에
+        #    안 남아 **빈손을 파지 성공으로 오판**한다(2026-08-12 오전에 실제로 겪었다).
+        #    도달 가능한 값으로 두면 서보가 멈추고 빈손 effort 가 바닥으로 떨어진다.
+        #    파지 자체는 물체가 먼저 막으므로 이 38 tick 은 쓰이지 않는 구간이다.
+        #
+        # 🔁 **2026-08-19 재조립 후 재측정.** 손(토크 OFF) 실측 끝단은
+        #    닫힘 -1933 / 열림 -796 (stroke 1137). 열림은 무부하라 그대로 쓴다.
+        #    ⚠️ **닫힘은 손 실측값을 그대로 쓰지 않는다** — 위에 적힌 이유 그대로다.
+        #    옛 회차의 (손 -1903 → PWM280 도달 -1865) 관계에서 나온 38 tick 마진을
+        #    새 손 끝단 -1933 에 그대로 적용해 **-1895** 로 둔다.
+        #    ⚠️ 이 38 은 **옛 조립 상태에서 잰 값을 가정으로 옮겨온 것**이다. 실기
+        #    파지 판정을 믿기 전에 Goal PWM 280 으로 닫아 실제로 어디서 멈추는지
+        #    재확인할 것(토크 인가가 필요해 read_only 캘리브로는 못 잰다). 그 전까지
+        #    빈손 effort 가 파지 임계(250) 근처로 뜨면 이 값부터 의심한다.
+        # 🔻 **2026-08-19 사용자 지시로 close_tick -1895 → -1925 (3.0° 더 닫힘).**
+        #    요청은 "5도 더"였지만 **5°(49.3 tick)는 하드스톱을 11 tick 넘어간다** —
+        #    손(토크 OFF) 실측 완전닫힘이 -1933 이라 여유가 38 tick(=3.85°)뿐이다.
+        #    도달 못 하는 목표를 두면 위에 적힌 실패가 그대로 재현되므로(서보가 영원히
+        #    밀며 전류 유지 → 빈손 effort 가 파지 임계에 붙어 헛파지를 성공으로 오판)
+        #    하드스톱에 8 tick 여유를 남긴 -1925 로 뒀다(사용자 선택).
+        #    환산: stroke 1099 tick / 1.9444 rad = 565.2 tick/rad = 9.86 tick/°.
+        #
+        #    ⚠️ **여유 8 tick 은 얇다.** PWM 600 이 이 값에 실제로 도달하는지 확인할 것 —
+        #    도달하면 정지 후 빈손 effort 가 바닥으로 떨어지고, 못 하면 계속 밀며
+        #    effort 가 뜬 채 유지된다. 후자면 -1915 쯤으로 되물릴 것.
+        "gripper_open_tick": -796,
+        "gripper_close_tick": -1925,
         # 이 그리퍼는 Extended Position Control Mode 로 돌아간다(실기 ID 3 확인). 스트로크가
         # 서보 한 바퀴에 육박해 단일회전으로 두면 wrap 경계가 사용 범위 한가운데 걸려
         # 양 끝이 막힌다 — 2026-08-02 에 실제로 그 증상을 겪었다(teleop_core 의
@@ -79,16 +120,23 @@ GRIPPER_PRESETS = {
         #    물체 종류·파지 위치에 따라 193 이 더 낮아질 수 있으니, 파지했는데 실패로
         #    보면 grasp 를 먼저 낮출 것. close_tick 을 다시 건드리면 이 두 값도 반드시
         #    같이 재측정해야 한다 — 스케일이 그쪽에 묶여 있다.
+        # 🔺 **2026-08-19 close_tick 을 -1895 → -1925 로 30 tick 더 깊게 바꿨다 —
+        #    아래 두 값은 아직 그 상태에서 재측정하지 않았다.** 더 깊이 닫으면 빈손이
+        #    끝단에 더 강하게 눌려 빈손 effort 가 91 보다 올라갈 수 있고, 그러면
+        #    drop(120)·grasp(140) 마진이 그만큼 얇아진다. 빈손인데 파지로 잡히거나
+        #    CARRY 에서 낙하 오판이 나면 **여기가 아니라 빈손 effort 를 먼저 재라.**
         "grasp_effort_thresh": 140.0,  # 빈손(91) 과 파지(193) 사이
         "drop_effort_thresh": 120.0,   # 빈손 위 — 물체가 빠지면 빈손 수준으로 떨어진다
         # FSM 이 개폐 명령을 낸 뒤 effort 를 읽기까지 기다리는 시간 [s].
         #
         # ⚠️ 2026-08-09 실기: 1.0 이면 **닫히는 도중에 판정**해서 grasp effort 가 0.0 으로
         #    읽히고 파지가 무조건 실패한다. 서보 프로파일로 계산한 완전 개폐 시간은
-        #      스트로크 1060 tick (open -805 → close -1865, 2026-08-12 재실측)
+        #      스트로크 1129 tick (open -796 → close -1925, 2026-08-19)
         #      Profile Velocity 80 = 18.3 rev/min = 1251 tick/s
         #      Profile Acceleration 25 = 1.49 rev/s^2 → 가감속 각 0.20s(128 tick)
-        #      → 2*0.20 + (1060-256)/1251 = **1.04 s**  (옛 1484 tick 기준으로는 1.39 s)
+        #      → 2*0.20 + (1129-256)/1251 = **1.10 s**
+        #      (옛 1099 tick 기준 1.07s / 그 전 1060 tick 기준 1.04s — 어느 쪽이든
+        #       여유 2.5s 안이라 이번 close_tick 변경으로 이 값은 안 바꿨다)
         #    물체에 닿으면 감속해 더 걸리므로 여유를 둬 2.5 로 잡는다.
         #
         # 이 값은 gripper_open_tick/gripper_close_tick 이나 브릿지의 PROFILE_VELOCITY/
@@ -118,86 +166,80 @@ GRIPPER_PRESETS = {
         #
         # 조정 방향: 물체가 미끄러지면 올리고, 트립이 재발하면 내린다. 올릴 때는 **유지
         # 시간을 반드시 30초 이상 확인할 것** — 400 도 17초까지는 멀쩡해 보였다.
-        "gripper_goal_pwm": 280,
-        "command_calibrated": True,
-        "observed_operating_modes": {3: 4, 4: 3},
-        # 단일축 preset과의 하위 호환용. dual 경로는 위 per-ID map만 사용한다.
-        "observed_operating_mode": -1,
-        "required_operating_mode": -1,
-        "kind": "gripper",
-        "allowed_mission": "PICK_PLACE",
-        "arm_tip_link": "link_043",
-        "tip_link": "link_043",
-        "profile_acceleration": 25,
-        "profile_velocity": 80,
-        "max_abs_current": 300,
-        "stall_timeout": 2.0,
-        "motion_timeout": 10.0,
-        "goal_tolerance_ticks": 10,
-    },
-    "single_motor_gripper": {
-        # HW-8 단일 서보 그리퍼의 복원 URDF/MoveIt 모델에서 실제 구동축은
-        # gripper_drive_joint(parent=link_051, child=link_055)였고 나머지 조 관절은
-        # 이 축을 mimic 했다. 현재 활성 랙피니언 URDF에는 이 단일모터 형상이 없지만,
-        # 잘못된 gripper_left_pinion_joint/end_effector_joint로 대체하지 않고 확인된
-        # 논리 축 이름을 보존한다. 형상 복원 전에도 FSM/preset 선택 계약은 검증 가능하다.
-        "gripper_joints": ["gripper_drive_joint"],
-        "gripper_ids": [5],
-        # 2026-08-11 ID5 Mode 3, Profile Acceleration=5/Velocity=20 실측.
-        # 52↔615 명령을 3-cycle씩 두 번 반복했을 때 매 cycle 실제 범위가 80↔588,
-        # stroke=508 tick(44.65°)으로 동일했고 Hardware Error/통신 오류가 없었다.
-        # 이 tick endpoint만 확정되었으며 위치-rad 매핑, operating mode/PWM/effort
-        # 임계값은 아직 sentinel이다. 파지 캘리브 전 command_calibrated=False 유지.
-        "gripper_open_tick": 80,
-        "gripper_close_tick": 588,
-        "gripper_open_rad": 0.0,
-        "gripper_close_rad": 0.0,
-        "grasp_effort_thresh": 1.0e9,
-        "drop_effort_thresh": -1.0,
-        "gripper_action_time": 0.0,
-        "gripper_goal_pwm": 0,
-        "command_calibrated": False,
-        "observed_operating_mode": -1,
-        "required_operating_mode": -1,
-        "kind": "gripper",
-        "allowed_mission": "PICK_PLACE",
-        "arm_tip_link": "link_051",
-        "tip_link": "single_gripper_grasp_frame",
-        "profile_acceleration": 0,
-        "profile_velocity": 0,
-        "max_abs_current": 0,
-        "stall_timeout": 0.0,
-        "motion_timeout": 0.0,
-        "goal_tolerance_ticks": 0,
-    },
-    "rotary_id5": {
-        # PICK_PLACE에서는 선택되지 않는다. 기존 rotary workflow 보존용 별도 preset.
-        "gripper_joints": ["end_effector_joint"],
-        "gripper_ids": [5],
-        "gripper_open_tick": 2446,
-        "gripper_close_tick": 3186,
-        "gripper_open_rad": 1.0471975511966,
-        "gripper_close_rad": -0.872664625997165,
-        "grasp_effort_thresh": 80.0,
-        "drop_effort_thresh": 20.0,
-        "gripper_action_time": 1.0,
-        "command_calibrated": True,
-        "observed_operating_mode": 3,
-        "required_operating_mode": 3,
-        "kind": "rotary",
-        "allowed_mission": "ROTARY_TOOL",
-        "arm_tip_link": "link_043",
-        "tip_link": "link_043",
-        "profile_acceleration": 5,
-        "profile_velocity": 20,
-        "max_abs_current": 100,
-        "stall_timeout": 2.0,
-        "motion_timeout": 10.0,
-        "goal_tolerance_ticks": 10,
+        #
+        # 🔺 **2026-08-19 사용자 지시로 280 → 400 (1.43배).** 파지력이 약해 물체가
+        #    미끄러졌다. 요청은 "2배"(=560)였지만 위 스윕상 560 은 400(17초)과
+        #    885(3.5초) 사이라 미션 중 확실히 트립하므로 올리지 않았다.
+        #
+        #    ⚠️ **400 은 무한정 버티는 값이 아니다 — 17초 트립이다.** 파지부터 해제까지
+        #    총 유지 시간을 **15초 안**에 끝내야 한다. 2026-08-19 실측 미션에서는
+        #    23초가 걸렸는데(대부분 CARRY 에서 운영자의 drop/stow 입력을 기다린 시간),
+        #    그대로면 트립한다. `arm_fsm` 이 `grip_hold_warn_s`(기본 12초)에서 경고를
+        #    띄우니 그 전에 drop/stow 할 것.
+        #    트립하면 Hardware Error 0x20 래치 + 토크 차단 → 화물 낙하, REBOOT 전까지
+        #    무응답이다.
+        #
+        #    미끄러짐이 계속되면 PWM 을 더 올리지 말고 **손가락 마찰(고무/실리콘 패드)**
+        #    을 올리는 게 맞다 — 미끄럼 힘은 μ×법선력이고 PWM 은 법선력만 건드린다.
+        #    금속/플라스틱 조(μ≈0.2) → 실리콘(μ≈1.0) 이면 유효 파지력이 몇 배가 되면서
+        #    트립 위험은 0 이다. (그 경우 손목카메라 `fill` 임계값 재측정 필요할 수 있음)
+        #
+        # 🔺🔺 **2026-08-19 사용자 지시로 400 → 600.** 400 에서도 물체가 계속 미끄러졌다.
+        #    ⚠️ **600 은 트립 시간을 안 재본 값이다.** 아래 표에 600 키가 없으므로
+        #    `trip_seconds_for(600)` 은 885 의 3.5초를 **보수적 하한**으로 돌려준다
+        #    (실제로는 3.5초보다 오래 버티지만 17초보다는 훨씬 짧을 것이다).
+        #    내삽 추정을 코드에 넣지 않은 이유는 이 구간이 극단적으로 비선형이기 때문이다.
+        #    **`scripts/measure_gripper_pwm_limit.py --pwm 600` 으로 재서 아래 표에
+        #    넣을 것.** 그 전까지는 파지 유지 경고가 매우 이르게(≈2.5초) 뜬다 — 정상이다.
+        #    그 시점에 Overload 가 나면 브릿지가 REBOOT 로 되살리지만(사용자 지시),
+        #    **트립 순간 토크가 끊겨 화물은 이미 떨어진 뒤다.**
+        "gripper_goal_pwm": 600,
+        #: Goal PWM 별 **Overload 트립까지 걸린 시간** [s] — 파지 유지 한계의 단일 출처.
+        #: `None` = 그 값에서는 트립 없이 버팀(측정 상한까지).
+        #: 2026-08-09 실기 즉석 실측 3점. `scripts/measure_gripper_pwm_limit.py` 로
+        #: 다시/더 촘촘히 잴 수 있다(그 스크립트가 이 표를 채우는 도구다).
+        #:
+        #: ⚠️ **3점 사이를 내삽하지 말 것.** 400→885 는 힘이 2.2배인데 시간은 4.9배
+        #: 짧아진다 — 매우 비선형이라 추정값으로 PWM 을 올리면 미션 중에 떨어뜨린다.
+        #: 새 값을 쓰려면 그 값에서 **직접 재라.**
+        "gripper_pwm_trip_seconds": {280: None, 400: 17.0, 885: 3.5},
     },
 }
 
 DEFAULT_GRIPPER = "dual_motor_gripper"
+
+
+def trip_seconds_for(pwm, preset_name=DEFAULT_GRIPPER):
+    """Goal PWM 에서 Overload 트립까지 걸리는 시간을 돌려준다 → `(seconds, measured)`.
+
+    · `seconds is None` **and** `measured` → 그 PWM 에서는 트립하지 않는다(측정으로 확인).
+    · `measured is False` → 그 PWM 은 **안 재봤고**, 돌려준 값은 측정된 더 높은 PWM 의
+      트립 시간을 가져온 **보수적 하한**이다(높은 PWM 이 더 빨리 트립하므로, 실제로는
+      이 값보다 오래 버틴다).
+
+    ⚠️ **키가 없는 것(안 재봄)과 값이 None 인 것(재봤는데 무트립)은 전혀 다르다.**
+    2026-08-19 이 둘을 뭉갠 탓에, 표에 없는 PWM 을 쓰면 `arm_fsm` 이 "트립 없음" 으로
+    읽고 **파지 유지 경고를 꺼버렸다** — 가장 위험한 경우에 경고가 사라지는 정반대
+    동작이었다. 그래서 반환값에 `measured` 를 실어 호출부가 구분하게 한다.
+
+    ⚠️ 보간(내삽)은 하지 않는다. 400→885 는 힘이 2.2배인데 시간은 4.9배 짧아질 만큼
+    비선형이라, 내삽값을 믿고 PWM 을 올리면 미션 중에 화물을 떨어뜨린다. 새 값을
+    제대로 쓰려면 `scripts/measure_gripper_pwm_limit.py` 로 **직접 재서** 아래
+    `gripper_pwm_trip_seconds` 에 넣을 것.
+    """
+    table = GRIPPER_PRESETS[preset_name].get("gripper_pwm_trip_seconds") or {}
+    if pwm in table:
+        return table[pwm], True
+    # 안 재본 PWM — **가장 가까운 상위** PWM 의 실측 트립 시간을 하한으로 쓴다.
+    # 트립 시간은 PWM 이 오를수록 짧아지므로(부하가 클수록 누적이 빠르다) 상위 PWM 의
+    # 값은 항상 유효한 하한이고, 그중 **가장 가까운 것**이 제일 조인 하한이다.
+    # (표 전체의 최솟값을 쓰면 PWM 300 에 885 의 3.5초가 붙어 쓸데없이 비관적이 된다.)
+    higher = sorted((p, t) for p, t in table.items() if p >= pwm and t is not None)
+    if higher:
+        return higher[0][1], False
+    # 측정된 모든 PWM 보다 높다 = 표의 최단 트립보다도 빨리 트립한다고 봐야 한다.
+    known = [t for t in table.values() if t is not None]
+    return (min(known), False) if known else (None, False)
 
 
 def get_preset(gripper_type, logger=None):

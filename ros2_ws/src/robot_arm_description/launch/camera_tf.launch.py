@@ -78,6 +78,8 @@ def generate_launch_description():
         #       (편차 7.7cm). 손목 각도에 따라 tip↔접촉점 오프셋이 평면 안에서 회전하는
         #       탓으로 보인다 — 평행이동 한 벌로는 y 를 못 잡는다. y 가 계속 빗나가면
         #       이 값이 아니라 **회전까지 푸는 다점 캘리브**가 답이다.
+        # 이전 값(2026-08-19 이전): x=0.4483 y=-0.4817 z=0.2634
+        #    roll=-0.0619 pitch=0.0404 yaw=2.8198
         # 이전 값(2026-08-12 1차): x=0.4968 y=-0.5041 z=0.1287
         # 이전 값(2026-08-09 2차): x=0.2022 y=-0.5957 z=0.1272
         #    roll=-0.0619 pitch=0.0404 yaw=1.6265
@@ -86,12 +88,21 @@ def generate_launch_description():
         #    roll=0.0267 pitch=0.0210 yaw=0.4718
         # 이전 값(차체 장착 CAD 추정, 실기 검증 전): x=0.123 y=0.0 z=0.082
         #    roll=0.0 pitch=-0.26 yaw=0.0 — 정식 장착 시 출발점으로 참고.
-        DeclareLaunchArgument('cam_x',     default_value='0.4483'),
-        DeclareLaunchArgument('cam_y',     default_value='-0.4817'),
-        DeclareLaunchArgument('cam_z',     default_value='0.2634'),
-        DeclareLaunchArgument('cam_roll',  default_value='-0.0619'),
-        DeclareLaunchArgument('cam_pitch', default_value='0.0404'),
-        DeclareLaunchArgument('cam_yaw',   default_value='2.8198'),
+        # 이전 값(2026-08-19 1차): x=0.6936 y=-0.4817 z=0.3638
+        #    roll=-0.1068 pitch=0.2407 yaw=2.8157
+        # 🔁 2026-08-19 2차 재캘리브 — camera_tf_tuner 로 RViz 에서 depth 포인트클라우드가
+        #    로봇 모델에 겹치도록 드래그해 맞춘 값(사용자 확정, camera_tf_calib.txt).
+        #    앞 -1.8, 좌우 -80.1, 높이 16.5 cm / roll -1.7° pitch +5.4° yaw +86.6°
+        # ⚠️ 같은 날 1차 값에서 **yaw 가 161.3° → 86.6° (-74.7°)**, x 가 -71cm,
+        #    z 가 -20cm 움직였다. 미세조정 폭이 아니라 **카메라를 물리적으로 다시
+        #    놓은 수준**이다 — 책상 위 벤치 배치라 세션 중에도 밀린다는 기존 경고
+        #    그대로다. 이 값은 그 배치에 한정되며, 카메라를 건드렸으면 다시 잴 것.
+        DeclareLaunchArgument('cam_x',     default_value='-0.0178'),
+        DeclareLaunchArgument('cam_y',     default_value='-0.8008'),
+        DeclareLaunchArgument('cam_z',     default_value='0.1645'),
+        DeclareLaunchArgument('cam_roll',  default_value='-0.0302'),
+        DeclareLaunchArgument('cam_pitch', default_value='0.0937'),
+        DeclareLaunchArgument('cam_yaw',   default_value='1.5108'),
     ]
 
     # ── 전방 RGB-D: base_link → camera_link ──

@@ -54,7 +54,7 @@
     LOCKED 상태에서 `DRIVING`으로 자동 언락되는 옛 버그(PR #17이 미수정으로 지적)는
     애초에 이 파일에 그런 분기가 없으므로 해당 없음 — `_try_advance()`의
     MISSION_STOP+ArrivalStatus conjunction으로만 탈출.
-  - **`STOWING` 실제 접이 모션 구현**(`_begin_stow_move`) — 이전까지는 스켈레톤이라 현재
+  - **`STOWING` 실제 접이 모션 구현**(`_run_stow_sequence`) — 이전까지는 스켈레톤이라 현재
     자세 그대로 `_is_settled()`만 확인했음(모션 자체가 없어 접힘 자세 검증이 아니라
     "멈춰있나" 검증에 불과했음). 이제 `stow_joint_positions` 파라미터가 정의하는 목표
     관절각으로 `/arm_controller/joint_trajectory`에 직접 궤적을 발행 → 완료 후 `_is_settled()`
@@ -83,9 +83,47 @@
     이면 즉시 미확인 처리 — 이전엔 이 필드 자체가 없어 검사 불가였던 항목(§5.1
     잔여 항목 3).
 
-상태 흐름: IDLE → PERCEIVE → PLAN → DESCEND → CLEAN_START → CONTACT_CHECK
-  → CLEAN → CLEAN_STOP → LIFT → LOCK_CHECK → CARRY → RELEASE → DONE
-  → STOWING → STOWED_LOCKED → IDLE
+2026-08-19 — 실기 픽 테스트 피드백 3건 반영:
+  - **DESCEND→GRASP 게이트를 실측 정지 확인으로 강화**: 기존엔 모션 완료 추정 시각
+    (`duration+0.5s`)만 보고 바로 그리퍼를 닫았는데, 실기에서 하중/마찰로 이동이
+    추정보다 길어지면 팔이 아직 내려가는 중에 닫힘 명령이 나갈 수 있었다. `_is_settled()`
+    (LOCKED 하트비트에도 쓰는 tip TF + 관절속도 유한차분 실측)를 추가 게이트로 걸어
+    **팔이 완전히 멈춘 뒤에만** GRASP 로 넘어가도록 `_do_descend()` 수정.
+  - **그리퍼 전류 스파이크 조기 감지**: `_do_grasp()`가 이제 닫는 도중 매 tick effort 를
+    감시한다 — 완전닫힘 전에 전류가 `grasp_effort_thresh` 를 넘으면(=물체에 걸려 막힘)
+    남은 시간(`gripper_action_time`)을 기다리지 않고 그 순간 파지 성공으로 간주해 바로
+    LIFT 로 전이한다. `_do_grasp_check()`가 이미 문서화한 함정(완전닫힘 근처 전류 상승은
+    기구적 끝단을 미는 것이지 파지가 아님)을 피하려고, 위치가 아직 완전닫힘 근처가
+    아닐 때만 스파이크를 성공 신호로 인정한다. 스파이크가 끝내 없으면 기존 동작(시간
+    경과 후 GRASP_CHECK 에서 위치+전류 재확인)으로 폴백 — 빈손 판정 로직은 그대로.
+  - **`carry_home` 기본값 false→true**: 파지 성공 후 물건을 문 채로 접힘(home) 자세로
+    돌아가 CARRY 에 들어간다(그리퍼는 건드리지 않아 계속 물고 있음). 필요하면
+    `carry_home:=false` 로 되돌려 예전 동작(들어올린 자리에서 대기)을 쓸 수 있다.
+
+2026-08-19(2차) — "옆에서 대각선으로 문다 / 파지 순간 arm_joint_4 가 혼자 들린다" 두
+증상의 원인을 잡음. 둘 다 뿌리가 같다 — **analytic IK 에 자유도가 남아돌았다**:
+  - **손목 자세 잠금 신설**(모듈 상단 `WRIST_PITCH_COEFFS` 블록에 기하 유도 전문).
+    관절 5개로 위치 3개만 풀어 2자유도가 남았고, 남는 자유도를 댐핑 최소자승이
+    "가장 적게 움직이는 해"로 아무렇게나 채우는 바람에 손목이 매번 다른 각도로 잡혔다.
+    URDF 실측상 j2(+X)·j3(-X)·j4(-X)가 전부 평행이라 그리퍼가 향하는 방향은
+    `j2-j3-j4` 합 하나로만 정해지므로, 이 식을 j4 에 대해 풀어 **종속 관절**로 만들고
+    j5(접근축 둘레 롤)는 0 고정 → 자유변수가 j1·j2·j3 셋으로 줄어 위치 3개와 정확히
+    맞아떨어진다(해가 유일 = 매번 같은 자세). `tool_pitch=pi/2` 가 수직 아래(top-down).
+  - **IK 반복에 관절 리밋 clamp 추가**(`_clamp_arm_joints`). 예전엔 IK 가 리밋 밖으로
+    자유롭게 반복하고 브릿지 `rad_to_tick` 이 마지막에 clamp 해서 **IK 가 푼 자세와 팔이
+    실제로 가는 자세가 달랐다.** URDF FK 재현: `arm_joint_2` 가 리밋 [0, 1.4276] 밖
+    -1.968 로 수렴 → 손목 종속각이 리밋에 걸려 접근축이 수직에서 최대 88° 기울었다.
+    reproduce 후 clamp 를 반복 안에 넣으니 접근축이 정확히 90.00°(수직)로 유지된다.
+  ⚠️ **top-down 잠금 시 도달 가능 범위가 좁다**(URDF 전수 스캔, tip_link 기준):
+     x [-0.052, +0.101] / y [-0.310, -0.030] / z [-0.022, +0.191] m.
+     팔은 base_link **-Y 방향으로만** 뻗는다 — `arm_joint_1` 이 ±14.3° 뿐이라 방위
+     회전이 사실상 불가능하다. 목표가 이 밖이면 이제 IK 가 정직하게 실패를 보고한다
+     (예전엔 조용히 기울어진 자세로 갔다).
+
+상태 흐름: STOWED_LOCKED → PERCEIVE → PLAN → APPROACH → DESCEND → GRASP
+  → GRASP_CHECK → LIFT → CARRY → (ARRIVED_DROP) RELEASE → DONE → STOWING
+  → STOWED_LOCKED(빈손 대기)
+  계획/접근/하강/리프트 또는 파지 판정 실패 → FAILED(래치)
   CARRY 중 DROP 감지 → GRIP_LOST(래치) → (재발행 conjunction) PERCEIVE
   PERCEIVE~LIFT 중 지형/주행 이벤트 → LOCKED(래치, 하트비트 유지) → (재발행 conjunction) PERCEIVE
   LIFT/CARRY(또는 LIFT 중 LOCKED) 중 STOW_REQUEST → LOWER_RELEASE → RELEASE → STOWING
@@ -98,6 +136,7 @@
    확인은 `moveit_dynamixel_bridge`의 `/dynamixel/controller_fault`(Hardware Error
    Status 집계)를 `_is_settled()`에서 게이트로 사용해 구현 완료(2026-07-15).
 """
+import math
 from copy import deepcopy
 from enum import Enum, auto
 import random
@@ -126,8 +165,12 @@ from moveit_msgs.msg import (MotionPlanRequest, Constraints, PositionConstraint,
                              OrientationConstraint, BoundingVolume, RobotState)
 from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
-from robot_arm_msgs.msg import (ArrivalStatus, ChassisMode, ArmStatus,
-                                DetectedObject, TaskCommand, TaskResult)
+from robot_arm_msgs.msg import ArrivalStatus, ChassisMode, ArmStatus, DetectedObject
+from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset, trip_seconds_for
+# 관절 이름·순서의 단일 출처(ARM_JOINT_NAMES 주석 참고). 이 import 는 상수만 읽으며
+# 서보 포트를 열지 않는다 — 포트는 브릿지 노드 인스턴스가 생성될 때만 열린다.
+from dynamixel_control.moveit_dynamixel_bridge import JOINT_CONFIG
+from dynamixel_control import joint_limits
 
 
 # 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf) 기준 — URDF 자체는
@@ -143,6 +186,54 @@ from robot_arm_msgs.msg import (ArrivalStatus, ChassisMode, ArmStatus,
 # arm_joint_4/5 는 건드리지도 않는** 상태였다. dict 는 삽입 순서를 보존하므로
 # 궤적 메시지의 관절 순서도 브릿지와 자동으로 일치한다.
 ARM_JOINT_NAMES = list(JOINT_CONFIG)
+
+
+# ──────────────────────────────────────────────
+# 손목 자세 잠금 — "위에서 내려다보는 파지"(top-down)를 강제한다 (2026-08-19 신설).
+#
+# ## 왜 필요한가
+#
+# analytic IK 는 **위치 3개만** 맞추고 방향을 통째로 버린다. 그런데 팔은 관절이
+# 5개라 **2자유도가 남아돈다** — 남는 자유도를 댐핑 최소자승이 "현재 자세에서 가장
+# 적게 움직이는 해"로 아무렇게나 채우기 때문에, 같은 목표 좌표라도 손목이 매번 다른
+# 각도로 잡힌다. 실기 증상이 정확히 이것이었다(2026-08-19):
+#   - 상자를 **옆에서 대각선으로** 물려 든다 (접근축이 수직이 아님)
+#   - APPROACH → DESCEND 사이에 **arm_joint_4 가 혼자 들려서** 손가락이 상자를 빗나감
+#     (두 목표는 x·y 가 같고 z 만 다른데, 해가 재분배되며 손목만 따로 움직인다)
+#
+# ## 기하 (urdf/robot_arm.urdf 실측, 2026-08-19)
+#
+# `arm_joint_2` 축 `+X` / `arm_joint_3` 축 `-X` / `arm_joint_4` 축 `-X` — **셋이 전부
+# 평행한 피치축**이다. 따라서 그리퍼가 향하는 방향은 세 각도의 **부호합 하나로만**
+# 정해진다(개별 값과는 무관하다 — FK 로 교차검증함):
+#
+#       tool_pitch = j2 - j3 - j4        [rad, base_link +X 축 둘레 회전량]
+#
+# 그리퍼 접근축(손가락이 뻗어나가는 방향)은 `link_043` 로컬 `-Y` 이고, all-zero 에서
+# base_link `-Y`(수평)를 본다. `+X` 둘레로 `+pi/2` 돌리면 base_link `-Z`(수직 아래) —
+# 즉 **`j2 - j3 - j4 = pi/2` 가 top-down 파지**다.
+# 리밋상 도달 범위는 [-4.35, +2.67] 이라 pi/2 는 여유 있게 들어간다.
+#
+# 손가락은 로컬 `X` 축을 따라 닫힌다(랙 조인트 축이 ±X). `arm_joint_5`(축 `-Y`)는
+# 접근축 **자신을 축으로 한 롤**이라 향하는 방향은 안 바꾸고 손가락 닫히는 방향만
+# 돌린다 — 그래서 위치 IK 에는 기여가 거의 없으면서 해만 흔든다. 0 으로 고정한다.
+# (CLAUDE.md 의 손목카메라 파지 검증도 `arm_joint_5=0` 고정을 전제로 캘리브돼 있다 —
+#  롤을 안 고정하면 fill 지표가 2.5배 흔들리고 검출률이 53%까지 떨어진다.)
+#
+# ## 어떻게 거는가
+#
+# 위 식을 `arm_joint_4` 에 대해 풀어 **종속 관절**로 만든다(`_apply_wrist_lock`):
+#
+#       j4 = j2 - j3 - tool_pitch
+#
+# 그러면 IK 의 자유변수는 j1·j2·j3 셋만 남아 **위치 3개와 정확히 맞아떨어진다**
+# (남는 자유도 0 = 해가 유일 → 매번 같은 자세). 제약을 반복 **안쪽**에서 걸기 때문에
+# (자코비안도 자유변수에 대해서만 잡는다) 수렴한 해는 위치와 손목 자세를 동시에
+# 만족한다 — 풀고 나서 j4 를 덮어쓰는 방식이면 그만큼 위치가 어긋난다.
+WRIST_PITCH_COEFFS = {'arm_joint_2': +1.0, 'arm_joint_3': -1.0, 'arm_joint_4': -1.0}
+WRIST_PITCH_DEPENDENT = 'arm_joint_4'   # 위 식을 풀어 종속시킬 관절
+WRIST_ROLL_JOINT = 'arm_joint_5'        # 접근축 둘레 롤 — 고정
+TOOL_PITCH_DOWN = math.pi / 2           # 접근축이 수직 아래(base -Z)를 보는 값
 
 
 # ──────────────────────────────────────────────
@@ -261,7 +352,26 @@ class ArmFsmNode(Node):
         self.declare_parameter('ik_mode', 'analytic')
         self.declare_parameter('ik_max_iters', 8)
         self.declare_parameter('ik_tol', 0.01)          # [m] 위치 수렴 허용오차
-        self.declare_parameter('ik_accept_tol', 0.03)   # [m] 최종 실패 판정 기준
+        # [m] 최종 실패 판정 기준 — 이 안이면 "덜 수렴했지만 그 자리에서 집어본다".
+        #
+        # 2026-08-19 0.03 → 0.05 로 완화(사용자 지시: "상자에 거의 위치하면 왠만하면
+        # 거기에서 집어라 — 그리퍼가 커서 집힌다"). 실기에서 3.4cm 부족으로 IK 가
+        # 실패하면 FAILED 가 **래치**돼 미션이 통째로 중단됐는데(자동 재시도 없음,
+        # pick 을 다시 눌러야 한다), 그 정도 오차는 그리퍼가 흡수한다.
+        #
+        # 0.05 의 근거는 **대상 상자 반폭**이다 — 95mm 큐브라 중심에서 47.5mm 를 넘게
+        # 빗나가면 그리퍼가 상자 **바깥**에서 닫혀 아예 못 문다. 즉 이 값을 더 키우면
+        # "집으려 시도했지만 허공을 쥔다" 가 늘 뿐이다. 대상 크기가 바뀌면 같이 바꿀 것
+        # (손목카메라 캘리브의 box_size_m=0.095 와 같은 대상이다).
+        self.declare_parameter('ik_accept_tol', 0.05)
+        # 손목 자세 잠금 (위 WRIST_PITCH_COEFFS 블록의 근거 참고).
+        # false 로 두면 2026-08-19 이전 동작(손목 자유 = 대각선 파지)으로 돌아간다.
+        self.declare_parameter('lock_tool_pitch', True)
+        # 접근축 기울기 [rad]. pi/2 = 수직 아래(top-down). 실기에서 상자를 살짝
+        # 비스듬히 물어야 하면 여기서 몇 도만 빼면 된다(예: 1.40 ≈ 아래에서 10° 젖힘).
+        self.declare_parameter('tool_pitch', TOOL_PITCH_DOWN)
+        # 손목 롤 [rad]. 0 = 손가락이 base X 방향으로 닫힘.
+        self.declare_parameter('wrist_roll', 0.0)
         # 재시도(FAILED→PERCEIVE→PLAN) 때 타겟을 다시 인식하지 않고 처음 얼린 값을 재사용한다.
         #
         # ⚠️ 왜 필요한가 (2026-08-09 실기): APPROACH/DESCEND 로 팔이 움직이면 **팔 자신이
@@ -282,22 +392,45 @@ class ArmFsmNode(Node):
             'gripper_command_calibrated', gpreset['command_calibrated'])
         self.declare_parameter('stop_after_descend', False)
         self.declare_parameter('arm_move_speed', 0.5)   # [rad/s] 직접명령 시 소요시간 추정용
-        # 털털이는 MoveIt planning joint가 아닌 별도 velocity actuator다. ZIP에 실제
-        # joint/모터 정보가 없으므로 actuator joint 이름은 빈 값(안전 비활성)이 기본이다.
-        self.declare_parameter('cleaning_actuator_joint', '')
-        self.declare_parameter('vla_command_topic', '/vla/command')
-        self.declare_parameter('vla_result_topic', '/vla/result')
-        self.declare_parameter('vla_standalone_mode', False)
-        self.declare_parameter('dry_run_mode', False)
-        self.declare_parameter('tool_type', 'spur_1motor_gripper')
-        default_profiles = str(Path(get_package_share_directory(
-            'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
-        self.declare_parameter('tool_profile_file', default_profiles)
-        self.declare_parameter('tool_status_timeout', 1.5)
-        self.declare_parameter('cleaning_start_time', 0.5)
-        self.declare_parameter('contact_timeout', 3.0)
-        self.declare_parameter('lock_check_timeout', 3.0)
-        self.declare_parameter('clean_duration', 5.0)
+        # 그리퍼 — gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,
+        # 아래 개별 파라미터는 필요 시 CLI/런치로 여전히 개별 오버라이드 가능.
+        self.declare_parameter('gripper_type', DEFAULT_GRIPPER)
+        gripper_type = self.get_parameter('gripper_type').value
+        gpreset = get_preset(gripper_type, self.get_logger())
+
+        self.declare_parameter('gripper_joints', gpreset['gripper_joints'])
+        self.declare_parameter('gripper_open', gpreset['gripper_open_rad'])
+        self.declare_parameter('gripper_close', gpreset['gripper_close_rad'])
+        # 전류(effort) 임계 — moveit_dynamixel_bridge 가 /joint_states.effort 에
+        # raw signed PRESENT_CURRENT(XL430 기준 1단위≈2.69mA)를 발행. preset 값은 placeholder,
+        # 실측 캘리브 필요(TODO): 무부하 파지 전류/낙하 시 전류를 측정해 임계값 설정.
+        # 파지 시 완전닫힘보다 더 깊이 밀 양 [rad]. 0 이면 예전 동작(살짝 쥠).
+        # 힘의 상한은 gripper_goal_pwm(280)이 잡으므로 Overload 트립은 안 난다
+        # (PWM 280 은 40초+ 유지 무트립 실측). 세게 쥐려면 이 값을 올린다.
+        self.declare_parameter('gripper_squeeze_rad', 0.25)
+        # 빈손 판정 — 그리퍼가 완전닫힘에서 이 이내면 손가락 사이가 비어 있다.
+        # 얇은 물체를 쥐면 이 값보다 작게 벌어질 수 있으니 그때는 줄일 것.
+        self.declare_parameter('gripper_empty_pos_tol', 0.06)
+        self.declare_parameter('grasp_effort_thresh', gpreset['grasp_effort_thresh'])
+        self.declare_parameter('drop_effort_thresh', gpreset['drop_effort_thresh'])
+        # 동작 제어
+        # max_regrasp(origin/main의 옛 자동 재파지 루프 파라미터)는 도입 안 함 — 계약 v2는
+        # CARRY 중 DROP 감지 시 REGRASP↔PERCEIVE 루프 대신 GRIP_LOST 완전 래치로 대체함
+        # (자동 재시도 없음, 새 MISSION_STOP+ArrivalStatus conjunction으로만 재개).
+        self.declare_parameter('gripper_action_time', gpreset['gripper_action_time'])  # [s]
+        # 파지 유지 시간 경고 [s]. XL430 은 전류 제어가 없어 파지력이 Goal PWM 으로만
+        # 정해지는데, Overload 는 부하를 **시간에 누적**해 판정한다 — 힘을 올리면
+        # 무한정 버티던 게 유한 시간 트립으로 바뀐다(gripper_presets 실측 스윕:
+        # PWM 280→40초+ 무트립, PWM 400→17초, PWM 885→3.5초).
+        # 트립하면 토크가 끊겨 **화물을 떨어뜨리고 REBOOT 전까지 무응답**이다.
+        # 2026-08-19 PWM 을 400 으로 올렸으므로(사용자 지시) 17초가 한계인데, 실측
+        # 미션에서 파지~해제가 23초 걸렸다 — 대부분 CARRY 에서 운영자의 drop/stow
+        # 입력을 기다린 시간이라 코드로는 줄일 수 없다. 그래서 **경고로 알린다.**
+        # PWM 을 되돌리면(280) 이 경고도 같이 꺼도 된다(0 이하면 비활성).
+        self.declare_parameter('grip_hold_warn_s', 12.0)
+        # 파지 유지 중 닫힘 명령을 재발행하는 주기 [s]. 0 이하면 끔(예전 동작 = 1회 발행).
+        # 근거는 `_maintain_grip()` docstring 참고.
+        self.declare_parameter('grip_refresh_s', 1.0)
         self.declare_parameter('tick_rate', 10.0)
         # chassis_mode 수신 끊김 워치독 — §5.1 "수신 끊김 = default-deny(잠금 유지)"
         self.declare_parameter('chassis_mode_timeout', 1.0)      # [s]
@@ -334,15 +467,31 @@ class ArmFsmNode(Node):
         # ⚠️ URDF 검증만 끝났고 실기 검증은 아직 — 실물 구동 전 서보 tick 대응 확인 필요.
         # 길이는 ARM_JOINT_NAMES 를 따라간다 — 리터럴로 박아두면 축 수가 바뀔 때
         # 길이 검증(아래)에 걸려 STOWING 모션이 **조용히 비활성**된다.
-        # 파지 후 **물건을 문 채** 접힘(=URDF home) 자세로 돌아갈지. 기본 false 는
-        # 기존 동작(들어올린 자리에서 CARRY 대기)이다. true 면 LIFT 완료 후
-        # stow_joint_positions 로 접고 나서 CARRY 로 들어간다 — 화물을 든 채
-        # 주행하려면 팔이 펴져 있는 것보다 접혀 있는 쪽이 안전하다는 판단.
-        # ⚠️ 접는 경로에 충돌 검사가 없다(_begin_stow_move 는 known-safe 가정으로
+        # 파지 후 **물건을 문 채** 접힘(=URDF home) 자세로 돌아갈지. true 면 LIFT 완료 후
+        # stow_joint_positions 로 접고 나서 CARRY 로 들어간다(그리퍼는 건드리지 않으므로
+        # 계속 물고 있음) — 화물을 든 채 주행하려면 팔이 펴져 있는 것보다 접혀 있는 쪽이
+        # 안전하다는 판단. 2026-08-19: 실기 픽 테스트 요청으로 기본값을 true 로 전환
+        # (예전 기본 false 는 들어올린 자리에서 CARRY 대기 — 필요하면 CLI/launch 에서
+        # carry_home:=false 로 되돌릴 것).
+        # ⚠️ 접는 경로에 충돌 검사가 없다(_run_stow_sequence 는 known-safe 가정으로
         #    직접 궤적을 쏜다). 화물이 큰 경우 차체·자기 링크와 부딪히는지 눈으로
         #    확인하고 켤 것.
-        self.declare_parameter('carry_home', False)
+        self.declare_parameter('carry_home', True)
         self.declare_parameter('stow_joint_positions', [0.0] * len(ARM_JOINT_NAMES))
+        # 접힘(home 복귀)을 **단계로 나눠** 이 관절들을 먼저 보낸다. 나머지 축은 그동안
+        # 현재 자세를 유지하고, 선행축이 도착한 뒤에 함께 접힌다.
+        #
+        # 왜 (2026-08-19 사용자 지시): 전 축을 동시에 접으면 팔이 뻗은 채로 호를 그리며
+        # 돌아와 화물이 차체·주변에 쓸린다. 어깨축(arm_joint_2)을 먼저 세워 팔을 몸쪽으로
+        # 당긴 뒤 나머지를 접으면 훨씬 안정적이다.
+        #
+        # ⚠️ **다점 궤적 하나로는 이걸 못 만든다.** 브릿지의 `/arm_controller/joint_trajectory`
+        # 구독부는 `msg.points[-1]` **만** 읽고 중간 점을 전부 버린다
+        # (moveit_dynamixel_bridge.py 의 `point = msg.points[-1]`). 그래서 단계마다
+        # **별도의 궤적을 시간차로 발행**한다(`_run_stow_sequence`).
+        #
+        # 빈 리스트면 단계 없이 예전처럼 전 축 동시 접힘.
+        self.declare_parameter('stow_lead_joints', ['arm_joint_2'])
         # STOWED_LOCKED 발행 전 "실제로 접힌 자세인지" 확인용 관절각 허용오차 — §5.1 잔여
         # 합의 ②(정지 안정성만 검사하고 접힘 자세 근접은 미확인) 대응. LOCKED 경유(지형/주행
         # 이벤트로 작업 중단)로 도달한 임의 자세를 STOWED_LOCKED로 착칭하지 않기 위함.
@@ -364,6 +513,10 @@ class ArmFsmNode(Node):
         self.ik_max_iters = int(g('ik_max_iters').value)
         self.ik_tol = g('ik_tol').value
         self.ik_accept_tol = g('ik_accept_tol').value
+        self.lock_tool_pitch = bool(g('lock_tool_pitch').value)
+        self.tool_pitch = float(g('tool_pitch').value)
+        self.wrist_roll = float(g('wrist_roll').value)
+        self._setup_wrist_lock()
         self.freeze_target_on_retry = bool(g('freeze_target_on_retry').value)
         self.gripper_change_mode = bool(g('gripper_change_mode').value)
         self.gripper_command_calibrated = bool(
@@ -378,35 +531,72 @@ class ArmFsmNode(Node):
         self.stop_after_descend = (
             self.gripper_change_mode or bool(g('stop_after_descend').value))
         self.arm_move_speed = g('arm_move_speed').value
-        self.cleaning_actuator_joint = g('cleaning_actuator_joint').value
-        self.vla_standalone_mode = bool(g('vla_standalone_mode').value)
-        self.dry_run_mode = bool(g('dry_run_mode').value)
-        self.selected_tool_type = str(g('tool_type').value)
-        self.tool_status_timeout = float(g('tool_status_timeout').value)
-        try:
-            profiles = load_profiles(g('tool_profile_file').value)
-            self.tool_manager = ToolManager(
-                profiles,
-                ParameterToolIdentityProvider(self.selected_tool_type),
-                mock_mode=self.dry_run_mode)
-            self.tool_selection = self.tool_manager.refresh('IDLE')
-        except ToolProfileError as exc:
-            self.get_logger().error(f'tool profile rejected: {exc}')
-            self.tool_selection = None
-        self.tool_profile = (
-            self.tool_selection.profile if self.tool_selection else {})
-        self.tool_profile_valid = bool(
-            self.tool_selection and self.tool_selection.valid)
-        self.cleaning_start_time = g('cleaning_start_time').value
-        self.contact_timeout = g('contact_timeout').value
-        self.lock_check_timeout = g('lock_check_timeout').value
-        self.clean_duration = g('clean_duration').value
+        self.gripper_type = gripper_type
+        self.gripper_joints = list(g('gripper_joints').value)
+        self.gripper_open = g('gripper_open').value
+        self.gripper_close = g('gripper_close').value
+        self.gripper_squeeze_rad = float(g('gripper_squeeze_rad').value)
+        self.gripper_empty_pos_tol = float(g('gripper_empty_pos_tol').value)
+        self.grasp_thresh = g('grasp_effort_thresh').value
+        self.drop_thresh = g('drop_effort_thresh').value
+        self.gripper_action_time = g('gripper_action_time').value
+        # 경고 문구가 실제 설정을 따라가게 preset 에서 PWM·트립시간을 읽어둔다.
+        # 하드코딩하면 PWM 을 바꿨을 때 경고만 옛 숫자로 남아 운영자를 오도한다.
+        self._grip_pwm = gpreset.get('gripper_goal_pwm')
+        # (트립시간, 실측여부) — 의미 구분은 gripper_presets.trip_seconds_for 참고.
+        # "재봤는데 무트립"과 "안 재봄"을 반드시 갈라야 한다(뭉개면 가장 위험한 경우에
+        # 경고가 꺼진다).
+        self._grip_trip_seconds, self._grip_trip_measured = trip_seconds_for(
+            self._grip_pwm, gripper_type)
+        self.grip_refresh_s = float(g('grip_refresh_s').value)
+        self.grip_hold_warn_s = float(g('grip_hold_warn_s').value)
+        if self.grip_hold_warn_s <= 0.0:
+            pass
+        elif self._grip_trip_seconds is None:
+            if self._grip_trip_measured:
+                # 실측으로 무트립이 확인된 PWM — 경고를 끈다. 안 끄면 무해한 유지에서도
+                # 계속 경고가 떠 진짜 위험할 때 무시하게 된다.
+                self.get_logger().info(
+                    f'그리퍼 Goal PWM {self._grip_pwm} 은 실측상 무트립 구간이라 '
+                    '파지 유지 경고를 끕니다.')
+            else:
+                self.get_logger().warn(
+                    f'그리퍼 Goal PWM {self._grip_pwm} 의 트립 시간을 추정할 근거가 '
+                    '전혀 없습니다 — 파지 유지 경고를 끕니다. '
+                    'scripts/measure_gripper_pwm_limit.py 로 재서 '
+                    "gripper_presets 의 'gripper_pwm_trip_seconds' 에 넣으세요.")
+            self.grip_hold_warn_s = 0.0
+        else:
+            # 트립의 70% 지점에서 경고 — 운영자가 drop/stow 할 시간이 남게.
+            self.grip_hold_warn_s = min(self.grip_hold_warn_s,
+                                        self._grip_trip_seconds * 0.7)
+            if self._grip_trip_measured:
+                self.get_logger().warn(
+                    f'그리퍼 Goal PWM {self._grip_pwm} — 실측상 약 '
+                    f'{self._grip_trip_seconds:.0f}초에 Overload 트립합니다. '
+                    f'파지 유지 {self.grip_hold_warn_s:.1f}초에 경고합니다.')
+            else:
+                self.get_logger().error(
+                    f'⚠️ 그리퍼 Goal PWM {self._grip_pwm} 은 **트립 시간을 안 재본 값**입니다. '
+                    f'더 높은 PWM 의 실측값에서 가져온 보수적 하한 '
+                    f'{self._grip_trip_seconds:.1f}초를 기준으로 '
+                    f'{self.grip_hold_warn_s:.1f}초에 경고합니다(실제로는 더 오래 버팁니다). '
+                    'scripts/measure_gripper_pwm_limit.py 로 재서 표에 넣으면 경고 시점이 '
+                    '정확해집니다.')
         self.chassis_mode_timeout = g('chassis_mode_timeout').value
         self.locked_pos_tol = g('locked_pos_tol').value
         self.locked_vel_tol = g('locked_vel_tol').value
         self.locked_dwell = g('locked_dwell').value
         self.stow_pos_tol_rad = g('stow_pos_tol_rad').value
         self.carry_home = bool(g('carry_home').value)
+        self.stow_lead_joints = [j for j in g('stow_lead_joints').value
+                                 if j in ARM_JOINT_NAMES]
+        unknown_lead = [j for j in g('stow_lead_joints').value
+                        if j not in ARM_JOINT_NAMES]
+        if unknown_lead:
+            self.get_logger().warn(
+                f'stow_lead_joints 의 {unknown_lead} 은 ARM_JOINT_NAMES 에 없어 무시합니다 '
+                f'(유효: {ARM_JOINT_NAMES})')
         self.stow_joint_positions = list(g('stow_joint_positions').value)
         if len(self.stow_joint_positions) != len(ARM_JOINT_NAMES):
             self.get_logger().error(
@@ -436,12 +626,13 @@ class ArmFsmNode(Node):
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" —
         # moveit_dynamixel_bridge가 Hardware Error Status를 집계해 발행(내부용 토픽,
         # 파워트레인 DDS 경계를 넘지 않음). _is_settled()에서 게이트로 사용.
-        self.create_subscription(
-            Bool, '/dynamixel/controller_fault', self._on_controller_fault, 10)
-        self.create_subscription(String, '/tool/status', self._on_tool_status, 10)
-        self.create_subscription(Bool, '/tool/emergency_stop', self._on_tool_stop, 10)
-        self.create_subscription(Bool, '/tool/detached', self._on_tool_stop, 10)
-        self.create_subscription(String, '/control/mode', self._on_control_mode, 10)
+        self.create_subscription(Bool, '/dynamixel/controller_fault',
+                                  self._on_controller_fault, 10)
+        # 브릿지가 그리퍼 Overload 를 REBOOT 로 복구하는 동안 True. 그 구간엔 토크가
+        # 끊겨 effort 가 0 으로 떨어지는데, 그걸 DROP 으로 읽으면 복구가 끝나기도 전에
+        # GRIP_LOST 가 **래치**돼(자동 재시도 없음) 복구가 무의미해진다.
+        self.create_subscription(Bool, '/dynamixel/gripper_recovering',
+                                  self._on_gripper_recovering, 10)
 
         self.pub_status = self.create_publisher(ArmStatus, '/arm_status', HEARTBEAT_QOS)
         self.pub_task_result = self.create_publisher(
@@ -497,6 +688,8 @@ class ArmFsmNode(Node):
         # 브릿지 controller fault 게이트 — 첫 샘플 받기 전엔 알 수 없으니 보수적으로 True
         # (TF 미가용 시 _is_settled()가 False를 리턴하는 것과 같은 안전 측 기본값).
         self._controller_fault = True
+        # 브릿지가 그리퍼 Overload 를 재부팅 복구 중인가 (DROP 오판 방지 게이트).
+        self._gripper_recovering = False
         # 계약 v2 — MISSION_STOP + ArrivalStatus conjunction 게이트 (순서 무관)
         self._mission_stop_active = False
         self._chassis_mode = None
@@ -514,9 +707,22 @@ class ArmFsmNode(Node):
         self._motion_state = 'idle'        # 'idle' | 'active' | 'done'
         self._motion_ok = False
         self._arm_goal_handle = None
-        self._cleaning_command_sent = False
-        self._stow_move_sent = False       # 상태 진입 시 _transition에서 리셋
-        self._carry_home_sent = False      # carry_home 접이 모션 1회 발행 플래그
+        self._grip_sent = False            # 상태 진입 시 _transition에서 리셋
+        # 접힘 시퀀스 진행 단계(선행축 → 전체). 상태 진입 시 _transition 에서 리셋.
+        self._stow_stage = 0
+        self._stow_plan = None             # 시작 시 한 번 세워 고정하는 단계 계획
+        # LOWER_RELEASE 되돌림 단계(원래 집었던 지점 위 → 지점). _transition 에서 리셋.
+        self._return_stage = 0
+        # LIFT 안에서 carry_home 접이 단계로 넘어갔는가 (리프트 모션 처리와 분리).
+        self._carry_home_active = False
+        # 파지를 시작한 시각 — Overload 트립 경고용(grip_hold_warn_s 참고).
+        # 상태 전환마다 리셋하면 안 된다: 파지는 GRASP 에서 시작해 RELEASE 까지
+        # 여러 상태에 걸쳐 **연속으로** 유지되고, 트립은 그 누적 시간으로 결정된다.
+        self._grip_hold_start = None
+        self._grip_hold_warned = False
+        # 파지 유지 재발행용 — _send_gripper 가 clamp 후 값을 저장한다(_maintain_grip).
+        self._grip_hold_target = None
+        self._last_grip_refresh = None
 
         # ── heartbeat ─────────────────────────────
         # 계약: 현재 상태를 10Hz 로 끊임없이 발행한다. 0.5초 넘게 끊기면 파워트레인이
@@ -738,62 +944,14 @@ class ArmFsmNode(Node):
     def _on_controller_fault(self, msg):
         self._controller_fault = bool(msg.data)
 
-    def _on_tool_status(self, msg):
-        try:
-            status = json.loads(msg.data)
-        except (TypeError, ValueError):
-            return
-        if status.get('tool_type') != self.selected_tool_type:
-            self.get_logger().error(
-                'bridge tool_type differs from FSM selection; motion remains blocked')
-            self._tool_status = None
-            self._tool_status_stamp = None
-            return
-        self._tool_status = status
-        self._tool_status_stamp = self.get_clock().now()
-
-    def _on_tool_stop(self, msg):
-        if not msg.data:
-            return
-        self._set_cleaning(False)
-        self._cancel_arm_motion()
-        if self.state not in (State.IDLE, State.STOWED_LOCKED):
-            self._set_status(ARM_FAILED)
-            self._transition(State.STOWING)
-
-    def _on_control_mode(self, msg):
-        requested = msg.data.strip().upper()
-        self.get_logger().info(
-            f'Control mode request received: requested={requested!r}, '
-            f'fsm_state={self.state.name}, current_mode={self.control_mode}')
-        if requested not in ('MANUAL', 'FSM'):
+    def _on_gripper_recovering(self, msg):
+        recovering = bool(msg.data)
+        if recovering and not self._gripper_recovering:
             self.get_logger().warn(
-                f'Control mode request denied: unsupported mode {requested!r}')
-            return
-        if (requested == 'MANUAL'
-                and self.state not in (State.IDLE, State.STOWED_LOCKED)):
-            self.get_logger().warn(
-                f'Control mode request denied: MANUAL requires FSM state '
-                f'IDLE or STOWED_LOCKED; actual={self.state.name}')
-            return
-        self.control_mode = requested
-        self.get_logger().info(
-            f'Control mode request accepted: mode={self.control_mode}, '
-            f'fsm_state={self.state.name}')
-
-    def _tool_ready(self):
-        if (self.selected_tool_type != 'cleaner'
-                and not self.tool_profile_valid):
-            return False
-        if self.dry_run_mode:
-            return True
-        if self._tool_status is None or self._tool_status_stamp is None:
-            return False
-        age = (self.get_clock().now() - self._tool_status_stamp).nanoseconds * 1e-9
-        return (age <= self.tool_status_timeout
-                and bool(self._tool_status.get('profile_valid'))
-                and bool(self._tool_status.get('actuators_discovered'))
-                and bool(self._tool_status.get('motion_allowed')))
+                '브릿지가 그리퍼 Overload 를 재부팅으로 복구 중입니다 — 그동안 DROP '
+                '감지를 멈춥니다(토크가 끊겨 effort 가 0 이라 그대로 두면 GRIP_LOST 가 '
+                '래치됩니다). ⚠️ 화물은 이미 놓쳤을 가능성이 큽니다 — 눈으로 확인하세요.')
+        self._gripper_recovering = recovering
 
     # ── FSM tick ───────────────────────────────
 
@@ -956,50 +1114,81 @@ class ArmFsmNode(Node):
         if not ok:
             self._set_status(ARM_FAILED)
 
-    def _do_tool_action(self):
-        """Dispatch to a backend without exposing actuator APIs to the VLA layer."""
-        if self.task_command == 'MOVE':
-            self._transition(State.RETRACT)
-        elif (self.task_command == 'PICK'
-              and self.selected_tool_type in (
-                  'spur_1motor_gripper', 'dual_motor_gripper')):
+    def _do_descend(self):
+        """Descend from the clearance pose to the frozen grasp pose.
+
+        2026-08-19: 그리퍼는 팔이 **실제로 멈춘 뒤**에만 닫는다. `_motion_state=='done'`
+        은 추정 소요시간(`duration+0.5s`, `_publish_joint_trajectory`) 경과일 뿐 실측
+        정지 확인이 아니라서, 하중·마찰로 실기 이동이 추정보다 길어지면 그리퍼가 아직
+        내려가는 중에 닫히기 시작할 수 있다. `_is_settled()`(tip TF + 관절속도 유한차분,
+        LOCKED 하트비트에도 쓰는 실측 정지 판정)를 추가로 통과해야 GRASP 로 넘어간다.
+        """
+        self._set_status(ARM_EXECUTING)
+        if self._motion_state == 'active':
+            return
+        if self._motion_state == 'done':
+            if not self._motion_ok:
+                self._motion_state = 'idle'
+                self._fail('descend motion failed')
+                return
+            if not self._is_settled():
+                return  # 모션은 끝났다고 보고됐지만 아직 실측 정지 확인 전 — 대기
+            self._motion_state = 'idle'
             self._transition(State.GRASP)
-        elif (self.task_command == 'CLEAN'
-              and self.selected_tool_type == 'cleaner'):
-            self._transition(State.CLEAN_START)
-        else:
-            self._publish_task_result(
-                self.mission_id, False, 'TOOL_ACTION', 'unsupported tool backend')
-            self._transition(State.STOWING)
+            return
+        if self.ik_mode == 'moveit':
+            self._begin_arm_move(self._planned_grasp_pose)
+        elif not self._move_to_xyz(self._planned_grasp_xyz):
+            self._fail('descend IK failed')
 
     def _do_grasp(self):
-        """Shared GRASP sub-FSM entry for either calibrated gripper backend."""
+        """Close the gripper; success evaluation normally belongs to GRASP_CHECK.
+
+        2026-08-19: 닫는 도중 전류(effort)를 계속 감시한다 — 완전닫힘 전에 급전류가
+        튀면 손가락이 물체에 걸려 막힌 것이므로, 끝까지(gripper_action_time) 기다리지
+        않고 **그 순간 파지 성공으로 간주**해 바로 LIFT 로 넘어간다(더 조이지 않음).
+        ⚠️ `_do_grasp_check()` 상단 주석과 같은 함정을 피해야 한다 — 완전닫힘 근처의
+        전류 상승은 기구적 끝단을 미는 것이지 파지가 아니다. 그래서 위치가 아직
+        `gripper_empty_pos_tol` 밖(=완전닫힘까지 안 갔음)일 때만 전류 스파이크를
+        성공 신호로 인정한다. 스파이크가 없으면 기존과 동일하게 시간 경과 후
+        GRASP_CHECK 에서 위치+전류를 함께 재확인한다(빈손 폴백 유지).
+        """
         self._set_status(ARM_EXECUTING)
         if not self._tool_ready():
             self._fail_tool_action('gripper backend became unavailable')
             return
-        if self._gripper_command_state == 'idle':
-            self._send_gripper(float(self.tool_profile.get('close_position', 0.0)))
+        pos = self._joint_position.get(self.gripper_joints[0])
+        near_closed = (pos is not None
+                       and abs(pos - self.gripper_close) <= self.gripper_empty_pos_tol)
+        if not near_closed and self._gripper_effort() >= self.grasp_thresh:
+            self.get_logger().info(
+                f'그리퍼 전류 스파이크 감지 (effort {self._gripper_effort():.1f} '
+                f'≥ {self.grasp_thresh:.1f}, pos={pos if pos is not None else float("nan"):.3f}) '
+                '— 파지 성공으로 간주, 더 조이지 않고 LIFT로 진행')
+            self._begin_grip_hold()
+            self._transition(State.LIFT)
             return
-        if self._gripper_command_state == 'active':
-            return
-        ok = self._gripper_command_ok
-        self._gripper_command_state = 'idle'
-        if ok:
+        if self._elapsed() >= self.gripper_action_time:
             self._transition(State.GRASP_CHECK)
         else:
             self._fail_tool_action('gripper action failed')
 
     def _do_grasp_check(self):
         self._set_status(ARM_EXECUTING)
-        threshold = float(self.tool_profile.get('grasp_threshold', float('inf')))
-        effort = self._tool_effort()
-        if effort >= threshold:
-            self._transition(State.RETRACT)
+        self._maintain_grip()
+        pos = self._joint_position.get(self.gripper_joints[0])
+        if pos is not None and abs(pos - self.gripper_close) <= self.gripper_empty_pos_tol:
+            self.get_logger().error(
+                f'그리퍼가 완전닫힘({self.gripper_close:.3f})까지 닫혔습니다 '
+                f'(위치 {pos:.3f}, 허용 {self.gripper_empty_pos_tol:.3f}) — '
+                '손가락 사이에 아무것도 없습니다(빈손). effort 는 끝단을 미는 힘입니다.')
+            self._on_grasp_failure()
             return
-        if self._elapsed() >= float(self.tool_profile.get('action_time', 0.0)) + 0.5:
-            self._fail_tool_action(
-                f'grasp effort {effort:.1f} below threshold {threshold:.1f}')
+        if self._gripper_effort() >= self.grasp_thresh:
+            self._begin_grip_hold()
+            self._transition(State.LIFT)
+        else:
+            self._on_grasp_failure()
 
     def _fail_tool_action(self, reason):
         self.get_logger().error(reason)
@@ -1052,12 +1241,44 @@ class ArmFsmNode(Node):
     def _do_retract(self):
         """수직 리프트 → 운반 자세 (base_link +Z, 현재 tip TF 기준)."""
         self._set_status(ARM_EXECUTING)
+        self._check_grip_hold()
+        self._maintain_grip()
+
+        # carry_home: 들어올린 뒤 **물건을 문 채로** 접힘(=URDF home) 자세까지 접고 나서
+        # CARRY 로 간다. 그리퍼는 건드리지 않으므로 계속 물고 있다.
+        #
+        # 왜 CARRY 가 아니라 여기서 하나: CARRY 는 DROP 감시(effort 급감 → GRIP_LOST)를
+        # 도는 상태라, 그 안에서 큰 모션을 시작하면 이동 중 흔들림을 낙하로 오탐할 수
+        # 있다. 이동을 먼저 끝내고 CARRY 에 들어가면 감시 대상이 "정지해서 물고 있는
+        # 상태" 하나로 유지된다.
+        #
+        # ⚠️ 접힘이 **여러 단계**(선행축 먼저)라 리프트 모션 처리와 분리해야 한다.
+        # 예전 구조는 `_carry_home_sent` 하나로 "보냈다" 만 표시해서, 1단계가 끝나
+        # `_motion_state=='done'` 이 되면 플래그가 이미 True 라 **나머지 단계를 건너뛰고**
+        # 곧장 CARRY 로 갔다. 접이 단계로 들어갔는지를 별도 플래그로 들고 간다.
+        if self._carry_home_active:
+            if not self._run_stow_sequence():
+                return
+            self._transition(State.CARRY)
+            return
+
         if self._motion_state == 'active':
             return
         if self._motion_state == 'done':
             ok = self._motion_ok
             self._motion_state = 'idle'
-            self._transition(State.LOCK_CHECK)
+            if not ok:
+                self._fail('lift motion failed')
+                return
+            if self.carry_home:
+                if self.stow_joint_positions is None:
+                    self.get_logger().warn(
+                        'carry_home=true 이지만 stow_joint_positions 가 없어 건너뜁니다')
+                else:
+                    self.get_logger().info('carry_home: 물건을 문 채 home 자세로 접습니다')
+                    self._carry_home_active = True
+                    return
+            self._transition(State.CARRY)
             return
 
         # 'idle' — 리프트 모션 시작
@@ -1092,6 +1313,16 @@ class ArmFsmNode(Node):
         `EXECUTING`을 발행 — 문자열만 바꾸지 않고 실제 정지 확인 후에만 locked 하트비트.
         """
         self._set_status(ARM_CARRYING_LOCKED if self._is_settled() else ARM_EXECUTING)
+        self._check_grip_hold()
+        self._maintain_grip()
+        if self._elapsed() < 0.5:          # 진입 직후 dwell (DROP 오탐 방지, settle과 별개)
+            return
+        if self._gripper_recovering:
+            return          # 복구 중 — effort 0 은 트립 때문이지 낙하 판정 근거가 아니다
+        if self._gripper_effort() < self.drop_thresh:
+            self.get_logger().warn('DROP 감지 (effort 급감) → GRIP_LOST 래치')
+            self._cancel_arm_motion()
+            self._transition(State.GRIP_LOST)
         # ARRIVED_DROP 은 _try_advance(MISSION_STOP conjunction)에서 RELEASE로 전이
 
     def _do_grip_lost(self):
@@ -1104,21 +1335,68 @@ class ArmFsmNode(Node):
         self._set_status(ARM_GRIP_LOST)
 
     def _do_lower_release(self):
-        """RELEASE(그리퍼 오픈) 전에 파지 높이까지 내린다 — 화물 낙하 방지(§5.1 잔여 합의 ①).
+        """RELEASE 전에 **원래 집었던 자리로 화물을 되돌려 놓는다** (픽 순서의 역재생).
 
-        `PAYLOAD_ALOFT_STATES`(LIFT/CARRY)에서 STOW_REQUEST로 중단됐을 때만 경유.
-        `_carry_pose`/`_lift_target_xyz`가 더한 `lift_height`만큼 되돌려 내려
-        grasp 당시 높이 근처로 되돌아간 뒤에만 RELEASE로 넘어간다. TF/IK 실패 시엔
-        무한정 대기하지 않고 바로 RELEASE(기존 동작, 낙하 위험을 감수)로 폴백한다 —
-        높이를 못 낮추는 것보다 그리퍼를 계속 닫아 매달아두는 쪽이 더 위험할 수 있다.
+        `PAYLOAD_ALOFT_STATES`(LIFT/CARRY)에서 STOW_REQUEST로 중단됐을 때만 경유한다.
+        원래 취지는 "그리퍼를 열기 전에 파지 높이까지 내려 낙하를 막는다"(§5.1 잔여
+        합의 ①)였고, 구현은 **현재 tip 위치에서 `lift_height` 만큼 아래**로 내리는
+        것이었다.
+
+        ⚠️ **`carry_home` 을 켜면서 그 계산이 깨졌다** (2026-08-19). 이제 STOW_REQUEST
+        시점에는 팔이 이미 home 으로 접혀 있어서, "현재 위치에서 조금 아래" 는 원래
+        상자가 있던 곳이 아니라 **베이스 근처 엉뚱한 자리**다. 거기서 그리퍼를 열면
+        화물을 아무 데나 떨궈 놓는다.
+
+        그래서 PLAN 이 얼려둔 목표를 그대로 되짚어 간다 — APPROACH → DESCEND → GRASP
+        의 **역순**이다:
+          1) 원래 집었던 지점 **위**(`_planned_approach_*`) — 접혀 있으면 여기서 펴진다.
+             바로 파지점으로 가지 않는 이유: 접힌 자세에서 직선으로 내려가면 화물이
+             차체나 주변을 쓸고 지나간다.
+          2) 원래 집었던 지점(`_planned_grasp_*`)으로 하강 → 상자가 원래 높이로 돌아온다.
+          3) `_do_release` 가 그리퍼를 연다.
+
+        얼린 목표가 없으면(플랜 전에 중단 등) 예전 동작(현재 위치에서 `lift_height`
+        하강)으로 폴백한다. 이동/IK 실패 시에도 무한정 대기하지 않고 바로 RELEASE 로
+        간다 — 높이를 못 낮추는 것보다 그리퍼를 닫은 채 매달아두는 쪽이 더 위험할 수 있다.
         """
         self._set_status(ARM_EXECUTING)
+        self._check_grip_hold()
+        self._maintain_grip()
         if self._motion_state == 'active':
             return
         if self._motion_state == 'done':
+            ok = self._motion_ok
             self._motion_state = 'idle'
+            if not ok:
+                self.get_logger().warn(
+                    '되돌림 이동 실패 — 여기서 RELEASE 합니다(낙하 위험 감수)')
+                self._transition(State.RELEASE)
+                return
+
+        targets = self._return_targets()
+        if targets is not None:
+            if self._return_stage >= len(targets):
+                self._transition(State.RELEASE)
+                return
+            target = targets[self._return_stage]
+            self._return_stage += 1
+            self.get_logger().info(
+                f'화물 되돌림 {self._return_stage}/{len(targets)} 단계 — '
+                + ('원래 집었던 지점 위로' if self._return_stage == 1
+                   else '원래 집었던 지점으로 하강'))
+            if self.ik_mode == 'moveit':
+                self._begin_arm_move(target)
+            elif not self._move_to_xyz(target):
+                self.get_logger().warn(
+                    '되돌림 IK 실패 — 여기서 RELEASE 합니다(낙하 위험 감수)')
+                self._transition(State.RELEASE)
+            return
+
+        # ── 폴백: 얼린 목표가 없다(플랜 전에 중단됨). 예전 동작 — 제자리에서 하강. ──
+        if self._return_stage > 0:
             self._transition(State.RELEASE)
             return
+        self._return_stage = 1
 
         if self.ik_mode == 'moveit':
             pose = self._lower_pose()
@@ -1133,6 +1411,23 @@ class ArmFsmNode(Node):
         if target is None or not self._move_to_xyz(target):
             self.get_logger().warn('내림 이동 실패 — 바로 RELEASE(낙하 위험 감수)')
             self._transition(State.RELEASE)
+
+    def _return_targets(self):
+        """화물을 원래 자리로 되돌리는 경로 = 픽 목표의 역재생 [approach, grasp].
+
+        PLAN 이 얼려둔 값을 그대로 쓴다 — 다시 인식하지 않는다. 재인식하면 팔 자신이
+        시야에 들어와 타겟이 통째로 튀는 문제가 있다(`freeze_target_on_retry` 주석의
+        실측: 53cm 점프). 어차피 "원래 있던 자리" 가 목적이라 새 관측은 필요 없다.
+
+        얼린 목표가 없으면(플랜 전에 중단) None → 호출부가 예전 동작으로 폴백.
+        """
+        if self.ik_mode == 'moveit':
+            if self._planned_approach_pose is None or self._planned_grasp_pose is None:
+                return None
+            return [self._planned_approach_pose, self._planned_grasp_pose]
+        if self._planned_approach_xyz is None or self._planned_grasp_xyz is None:
+            return None
+        return [self._planned_approach_xyz, self._planned_grasp_xyz]
 
     def _lower_pose(self):
         """현재 TCP(tip_link)를 base_link 기준 -Z(lift_height만큼) 내린 자세. `_carry_pose` 역."""
@@ -1198,29 +1493,39 @@ class ArmFsmNode(Node):
     def _do_stowing(self):
         """접힘 자세로 이동 → `_is_settled()` 확인 후 `STOWED_LOCKED`.
 
-        `stow_joint_positions`(파라미터, CAD 미검증 placeholder)로 직접 관절궤적을
-        딱 한 번만(`_stow_move_sent`, 상태 진입당 1회) 발행한다. 모션 완료 전에
-        `_is_settled()`를 확인하면 CARRY 종료 시점의 자세가 우연히 안정적이어서 실제로
-        접히기도 전에 통과해버릴 수 있으므로, 반드시 `_motion_state=='active'`가 아닐
-        때만 settle 게이트를 본다. ⚠️ `_motion_state`를 'idle'로 되돌리면 다음 tick에
-        재발행 분기를 다시 타 dwell 누적 없이 궤적을 계속 재전송하는 버그가 있었음
-        (2026-07-15 발견·수정) — `_stow_move_sent`는 상태를 벗어날 때(`_transition`)만
-        리셋되므로 매 tick 재발행되지 않는다.
+        `stow_joint_positions`(파라미터)로 직접 관절궤적을 발행하되, 2026-08-19부터
+        **단계로 나눠** 보낸다(선행축 `stow_lead_joints` 먼저 → 나머지, `_run_stow_sequence`).
+        모션 완료 전에 `_is_settled()`를 확인하면 CARRY 종료 시점의 자세가 우연히
+        안정적이어서 실제로 접히기도 전에 통과해버릴 수 있으므로, 반드시 전 단계가
+        끝난 뒤에만 settle 게이트를 본다. ⚠️ `_motion_state`를 'idle'로 되돌리면 다음
+        tick에 재발행 분기를 다시 타 dwell 누적 없이 궤적을 계속 재전송하는 버그가
+        있었음(2026-07-15 발견·수정) — 이제 단계 카운터 `_stow_stage`가 그 역할을 하고,
+        `_transition()`이 상태를 벗어날 때만 0으로 되돌리므로 매 tick 재발행되지 않는다.
         """
         self._set_status(ARM_STOWING)
-        if self.dry_run_mode:
-            self._transition(State.STOWED_LOCKED)
-            return
+        # 🆕 2026-08-19: 접힘 자세에는 **그리퍼 열림도 포함**이다.
+        #
+        # `_run_stow_sequence` 는 ARM_JOINT_NAMES(팔 축)만 궤적으로 내보내고 그리퍼는
+        # 건드리지 않는다. 그리퍼를 여는 곳은 `_do_release()` 하나뿐이라, RELEASE 를
+        # **거치지 않고** STOWING 에 들어온 경로(실패/중단 등)에서는 그리퍼가 닫힌 채
+        # 접힌다 — 실기에서 그 증상이 나왔다.
+        #
+        # `_grip_sent` 는 `_transition()` 이 상태 전환마다 False 로 되돌리므로 이
+        # 분기는 STOWING 진입당 딱 한 번만 탄다(매 tick 재전송 아님). 아래
+        # stow_joint_positions 가 None 인 폴백 경로에도 똑같이 적용되도록 **분기보다
+        # 앞에** 둔다.
+        if not self._grip_sent:
+            self._send_gripper(self.gripper_open)
+            self._grip_sent = True
         if self.stow_joint_positions is None:
             # 목표 미설정(파라미터 길이 오류) — 접이 모션 없이 현재 자세 유지로 폴백.
             if self._is_settled():
                 self._transition(State.STOWED_LOCKED)
             return
-        if not self._stow_move_sent:
-            self._begin_stow_move()
-            self._stow_move_sent = True
-            return
-        if self._motion_state == 'active':
+        # 접힘은 여러 단계로 나뉜다(선행축 먼저) — 전 단계가 끝나야 settle 게이트를 본다.
+        # `_run_stow_sequence` 가 단계별 재발행을 스스로 막으므로 예전의 `_stow_move_sent`
+        # 1회 발행 가드는 필요 없다(매 tick 재발행 버그도 그쪽에서 함께 방지된다).
+        if not self._run_stow_sequence():
             return
         if self._is_settled():
             self._transition(State.STOWED_LOCKED)
@@ -1430,6 +1735,105 @@ class ArmFsmNode(Node):
     def _current_arm_joint_positions(self):
         return [self._joint_position.get(j, 0.0) for j in ARM_JOINT_NAMES]
 
+    # ── 손목 자세 잠금 ─────────────────────────
+
+    def _setup_wrist_lock(self):
+        """손목 잠금에 쓸 자유/종속 관절 인덱스를 준비한다 (모듈 상단 블록 참고).
+
+        필요한 관절이 `ARM_JOINT_NAMES` 에 하나라도 없으면(팔 축 구성이 바뀐 경우)
+        경고만 남기고 조용히 잠금을 끈다 — 여기서 죽이면 축 구성을 바꿀 때마다
+        원인 모를 정지가 난다. 관절 수를 상수로 박지 않는다는 이 저장소 규약대로
+        전부 이름으로 조회한다.
+        """
+        self._pitch_dep_idx = None
+        self._roll_idx = None
+        self._ik_free_idx = list(range(len(ARM_JOINT_NAMES)))
+        if not self.lock_tool_pitch:
+            self.get_logger().warn(
+                'lock_tool_pitch=false — 손목이 자유롭습니다. IK 에 자유도가 남아돌아 '
+                '상자를 대각선으로 물거나 APPROACH→DESCEND 사이에 손목만 따로 움직일 수 '
+                '있습니다(2026-08-19 실기 증상).')
+            return
+        missing = [n for n in WRIST_PITCH_COEFFS if n not in ARM_JOINT_NAMES]
+        if missing:
+            self.get_logger().warn(
+                f'손목 피치 잠금에 필요한 관절 {missing} 이 ARM_JOINT_NAMES 에 없어 '
+                '잠금을 끕니다 — 팔 축 구성이 바뀌었다면 WRIST_PITCH_COEFFS 를 '
+                '새 URDF 축으로 다시 유도할 것.')
+            self.lock_tool_pitch = False
+            return
+
+        self._pitch_dep_idx = ARM_JOINT_NAMES.index(WRIST_PITCH_DEPENDENT)
+        locked = {self._pitch_dep_idx}
+        if WRIST_ROLL_JOINT in ARM_JOINT_NAMES:
+            self._roll_idx = ARM_JOINT_NAMES.index(WRIST_ROLL_JOINT)
+            locked.add(self._roll_idx)
+        self._ik_free_idx = [i for i in range(len(ARM_JOINT_NAMES)) if i not in locked]
+
+        free_names = [ARM_JOINT_NAMES[i] for i in self._ik_free_idx]
+        self.get_logger().info(
+            f'손목 자세 잠금 ON — tool_pitch={self.tool_pitch:.4f}rad '
+            f'({math.degrees(self.tool_pitch):.1f}°, pi/2=수직 아래), '
+            f'wrist_roll={self.wrist_roll:.4f}rad. '
+            f'IK 자유관절={free_names}, 종속={WRIST_PITCH_DEPENDENT}'
+            f'(=j2-j3-tool_pitch)')
+        if len(self._ik_free_idx) != 3:
+            self.get_logger().warn(
+                f'IK 자유관절이 {len(self._ik_free_idx)}개입니다(위치 제약은 3개) — '
+                '3개가 아니면 해가 유일하지 않거나(남는 자유도) 과결정입니다.')
+
+    @staticmethod
+    def _clamp_arm_joints(q):
+        """전체 관절각 벡터를 `joint_limits` 안전범위로 제한한다.
+
+        ⚠️ **IK 반복 안에서 매번 걸어야 한다** (2026-08-19 추가). 예전에는 이게 없어
+        댐핑 최소자승이 리밋 **밖으로** 자유롭게 반복했고, 그 해가 그대로 발행된 뒤
+        브릿지 `rad_to_tick` 이 마지막에 clamp 했다 — 즉 **IK 가 푼 자세와 팔이 실제로
+        가는 자세가 달랐다.** URDF FK 로 재현해 보니 `arm_joint_2` 가 리밋 [0, 1.4276]
+        을 한참 벗어난 -1.968 로 수렴하고, 그 상태에서 손목 종속각이 리밋에 걸려
+        접근축이 수직에서 최대 88° 까지 기울었다(=상자를 옆에서 대각선으로 무는 증상).
+        반복 안에서 clamp 하면 IK 는 **실제 도달 가능한 집합 안에서만** 풀고, 목표가
+        정말 못 닿으면 잔차로 정직하게 실패를 보고한다.
+        """
+        out = []
+        for name, val in zip(ARM_JOINT_NAMES, q):
+            clamped, _ = joint_limits.clamp(name, float(val))
+            out.append(clamped)
+        return out
+
+    def _apply_wrist_lock(self, q):
+        """전체 관절각 벡터에 리밋 clamp + 손목 잠금(피치 종속 + 롤 고정)을 적용한다.
+
+        `j4 = j2 - j3 - tool_pitch` 를 계수 dict 에서 일반적으로 풀어낸다. 순서가 중요하다 —
+        **자유관절을 먼저 clamp 한 뒤** 그 값으로 종속 관절을 계산해야 피치 식이 실제
+        관절각과 맞는다. 종속 관절도 `joint_limits` 로 clamp 한다: clamp 되면 요청한
+        tool_pitch 가 그만큼 안 나오지만, 여기서 clamp 해야 **IK 반복이 실제로 도달 가능한
+        손목 자세를 전제로** 위치를 풀어준다(풀고 나서 브릿지가 clamp 하면 그만큼 위치가
+        조용히 어긋난다). 미달성은 `_move_to_xyz` 가 경고로 보고한다.
+        """
+        q = self._clamp_arm_joints(q)
+        if not self.lock_tool_pitch:
+            return q
+        dep_coeff = WRIST_PITCH_COEFFS[WRIST_PITCH_DEPENDENT]
+        residual = self.tool_pitch
+        for name, coeff in WRIST_PITCH_COEFFS.items():
+            if name == WRIST_PITCH_DEPENDENT:
+                continue
+            residual -= coeff * q[ARM_JOINT_NAMES.index(name)]
+        dep, clamped = joint_limits.clamp(
+            WRIST_PITCH_DEPENDENT, residual / dep_coeff)
+        self._wrist_pitch_clamped = clamped
+        q[self._pitch_dep_idx] = dep
+        if self._roll_idx is not None:
+            roll, _ = joint_limits.clamp(WRIST_ROLL_JOINT, self.wrist_roll)
+            q[self._roll_idx] = roll
+        return q
+
+    def _tool_pitch_of(self, q):
+        """관절각 벡터의 실제 tool_pitch [rad] — 로그·검증용."""
+        return sum(coeff * q[ARM_JOINT_NAMES.index(name)]
+                   for name, coeff in WRIST_PITCH_COEFFS.items())
+
     def _grasp_target_xyz(self):
         """/pick_target(카메라 프레임) → base_frame 기준 (x,y,z). 방향은 무시(3DOF 한계)."""
         if self.pick_target is None:
@@ -1482,10 +1886,14 @@ class ArmFsmNode(Node):
         2026-08-08 수정: 예전엔 3 이 하드코딩돼 있었는데 실기 배선 확정으로 구동 관절이
         4개(arm_joint_2~5, id 14/13/12/16)가 되면서 `q + dq` 가 shape (4,)+(3,) 로 깨져
         APPROACH 에서 무조건 ValueError 로 죽었다(실기 dry-run 에서 발견).
-        자코비안은 3×n(작업공간 3차원 × 관절 n)이고, 감쇠항 `np.eye(3)` 은 작업공간 쪽이라
-        관절 수와 무관하게 3 이 맞다.
+        자코비안은 3×n(작업공간 3차원 × **자유관절** n)이고, 감쇠항 `np.eye(3)` 은
+        작업공간 쪽이라 관절 수와 무관하게 3 이 맞다.
+
+        2026-08-19 — **손목 자세 잠금**(모듈 상단 WRIST_PITCH_COEFFS 블록) 적용. 반복은
+        자유관절(`_ik_free_idx`, 기본 j1·j2·j3)에 대해서만 돌고, 종속 관절(j4)·롤(j5)은
+        매 평가마다 `_apply_wrist_lock` 이 채운다. 제약을 반복 **안쪽**에 두는 게 핵심 —
+        풀고 나서 j4 를 덮어쓰면 그만큼 tip 위치가 어긋난다.
         """
-        q = np.array(q_init, dtype=float)
         target = np.array(target_xyz, dtype=float)
         eps = 0.05
         lam = 0.01
@@ -1495,8 +1903,25 @@ class ArmFsmNode(Node):
         # (ik_accept_tol)" 을 구분할 수 있게 한다. 이 둘은 3배 차이(1cm vs 3cm)인데
         # 로그가 같으면 파지가 빗나갈 때 IK 를 의심할지 캘리브를 의심할지 못 가린다.
         self._last_ik_residual = None
+        self._wrist_pitch_clamped = False
 
-        p = self._fk_tip(q)
+        # 자유관절 집합은 **호출 시점의** lock_tool_pitch 로 정한다 — `_ik_free_idx` 를
+        # 그대로 쓰면 `_report_ik_failure` 가 잠금을 잠깐 끄고 재진단할 때 j4/j5 가
+        # 초기화 때 정해진 축소 집합에 갇혀 **얼어붙은 채로** 풀리고, "손목을 풀어도
+        # 안 된다" 는 틀린 진단이 나온다.
+        free_idx = (self._ik_free_idx if self.lock_tool_pitch
+                    else list(range(len(ARM_JOINT_NAMES))))
+        q_base = self._apply_wrist_lock(q_init)
+
+        def expand(x):
+            """자유관절 벡터 → 손목 잠금이 적용된 전체 관절각 벡터."""
+            q_full = list(q_base)
+            for slot, val in zip(free_idx, x):
+                q_full[slot] = float(val)
+            return self._apply_wrist_lock(q_full)
+
+        x = np.array([q_base[i] for i in free_idx], dtype=float)
+        p = self._fk_tip(expand(x))
         if p is None:
             return None
 
@@ -1504,12 +1929,15 @@ class ArmFsmNode(Node):
             err = target - p
             if np.linalg.norm(err) < self.ik_tol:
                 self._last_ik_residual = float(np.linalg.norm(err))
-                return q.tolist()
-            J = np.zeros((3, q.size))
-            for i in range(q.size):
-                dq = np.zeros(q.size)
-                dq[i] = eps
-                p2 = self._fk_tip(q + dq)
+                return expand(x)
+            J = np.zeros((3, x.size))
+            for i in range(x.size):
+                dx = np.zeros(x.size)
+                dx[i] = eps
+                # 종속 관절이 자유관절을 따라 함께 움직이므로, 유한차분도 반드시
+                # expand() 를 거쳐야 한다 — 그래야 자코비안이 "손목을 잠근 채로 이
+                # 관절을 움직이면 tip 이 어디로 가는가" 를 반영한다.
+                p2 = self._fk_tip(expand(x + dx))
                 if p2 is None:
                     return None
                 J[:, i] = (p2 - p) / eps
@@ -1517,15 +1945,23 @@ class ArmFsmNode(Node):
             norm = np.linalg.norm(delta)
             if norm > max_step:
                 delta *= max_step / norm
-            q = q + delta
-            p = self._fk_tip(q)
+            x = x + delta
+            # 자유관절도 매 스텝 리밋 안으로 되돌린다 — clamp 된 값이 다음 반복의
+            # 출발점이 돼야 IK 가 도달 가능 집합 안에서만 움직인다
+            # (`_clamp_arm_joints` docstring 의 실측 근거 참고).
+            for k, slot in enumerate(free_idx):
+                x[k], _ = joint_limits.clamp(ARM_JOINT_NAMES[slot], float(x[k]))
+            p = self._fk_tip(expand(x))
             if p is None:
                 return None
 
         residual = float(np.linalg.norm(target - p))
+        # 실패해도 잔차를 남긴다 — 호출부(`_report_ik_failure`)가 "몇 cm 부족한가" 를
+        # 보고해야 사용자가 상자를 얼마나 당겨야 하는지 바로 안다. 예전엔 그냥 None 만
+        # 돌려줘서 "도달 불가" 가 1cm 부족인지 10cm 부족인지 구분이 안 됐다.
+        self._last_ik_residual = residual
         if residual < self.ik_accept_tol:
-            self._last_ik_residual = residual
-            return q.tolist()
+            return expand(x)
         return None
 
     def _move_to_xyz(self, target_xyz):
@@ -1533,28 +1969,22 @@ class ArmFsmNode(Node):
         q_current = self._current_arm_joint_positions()
         solution = self._solve_position_ik(target_xyz, q_current)
         if solution is None:
-            self.get_logger().warn(f'analytic IK 실패 — 목표 도달 불가: {target_xyz}')
-            # ⚠️ "도달 불가" 라고만 하면 목표가 먼 줄 오해한다. 실제로 자주 겪는 원인은
-            # **출발 자세가 리밋 밖**인 것이다 — 토크가 꺼진 동안 팔이 처졌다가 그 자세로
-            # 다시 잠기면(2026-08-12 실기) 야코비안 반복이 clamp 에 막혀 한 발도 못
-            # 나간다. 목표가 예전에 성공한 지점보다 가까운데도 실패한다.
-            # 원인을 여기서 갈라준다 — 이 경우 해법은 캘리브가 아니라 stow(home 복귀)다.
-            out = []
-            for name, q in zip(ARM_JOINT_NAMES, q_current):
-                bounds = joint_limits.get_limits(name)
-                if bounds is None:
-                    continue
-                lo, hi = bounds
-                if q < lo - 1e-3:
-                    out.append(f'{name}={q:+.3f}<하한{lo:+.3f}')
-                elif q > hi + 1e-3:
-                    out.append(f'{name}={q:+.3f}>상한{hi:+.3f}')
-            if out:
-                self.get_logger().error(
-                    '출발 자세가 관절 리밋 밖입니다: ' + ', '.join(out)
-                    + ' — 목표가 먼 게 아니라 여기서 IK 가 막힙니다. '
-                      'stow(STOW_REQUEST)로 home 복귀 후 다시 시도하세요.')
+            self._report_ik_failure(target_xyz, q_current)
             return False
+        # 손목 잠금이 실제로 지켜졌는지 확인한다. 종속 관절(j4)이 리밋에 걸리면
+        # 요청한 tool_pitch 가 안 나오고 — 그게 바로 "상자를 대각선으로 문다" 증상이다.
+        # 조용히 넘어가면 원인을 IK/캘리브에서 찾게 되므로 눈에 띄게 남긴다.
+        if self.lock_tool_pitch:
+            achieved = self._tool_pitch_of(solution)
+            if abs(achieved - self.tool_pitch) > 1e-3:
+                lo, hi = joint_limits.get_limits(WRIST_PITCH_DEPENDENT) or (float('nan'),) * 2
+                self.get_logger().warn(
+                    f'손목 피치 미달성: 요청 {math.degrees(self.tool_pitch):.1f}° → '
+                    f'실제 {math.degrees(achieved):.1f}° '
+                    f'({WRIST_PITCH_DEPENDENT} 이 리밋 [{lo:+.3f}, {hi:+.3f}] 에 걸림). '
+                    '그리퍼가 그만큼 기울어 물게 됩니다 — 목표가 팔에 너무 가깝거나 '
+                    '멀지 않은지, joint_limits 의 이 축 범위가 맞는지 확인하세요.')
+
         self._publish_joint_trajectory(solution, q_current)
         residual = getattr(self, '_last_ik_residual', None)
         # 잔차가 ik_tol 을 넘으면 "수렴 실패했지만 수용 범위" 라는 뜻 — 파지가 그만큼
@@ -1571,15 +2001,145 @@ class ArmFsmNode(Node):
                 else f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동')
         return True
 
-    def _begin_stow_move(self):
-        """`stow_joint_positions` 목표로 직접 관절궤적 발행 (MoveIt 미경유).
+    def _report_ik_failure(self, target_xyz, q_current):
+        """IK 실패 원인을 실제로 **구분해서** 보고한다 — "왜 팔이 안 움직이지" 를 로그만으로 판정.
+
+        ⚠️ **이 진단이 거짓말을 한 적이 있다 (2026-08-19 실기).** 예전 문구는 출발 자세가
+        관절 리밋 밖이기만 하면 무조건
+            "목표가 먼 게 아니라 여기서 IK 가 막힌다 — stow 로 home 복귀하라"
+        고 단정했다. 그런데 그날 실패의 진짜 원인은 **정반대**였다: 목표
+        `(0.045, -0.412, 0.136)` 이 팔의 최대 도달 반경 밖이었다(URDF 전수 스캔 결과
+        손목을 완전히 풀어도 3.5cm, top-down 잠금에서는 10.3cm 부족). 단정적인 오진이
+        원인 추적을 엉뚱한 곳으로 몰았다.
+        게다가 IK 반복에 리밋 clamp 가 들어간 뒤로(`_clamp_arm_joints`) 출발 자세가 리밋
+        밖이어도 즉시 clamp 되므로, 그건 이제 **막히는 원인 자체가 아니다.**
+
+        그래서 단정하지 않고 세 가지를 실제로 갈라본다:
+          (1) **손목 잠금이 원인인가** — 잠금을 잠깐 풀고 다시 풀어 본다(진단 전용, 실행
+              하지 않는다). 그때 풀리면 목표는 닿는데 top-down 자세로만 못 닿는 것이다.
+          (2) **순수 도달 불가인가** — 잠금 없이도 실패하면 작업공간 밖이다. 최근접 잔차를
+              "몇 cm 부족" 으로 보고해 상자를 얼마나 당겨야 하는지 바로 알 수 있게 한다.
+          (3) **출발 자세 이상** — 이제 blocking 원인은 아니지만 팔이 처졌다는 신호이므로
+              참고 정보로 같이 남긴다(단정하지 않는다).
+        """
+        gap = getattr(self, '_last_ik_residual', None)
+        gap_s = f'{gap * 100:.1f}cm' if gap is not None else '알 수 없음'
+        self.get_logger().warn(
+            f'analytic IK 실패 — 목표 {tuple(round(v, 3) for v in target_xyz)} '
+            f'(최근접 도달점까지 {gap_s} 부족)')
+
+        # (1) 손목 잠금이 binding constraint 인지 — 잠금만 빼고 같은 목표를 다시 풀어본다.
+        free_gap = None
+        if self.lock_tool_pitch:
+            saved = self.lock_tool_pitch
+            try:
+                self.lock_tool_pitch = False
+                free_solution = self._solve_position_ik(target_xyz, q_current)
+                free_gap = getattr(self, '_last_ik_residual', None)
+            finally:
+                self.lock_tool_pitch = saved
+            if free_solution is not None:
+                self.get_logger().error(
+                    f'원인: **손목 자세 잠금**입니다 — 손목을 풀면 닿는 목표입니다'
+                    f'(tool_pitch={math.degrees(self.tool_pitch):.0f}° 고정 때문). '
+                    '상자를 팔 쪽으로 더 당기거나, 비스듬한 파지를 허용하려면 '
+                    'tool_pitch 를 낮추세요(예: -p tool_pitch:=1.2 ≈ 21° 젖힘). '
+                    'lock_tool_pitch:=false 로 아예 끄면 2026-08-19 이전의 '
+                    '대각선 파지 동작으로 돌아갑니다.')
+                return
+
+        # (2) 손목을 풀어도 안 되면 순수 도달 불가.
+        if free_gap is not None:
+            gap_s = f'{free_gap * 100:.1f}cm'
+        self.get_logger().error(
+            f'원인: **목표가 팔의 도달 범위 밖**입니다 — 손목을 완전히 풀어도 '
+            f'{gap_s} 부족합니다. 손목 잠금 문제가 아니니 tool_pitch 를 만져도 소용없습니다. '
+            '상자를 팔 쪽으로 당기거나 차체를 더 붙여야 합니다. '
+            '(참고: 이 팔은 base_link -Y 방향으로만 뻗고 arm_joint_1 이 ±14.3° 뿐이라 '
+            '방위 회전으로 거리를 벌 수 없습니다.) 목표 좌표 자체가 의심되면 '
+            'camera_tf.launch.py 의 카메라 외부파라미터를 다시 재세요 — 캘리브가 틀리면 '
+            '상자는 코앞에 있는데 좌표만 멀리 나옵니다.')
+
+        # (3) 참고: 출발 자세가 리밋 밖이면 팔이 처졌다는 신호. 이제 IK 를 막지는 않는다
+        #     (반복 안에서 clamp 된다) — 그래서 '원인' 이 아니라 '참고' 로만 남긴다.
+        out = []
+        for name, q in zip(ARM_JOINT_NAMES, q_current):
+            bounds = joint_limits.get_limits(name)
+            if bounds is None:
+                continue
+            lo, hi = bounds
+            if q < lo - 1e-3:
+                out.append(f'{name}={q:+.3f}<하한{lo:+.3f}')
+            elif q > hi + 1e-3:
+                out.append(f'{name}={q:+.3f}>상한{hi:+.3f}')
+        if out:
+            self.get_logger().warn(
+                '참고 — 출발 자세가 관절 리밋 밖입니다: ' + ', '.join(out)
+                + ' (토크가 꺼진 동안 팔이 처졌을 때 이렇게 됩니다). IK 는 반복 안에서 '
+                  'clamp 하므로 이것 때문에 막히지는 않지만, 자세를 믿을 수 없으니 '
+                  'stow(STOW_REQUEST)로 home 복귀 후 다시 시도하는 게 안전합니다.')
+
+    def _stow_stages(self):
+        """접힘 목표를 단계 리스트로 만든다 (선행축 먼저 → 그다음 전체).
+
+        `stow_lead_joints` 가 비었거나 이미 목표에 있으면 단계 하나(전 축 동시)로
+        떨어져 예전 동작과 같아진다.
+        """
+        full = list(self.stow_joint_positions)
+        if not self.stow_lead_joints:
+            return [full]
+        # 1단계: 선행축만 목표로, 나머지는 **현재 자세 유지**.
+        q_now = self._current_arm_joint_positions()
+        lead = list(q_now)
+        for name in self.stow_lead_joints:
+            i = ARM_JOINT_NAMES.index(name)
+            lead[i] = full[i]
+        # 선행축이 이미 목표 근처면 1단계는 의미 없는 재발행이라 건너뛴다.
+        if all(abs(lead[i] - q_now[i]) < 1e-3 for i in range(len(lead))):
+            return [full]
+        return [lead, full]
+
+    def _run_stow_sequence(self):
+        """접힘 시퀀스를 한 단계씩 굴린다. **완료되면 True**, 진행 중이면 False.
 
         접힘 자세는 충돌 회피가 필요 없는 known-safe 설정값이라 가정하므로(실측 후
         캘리브 전제), ik_mode와 무관하게 항상 `_arm_traj_pub`로 직접 명령한다 —
         analytic IK를 거칠 필요가 없다(목표가 이미 관절각이지 xyz가 아님).
+
+        ⚠️ **단계를 다점 궤적 하나로 합치면 안 된다.** 브릿지의 트래젝토리 토픽
+        구독부는 `msg.points[-1]` 만 읽고 중간 점을 버리므로(`moveit_dynamixel_bridge`),
+        한 메시지에 담으면 선행축 단계가 통째로 무시되고 곧장 최종 자세로 간다.
+        그래서 단계마다 **별도 메시지를 시간차로** 발행하고, 각 단계의 완료를
+        `_motion_state` 로 기다린다.
+
+        호출부는 매 tick `if not self._run_stow_sequence(): return` 형태로 쓴다.
+        단계 카운터·계획은 `_transition()` 이 상태 전환마다 리셋한다.
+
+        ⚠️ **계획(`_stow_plan`)은 시작할 때 딱 한 번 세우고 고정한다.** 매 tick
+        `_stow_stages()` 를 다시 부르면 안 된다 — 1단계가 끝난 뒤에는 선행축이 이미
+        목표에 있어 계획이 2단계에서 1단계로 **줄어들고**, 카운터(이미 1)가 곧바로
+        끝으로 판정돼 **나머지 축이 통째로 안 접힌다.** 시퀀스를 시뮬레이션해서 잡은
+        실제 버그다. 1단계의 "나머지 축은 현재 자세 유지" 스냅샷도 시작 시점 값이어야
+        의미가 있으므로, 어느 쪽으로 보든 계획은 얼려야 맞다.
         """
-        q_current = self._current_arm_joint_positions()
-        self._publish_joint_trajectory(self.stow_joint_positions, q_current)
+        if self._motion_state == 'active':
+            return False
+        if self._motion_state == 'done':
+            self._motion_state = 'idle'
+        if self._stow_plan is None:
+            self._stow_plan = self._stow_stages()
+        stages = self._stow_plan
+        if self._stow_stage >= len(stages):
+            return True
+        target = stages[self._stow_stage]
+        self._stow_stage += 1
+        if len(stages) > 1:
+            self.get_logger().info(
+                f'접힘 {self._stow_stage}/{len(stages)} 단계 발행'
+                + (f' (선행축 {self.stow_lead_joints} 먼저)'
+                   if self._stow_stage == 1 else ' (나머지 축)'))
+        self._publish_joint_trajectory(target, self._current_arm_joint_positions())
+        return False
 
     def _publish_joint_trajectory(self, target_positions, q_current):
         """목표 관절각으로 단일 포인트 궤적 발행 + 모션 진행 상태 갱신 (공통 헬퍼)."""
@@ -1636,30 +2196,129 @@ class ArmFsmNode(Node):
         self._rotate_state = 'done'
         self._rotate_goal_handle = None
 
-    def _send_gripper(self, position):
-        """Send only the logical joint command; the bridge owns raw hardware."""
-        if self.dry_run_mode:
-            self._gripper_command_ok = True
-            self._gripper_command_state = 'done'
+    def _check_grip_hold(self):
+        """파지 유지 시간이 Overload 트립 구간에 들어가면 **한 번** 경고한다.
+
+        XL430 은 전류 제어가 없어 파지력이 Goal PWM 으로만 정해지고, Overload 는 부하를
+        시간에 누적해 판정한다 — 힘을 올리면 "무한정 버팀" 이 "유한 시간 트립" 으로
+        바뀐다(gripper_presets 실측: PWM 280→40초+ 무트립 / 400→17초 / 885→3.5초).
+        2026-08-19 PWM 400 채택으로 이제 **17초가 한계**인데, 남은 시간의 대부분은
+        CARRY 에서 운영자의 drop/stow 입력을 기다리는 시간이라 코드로 줄일 수 없다.
+        트립하면 토크가 끊겨 화물을 떨어뜨리고 REBOOT 전까지 응답하지 않으므로,
+        적어도 **일어나기 전에 알린다.**
+        """
+        if self.grip_hold_warn_s <= 0.0 or self._grip_hold_start is None:
             return
-        if not self._tool_ready():
-            self._gripper_command_ok = False
-            self._gripper_command_state = 'done'
+        if self._grip_hold_warned:
             return
-        trajectory = JointTrajectory()
-        trajectory.joint_names = list(self.tool_profile.get('joint_names', []))
-        point = JointTrajectoryPoint()
-        point.positions = [float(position)]
-        duration = float(self.tool_profile.get('action_time', 1.0))
-        point.time_from_start = Duration(
-            sec=int(duration), nanosec=int((duration % 1.0) * 1e9))
-        trajectory.points.append(point)
+        held = (self.get_clock().now() - self._grip_hold_start).nanoseconds * 1e-9
+        if held >= self.grip_hold_warn_s:
+            self._grip_hold_warned = True
+            trip = self._grip_trip_seconds
+            when = ('측정된 트립 시간 없음' if trip is None
+                    else f'약 {trip:.1f}초'
+                    + ('' if self._grip_trip_measured else ' 이후(보수적 하한, 미실측)'))
+            self.get_logger().warn(
+                f'⚠️ 파지 유지 {held:.0f}초 — 그리퍼 Goal PWM {self._grip_pwm} 기준 '
+                f'{when}에 Overload 트립합니다(토크 차단 → 화물 낙하, REBOOT 전까지 '
+                '무응답). 지금 바로 drop 또는 stow 하세요. 더 오래 들어야 하는 운용이면 '
+                'gripper_goal_pwm 을 낮추고 손가락 마찰 패드로 보강하세요 — 미끄럼 힘은 '
+                'μ×법선력인데 PWM 은 법선력만 건드립니다.')
+
+    def _begin_grip_hold(self):
+        """파지 유지 시계 시작 (GRASP 성공 시점). 이미 재고 있으면 건드리지 않는다."""
+        if self._grip_hold_start is None:
+            self._grip_hold_start = self.get_clock().now()
+            self._grip_hold_warned = False
+
+    def _end_grip_hold(self):
+        """파지 유지 시계 정지 — 그리퍼를 여는 모든 경로에서 부른다."""
+        self._grip_hold_start = None
+        self._grip_hold_warned = False
+        self._grip_hold_target = None
+        self._last_grip_refresh = None
+
+    def _maintain_grip(self):
+        """파지 중 닫힘 명령을 주기적으로 재발행해 **조이는 토크를 계속 유지**한다.
+
+        다이나믹셀 위치제어는 Goal Position 이 남아 있는 동안 계속 미므로, 원리적으로는
+        한 번만 보내도 토크가 유지된다. 문제는 그 전제("Goal Position 이 그대로 남아
+        있다")가 실기에서 깨질 수 있다는 것이다:
+
+          · 브릿지의 그리퍼 자동복구(`_recover_gripper_range`)는 Goal Position 을
+            **열림 쪽으로 덮어쓴다.** 기동 시에만 돌지만, 파지 중에 조건이 걸리면
+            조이던 목표가 통째로 사라진다.
+          · 물체가 눌리거나 살짝 미끄러져 손가락이 더 들어갈 여지가 생겼을 때, 목표를
+            다시 못 박아 주면 **그 여지만큼 느슨해진 채로** 남는다.
+          · 액션 서버 경로라 goal 이 유실돼도(통신 실패 등) 아무도 재시도하지 않았다 —
+            `_write_gripper` 의 write 실패는 warn 만 찍고 넘어간다.
+
+        재발행 비용은 사실상 0 이고(같은 목표를 다시 쓰는 것뿐), **부하가 늘지 않으므로
+        Overload 트립 위험도 그대로다** — 서보는 이미 그 목표를 향해 밀고 있었다.
+        실패 모드를 여럿 지우면서 위험은 안 늘리므로 기본으로 켠다.
+
+        ⚠️ 목표는 `_do_grasp` 가 실제로 보낸 값(`_grip_hold_target`)을 그대로 다시 쓴다.
+        여기서 새로 계산하면 `_send_gripper` 의 끝단 clamp 와 어긋날 수 있고, 끝단
+        너머로 밀면 하드스톱에 물려 되열리지도 못한다(그 실기 사고가 clamp 를 만든 이유다).
+        """
+        if self.grip_refresh_s <= 0.0 or self._grip_hold_target is None:
+            return
+        now = self.get_clock().now()
+        if self._last_grip_refresh is not None:
+            age = (now - self._last_grip_refresh).nanoseconds * 1e-9
+            if age < self.grip_refresh_s:
+                return
+        self._last_grip_refresh = now
+        self._send_gripper(self._grip_hold_target, refresh=True)
+
+    def _send_gripper(self, position, refresh=False):
+        """gripper_controller에 FollowJointTrajectory 단일 점 전송 (fire-and-forget).
+
+        ⚠️ **캘리브된 개폐 끝단 밖으로는 명령하지 않는다** (2026-08-19 추가).
+        `gripper_close - gripper_squeeze_rad` 는 완전닫힘(`gripper_close`=0.0)보다
+        `gripper_squeeze_rad`(0.25rad) 만큼 **더 닫으라는** 값이라, tick 으로는
+        -2036 이 나간다 — 캘리브된 완전닫힘 -1895 는 물론 손으로 잰 기구 한계
+        -1933 도 넘는다. 실기에서 그리퍼가 하드스톱에 물려 멈췄고, Goal PWM 이
+        280 으로 제한돼 있어 **되열리지도 못했다**(effort 316·velocity 0 으로 정지,
+        하드웨어 에러는 안 뜸 → 원인을 못 찾기 쉽다).
+
+        squeeze 는 원래 "접촉점보다 조금 더 눌러 힘을 준다" 는 뜻인데, 이 그리퍼는
+        파지력이 Goal PWM 으로 정해지므로 목표를 더 밀어넣어도 힘이 늘지 않는다 —
+        잃는 것 없이 끝단으로 자른다. squeeze 를 진짜로 쓰려면 `gripper_close` 를
+        기구 끝단이 아니라 **접촉 위치**로 잡아야 한다.
+        """
+        lo, hi = sorted((self.gripper_close, self.gripper_open))
+        clamped = max(lo, min(hi, float(position)))
+        if abs(clamped - float(position)) > 1e-9:
+            self.get_logger().warn(
+                f'그리퍼 목표 {position:+.4f} rad 가 캘리브 범위 '
+                f'[{lo:+.4f}, {hi:+.4f}] 밖이라 {clamped:+.4f} 로 자름')
+        position = clamped
+        if not refresh:
+            # 이 값이 파지 유지 재발행(_maintain_grip)의 기준이 된다. clamp 를 **거친 뒤**
+            # 저장해야 재발행이 끝단 밖으로 나가지 않는다.
+            self._grip_hold_target = position
+            self._last_grip_refresh = self.get_clock().now()
+        # 여는 명령이면 파지 유지 시계를 멈춘다. 호출부(_do_release/_do_stowing)마다
+        # 따로 부르지 않고 **이 funnel 한 곳**에서 처리한다 — 그리퍼를 여는 경로가
+        # 나중에 늘어나도 시계가 안 멈춘 채 남는 일이 없다(멈추지 않으면 다음 파지가
+        # 시작하자마자 경고를 띄운다).
+        if abs(position - self.gripper_open) < abs(position - self.gripper_close):
+            self._end_grip_hold()
+        traj = JointTrajectory()
+        traj.joint_names = self.gripper_joints
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(position)] * len(self.gripper_joints)
+        pt.time_from_start = Duration(sec=int(self.gripper_action_time))
+        traj.points.append(pt)
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory
-        self._gripper_command_state = 'active'
-        self._gripper_command_ok = False
-        self._gripper.send_goal_async(goal).add_done_callback(
-            self._on_gripper_goal_response)
+        goal.trajectory = traj
+        if not self._grip.server_is_ready():
+            # 재발행 경로는 조용히 넘어간다 — 1초마다 같은 경고가 찍히면 진짜 문제가 묻힌다.
+            if not refresh:
+                self.get_logger().warn('gripper_controller 액션 서버 미준비')
+            return
+        self._grip.send_goal_async(goal)
 
     def _on_gripper_goal_response(self, future):
         try:
@@ -1741,10 +2400,11 @@ class ArmFsmNode(Node):
             self._last_completed_mission_id = self.mission_id
         self.state = new_state
         self._state_enter_t = self.get_clock().now()
-        self._cleaning_command_sent = False
-        self._stow_move_sent = False
-        if new_state not in (State.GRASP, State.RELEASE):
-            self._gripper_command_state = 'idle'
+        self._grip_sent = False
+        self._stow_stage = 0
+        self._stow_plan = None
+        self._return_stage = 0
+        self._carry_home_active = False
 
     def _set_status(self, status):
         """발행할 현재 상태를 갱신한다. 실제 발행은 _publish_heartbeat 가 전담한다.
