@@ -114,11 +114,12 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_pose
 
 from builtin_interfaces.msg import Duration
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from moveit_msgs.action import MoveGroup
+from control_msgs.action import FollowJointTrajectory
 from moveit_msgs.msg import (MotionPlanRequest, Constraints, PositionConstraint,
                              OrientationConstraint, BoundingVolume, RobotState)
 from moveit_msgs.srv import GetPositionFK
@@ -148,6 +149,13 @@ from dynamixel_control.contract import (       # noqa: E402
 )
 from dynamixel_control.qos_profiles import HEARTBEAT_QOS, ARRIVAL_QOS   # noqa: E402
 from dynamixel_control.sensor_manager import SensorManager              # noqa: E402
+from dynamixel_control.tool_manager import (                            # noqa: E402
+    ParameterToolIdentityProvider, ToolManager)
+from dynamixel_control.tool_profiles import (                           # noqa: E402
+    load_profiles, ToolProfileError)
+from ament_index_python.packages import get_package_share_directory     # noqa: E402
+from pathlib import Path                                                # noqa: E402
+import json                                                             # noqa: E402
 
 # contract.py의 LOCK_MODES는 DRIVING을 포함한다("MISSION_STOP만 허가, 나머지 전부 잠금").
 RECOGNIZED_MODES = LOCK_MODES | {MODE_MISSION_STOP, MODE_STOW_REQUEST}
@@ -165,6 +173,8 @@ class State(Enum):
     PLAN = auto()
     APPROACH = auto()
     TOOL_ACTION = auto()
+    GRASP = auto()
+    GRASP_CHECK = auto()
     CLEAN_START = auto()
     CONTACT_CHECK = auto()
     CLEAN = auto()
@@ -235,6 +245,11 @@ class ArmFsmNode(Node):
         self.declare_parameter('vla_result_topic', '/vla/result')
         self.declare_parameter('vla_standalone_mode', False)
         self.declare_parameter('dry_run_mode', False)
+        self.declare_parameter('tool_type', 'spur_1motor_gripper')
+        default_profiles = str(Path(get_package_share_directory(
+            'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
+        self.declare_parameter('tool_profile_file', default_profiles)
+        self.declare_parameter('tool_status_timeout', 1.5)
         self.declare_parameter('cleaning_start_time', 0.5)
         self.declare_parameter('contact_timeout', 3.0)
         self.declare_parameter('lock_check_timeout', 3.0)
@@ -277,6 +292,22 @@ class ArmFsmNode(Node):
         self.cleaning_actuator_joint = g('cleaning_actuator_joint').value
         self.vla_standalone_mode = bool(g('vla_standalone_mode').value)
         self.dry_run_mode = bool(g('dry_run_mode').value)
+        self.selected_tool_type = str(g('tool_type').value)
+        self.tool_status_timeout = float(g('tool_status_timeout').value)
+        try:
+            profiles = load_profiles(g('tool_profile_file').value)
+            self.tool_manager = ToolManager(
+                profiles,
+                ParameterToolIdentityProvider(self.selected_tool_type),
+                mock_mode=self.dry_run_mode)
+            self.tool_selection = self.tool_manager.refresh('IDLE')
+        except ToolProfileError as exc:
+            self.get_logger().error(f'tool profile rejected: {exc}')
+            self.tool_selection = None
+        self.tool_profile = (
+            self.tool_selection.profile if self.tool_selection else {})
+        self.tool_profile_valid = bool(
+            self.tool_selection and self.tool_selection.valid)
         self.cleaning_start_time = g('cleaning_start_time').value
         self.contact_timeout = g('contact_timeout').value
         self.lock_check_timeout = g('lock_check_timeout').value
@@ -317,10 +348,19 @@ class ArmFsmNode(Node):
         # 파워트레인 DDS 경계를 넘지 않음). _is_settled()에서 게이트로 사용.
         self.create_subscription(
             Bool, '/dynamixel/controller_fault', self._on_controller_fault, 10)
+        self.create_subscription(String, '/tool/status', self._on_tool_status, 10)
+        self.create_subscription(Bool, '/tool/emergency_stop', self._on_tool_stop, 10)
+        self.create_subscription(Bool, '/tool/detached', self._on_tool_stop, 10)
+        self.create_subscription(String, '/control/mode', self._on_control_mode, 10)
 
         self.pub_status = self.create_publisher(ArmStatus, '/arm_status', HEARTBEAT_QOS)
         self.pub_task_result = self.create_publisher(
             TaskResult, g('vla_result_topic').value, 10)
+        self.pub_fsm_state = self.create_publisher(String, '/fsm/state', 10)
+        self.pub_control_mode = self.create_publisher(
+            String, '/control/mode_status', 10)
+        self.pub_contact_status = self.create_publisher(
+            Bool, '/sensors/contact_status', 10)
 
         # TF: base_link ← tip_link 조회용 (LIFT 시 현재 TCP 기준 수직 리프트 계산)
         self.tf_buffer = Buffer()
@@ -329,6 +369,10 @@ class ArmFsmNode(Node):
         # MoveIt action is used when ik_mode == 'moveit'.
         self._move = ActionClient(self, MoveGroup, 'move_action')
         self._cleaning_pub = self.create_publisher(Bool, '/cleaning/enable', 10)
+        self._tool_stop_pub = self.create_publisher(Bool, '/tool/emergency_stop', 10)
+        self._gripper = ActionClient(
+            self, FollowJointTrajectory,
+            '/gripper_controller/follow_joint_trajectory')
 
         # analytic IK 경로 (ik_mode=='analytic', 기본): FK 서비스 + 직접 관절궤적 publish
         # ⚠️ FK 호출은 _tick(타이머 콜백) 안에서 블로킹 대기함 — self 를 spin하면 이미
@@ -340,6 +384,7 @@ class ArmFsmNode(Node):
         self._arm_traj_pub = self.create_publisher(
             JointTrajectory, '/arm_controller/joint_trajectory', 10)
         self._joint_position = {}          # joint_name -> position(rad), /joint_states 에서 갱신
+        self._joint_effort = {}
         self._arm_move_deadline = None      # analytic 이동 완료 예상 시각
 
         # ── 내부 상태 ─────────────────────────────
@@ -351,6 +396,11 @@ class ArmFsmNode(Node):
         self.mission_id = 0
         self.task_command = ''
         self.tool_type = ''
+        self._tool_status = None
+        self._tool_status_stamp = None
+        self._gripper_command_state = 'idle'
+        self._gripper_command_ok = False
+        self.control_mode = 'FSM'
         self._task_result_sent = False
         # 브릿지 controller fault 게이트 — 첫 샘플 받기 전엔 알 수 없으니 보수적으로 True
         # (TF 미가용 시 _is_settled()가 False를 리턴하는 것과 같은 안전 측 기본값).
@@ -397,6 +447,8 @@ class ArmFsmNode(Node):
         self.get_logger().info(
             f'arm_fsm_node started (MoveIt 경로, state=IDLE, cleaning_actuator='
             f'{self.cleaning_actuator_joint or "UNCONFIGURED"}, '
+            f'tool_type={self.selected_tool_type}, '
+            f'tool_profile_valid={self.tool_profile_valid}, '
             f'heartbeat={HEARTBEAT_RATE_HZ}Hz)'
         )
 
@@ -408,12 +460,18 @@ class ArmFsmNode(Node):
     def _on_task_command(self, msg):
         """Accept only mission-level VLA commands; hardware remains behind this FSM."""
         command = msg.command.upper()
+        if self.control_mode != 'FSM':
+            self._publish_task_result(
+                msg.mission_id, False, self.state.name,
+                'control ownership is MANUAL')
+            return
         if command not in {'CLEAN', 'PICK', 'MOVE', 'STOP', 'STOW'}:
             self._publish_task_result(msg.mission_id, False, 'REJECTED', 'unknown command')
             return
         if command == 'STOP':
             self._cancel_arm_motion()
             self._set_cleaning(False)
+            self._tool_stop_pub.publish(Bool(data=True))
             self._publish_task_result(msg.mission_id, True, 'IDLE', 'stopped')
             self._transition(State.IDLE)
             return
@@ -424,10 +482,18 @@ class ArmFsmNode(Node):
         if self.state != State.IDLE:
             self._publish_task_result(msg.mission_id, False, self.state.name, 'FSM busy')
             return
-        if command == 'PICK':
+        requested_tool = msg.tool_type.strip()
+        accepted_aliases = {
+            'gripper': ('spur_1motor_gripper', 'dual_motor_gripper'),
+            'cleaner': ('cleaner',),
+        }
+        if (requested_tool and requested_tool != self.selected_tool_type
+                and self.selected_tool_type not in accepted_aliases.get(
+                    requested_tool, ())):
             self._publish_task_result(
                 msg.mission_id, False, 'REJECTED',
-                'ee_description defines no gripper joint/backend')
+                f'command requests {requested_tool}, selected tool is '
+                f'{self.selected_tool_type}')
             return
         if not self.vla_standalone_mode and not self._mission_stop_active:
             self._publish_task_result(
@@ -435,7 +501,7 @@ class ArmFsmNode(Node):
             return
         self.mission_id = msg.mission_id
         self.task_command = command
-        self.tool_type = msg.tool_type
+        self.tool_type = self.selected_tool_type
         self._task_result_sent = False
         target = DetectedObject()
         target.class_name = msg.target_object
@@ -511,6 +577,10 @@ class ArmFsmNode(Node):
             if msg.mission_id == self._last_completed_mission_id:
                 return  # 이미 완료된 mission_id 재발행 — 재실행 금지
             self.mission_id = msg.mission_id
+            if not self.task_command:
+                self.task_command = (
+                    'CLEAN' if self.selected_tool_type == 'cleaner' else 'PICK')
+                self.tool_type = self.selected_tool_type
             self._pending_arrival = None
             self._set_status(ARM_WORK_READY)
             self._transition(State.PERCEIVE)
@@ -543,13 +613,77 @@ class ArmFsmNode(Node):
         for i, name in enumerate(msg.name):
             if i < len(msg.position):
                 self._joint_position[name] = msg.position[i]
+            if i < len(msg.effort):
+                self._joint_effort[name] = abs(float(msg.effort[i]))
 
     def _on_controller_fault(self, msg):
         self._controller_fault = bool(msg.data)
 
+    def _on_tool_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if status.get('tool_type') != self.selected_tool_type:
+            self.get_logger().error(
+                'bridge tool_type differs from FSM selection; motion remains blocked')
+            self._tool_status = None
+            self._tool_status_stamp = None
+            return
+        self._tool_status = status
+        self._tool_status_stamp = self.get_clock().now()
+
+    def _on_tool_stop(self, msg):
+        if not msg.data:
+            return
+        self._set_cleaning(False)
+        self._cancel_arm_motion()
+        if self.state not in (State.IDLE, State.STOWED_LOCKED):
+            self._set_status(ARM_FAILED)
+            self._transition(State.STOWING)
+
+    def _on_control_mode(self, msg):
+        requested = msg.data.strip().upper()
+        self.get_logger().info(
+            f'Control mode request received: requested={requested!r}, '
+            f'fsm_state={self.state.name}, current_mode={self.control_mode}')
+        if requested not in ('MANUAL', 'FSM'):
+            self.get_logger().warn(
+                f'Control mode request denied: unsupported mode {requested!r}')
+            return
+        if (requested == 'MANUAL'
+                and self.state not in (State.IDLE, State.STOWED_LOCKED)):
+            self.get_logger().warn(
+                f'Control mode request denied: MANUAL requires FSM state '
+                f'IDLE or STOWED_LOCKED; actual={self.state.name}')
+            return
+        self.control_mode = requested
+        self.get_logger().info(
+            f'Control mode request accepted: mode={self.control_mode}, '
+            f'fsm_state={self.state.name}')
+
+    def _tool_ready(self):
+        if (self.selected_tool_type != 'cleaner'
+                and not self.tool_profile_valid):
+            return False
+        if self.dry_run_mode:
+            return True
+        if self._tool_status is None or self._tool_status_stamp is None:
+            return False
+        age = (self.get_clock().now() - self._tool_status_stamp).nanoseconds * 1e-9
+        return (age <= self.tool_status_timeout
+                and bool(self._tool_status.get('profile_valid'))
+                and bool(self._tool_status.get('actuators_discovered'))
+                and bool(self._tool_status.get('motion_allowed')))
+
     # ── FSM tick ───────────────────────────────
 
     def _tick(self):
+        self.pub_fsm_state.publish(String(data=self.state.name))
+        self.pub_control_mode.publish(String(data=self.control_mode))
+        self.pub_contact_status.publish(Bool(data=self.sensors.contact_confirmed()))
+        if self.control_mode == 'MANUAL':
+            return
         self._check_chassis_mode_watchdog()
         if (self._motion_state == 'active' and self._arm_move_deadline is not None
                 and self.get_clock().now() >= self._arm_move_deadline):
@@ -635,6 +769,14 @@ class ArmFsmNode(Node):
     def _do_plan(self):
         """파지 목표로 이동 시작. 디스패치만 하고 DESCEND에서 대기."""
         self._set_status(ARM_PLANNING)
+        if self.task_command in ('PICK', 'CLEAN') and not self._tool_ready():
+            self.get_logger().error(
+                f'{self.selected_tool_type} profile/backend not ready; arm motion blocked')
+            self._publish_task_result(
+                self.mission_id, False, 'PLAN', 'tool backend not ready')
+            self._set_status(ARM_FAILED)
+            self._transition(State.IDLE)
+            return
         if not self.sensors.obstacle_clear():
             return
         if self.dry_run_mode:
@@ -680,12 +822,54 @@ class ArmFsmNode(Node):
         """Dispatch to a backend without exposing actuator APIs to the VLA layer."""
         if self.task_command == 'MOVE':
             self._transition(State.RETRACT)
-        elif self.task_command == 'CLEAN' and self.tool_type in ('', 'cleaner'):
+        elif (self.task_command == 'PICK'
+              and self.selected_tool_type in (
+                  'spur_1motor_gripper', 'dual_motor_gripper')):
+            self._transition(State.GRASP)
+        elif (self.task_command == 'CLEAN'
+              and self.selected_tool_type == 'cleaner'):
             self._transition(State.CLEAN_START)
         else:
             self._publish_task_result(
                 self.mission_id, False, 'TOOL_ACTION', 'unsupported tool backend')
             self._transition(State.STOWING)
+
+    def _do_grasp(self):
+        """Shared GRASP sub-FSM entry for either calibrated gripper backend."""
+        self._set_status(ARM_EXECUTING)
+        if not self._tool_ready():
+            self._fail_tool_action('gripper backend became unavailable')
+            return
+        if self._gripper_command_state == 'idle':
+            self._send_gripper(float(self.tool_profile.get('close_position', 0.0)))
+            return
+        if self._gripper_command_state == 'active':
+            return
+        ok = self._gripper_command_ok
+        self._gripper_command_state = 'idle'
+        if ok:
+            self._transition(State.GRASP_CHECK)
+        else:
+            self._fail_tool_action('gripper action failed')
+
+    def _do_grasp_check(self):
+        self._set_status(ARM_EXECUTING)
+        threshold = float(self.tool_profile.get('grasp_threshold', float('inf')))
+        effort = self._tool_effort()
+        if effort >= threshold:
+            self._transition(State.RETRACT)
+            return
+        if self._elapsed() >= float(self.tool_profile.get('action_time', 0.0)) + 0.5:
+            self._fail_tool_action(
+                f'grasp effort {effort:.1f} below threshold {threshold:.1f}')
+
+    def _fail_tool_action(self, reason):
+        self.get_logger().error(reason)
+        self._tool_stop_pub.publish(Bool(data=True))
+        self._publish_task_result(
+            self.mission_id, False, self.state.name, reason)
+        self._set_status(ARM_FAILED)
+        self._transition(State.STOWING)
 
     def _do_clean_start(self):
         """털털이 회전을 시작한다. 미설정 actuator에서는 안전하게 실패한다."""
@@ -842,6 +1026,20 @@ class ArmFsmNode(Node):
     def _do_release(self):
         self._set_status(ARM_EXECUTING)
         self._set_cleaning(False)
+        if self.tool_profile.get('backend') != 'gripper':
+            self._transition(State.DONE)
+            return
+        if self._gripper_command_state == 'idle':
+            if self.dry_run_mode or self._tool_ready():
+                self._send_gripper(
+                    float(self.tool_profile.get('open_position', 1.0)))
+            else:
+                # Never invent a motor command after a detach/fault.
+                self._transition(State.DONE)
+            return
+        if self._gripper_command_state == 'active':
+            return
+        self._gripper_command_state = 'idle'
         self._transition(State.DONE)
 
     def _do_done(self):
@@ -1169,6 +1367,56 @@ class ArmFsmNode(Node):
         """별도 Dynamixel velocity actuator에 start/stop 의도를 전달한다."""
         self._cleaning_pub.publish(Bool(data=bool(enabled)))
 
+    def _send_gripper(self, position):
+        """Send only the logical joint command; the bridge owns raw hardware."""
+        if self.dry_run_mode:
+            self._gripper_command_ok = True
+            self._gripper_command_state = 'done'
+            return
+        if not self._tool_ready():
+            self._gripper_command_ok = False
+            self._gripper_command_state = 'done'
+            return
+        trajectory = JointTrajectory()
+        trajectory.joint_names = list(self.tool_profile.get('joint_names', []))
+        point = JointTrajectoryPoint()
+        point.positions = [float(position)]
+        duration = float(self.tool_profile.get('action_time', 1.0))
+        point.time_from_start = Duration(
+            sec=int(duration), nanosec=int((duration % 1.0) * 1e9))
+        trajectory.points.append(point)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self._gripper_command_state = 'active'
+        self._gripper_command_ok = False
+        self._gripper.send_goal_async(goal).add_done_callback(
+            self._on_gripper_goal_response)
+
+    def _on_gripper_goal_response(self, future):
+        try:
+            handle = future.result()
+            if not handle.accepted:
+                self._gripper_command_state = 'done'
+                return
+            handle.get_result_async().add_done_callback(self._on_gripper_result)
+        except Exception:
+            self._gripper_command_state = 'done'
+
+    def _on_gripper_result(self, future):
+        try:
+            wrapped = future.result()
+            self._gripper_command_ok = (
+                wrapped.result.error_code ==
+                FollowJointTrajectory.Result.SUCCESSFUL)
+        except Exception:
+            self._gripper_command_ok = False
+        self._gripper_command_state = 'done'
+
+    def _tool_effort(self):
+        joints = self.tool_profile.get('joint_names', [])
+        return max((self._joint_effort.get(name, 0.0) for name in joints),
+                   default=0.0)
+
     def _publish_task_result(self, mission_id, success, state, reason):
         msg = TaskResult()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1189,6 +1437,8 @@ class ArmFsmNode(Node):
         self._state_enter_t = self.get_clock().now()
         self._cleaning_command_sent = False
         self._stow_move_sent = False
+        if new_state not in (State.GRASP, State.RELEASE):
+            self._gripper_command_state = 'idle'
 
     def _set_status(self, status):
         """발행할 현재 상태를 갱신한다. 실제 발행은 _publish_heartbeat 가 전담한다.

@@ -1,0 +1,54 @@
+tool_profiles:
+  spur_1motor_gripper:
+    backend: gripper
+    calibrated: false
+    actuator_ids: [5]
+    joint_names: [gripper_drive_joint]
+    direction: 1
+    open_tick: null
+    close_tick: null
+    safe_min_tick: null
+    safe_max_tick: null
+    profile_velocity: null
+    profile_acceleration: null
+    no_load_effort: null
+    grasp_effort: null
+    grasp_threshold: null
+    release_drop_threshold: null
+    action_time: null
+    required_operating_modes: {5: 3}
+
+  dual_motor_gripper:
+    backend: gripper
+    calibrated: true
+    actuator_ids: [3, 4]
+    joint_names: [gripper_left_pinion_joint]
+    direction: 1
+    open_tick: 1056
+    close_tick: -526
+    safe_min_tick: -526
+    safe_max_tick: 2384
+    motor_endpoints:
+      3: {open: 1056, close: -526}
+      4: {open: 2384, close: 839}
+    required_operating_modes: {3: 4, 4: 3}
+    profile_velocity: 80
+    profile_acceleration: 25
+    no_load_effort: 119
+    grasp_effort: 290
+    grasp_threshold: 250
+    release_drop_threshold: 200
+    action_time: 2.5
+    goal_pwm: 280
+    max_abs_effort: 500
+    open_position: 1.9444444444444444
+    close_position: 0.0
+
+  cleaner:
+    backend: cleaner
+    calibrated: false
+    actuator_ids: []
+    joint_names: []
+    direction: null
+    profile_velocity: null
+    profile_acceleration: null

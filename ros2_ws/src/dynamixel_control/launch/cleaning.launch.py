@@ -42,6 +42,7 @@ def generate_launch_description():
             executable='moveit_dynamixel_bridge',
             output='screen',
             parameters=[shared, {
+                'tool_type': 'cleaner',
                 'cleaning_actuator_id': ParameterValue(dxl_id, value_type=int),
                 'cleaning_direction': ParameterValue(direction, value_type=int),
                 'cleaning_velocity_raw': ParameterValue(velocity, value_type=int),
@@ -52,6 +53,7 @@ def generate_launch_description():
             executable='arm_fsm',
             output='screen',
             parameters=[shared, {
+                'tool_type': 'cleaner',
                 'joint_effort_sensor_joint': joint,
                 'joint_effort_contact_threshold': ParameterValue(
                     contact, value_type=float),
