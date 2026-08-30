@@ -15,6 +15,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArmStatus.msg"
   "msg/TaskCommand.msg"
   "msg/TaskResult.msg"
+  "action/EndEffectorRotate.action"
+  "action/ArmTestMove.action"
+  "action/ArmRecordedPath.action"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 
