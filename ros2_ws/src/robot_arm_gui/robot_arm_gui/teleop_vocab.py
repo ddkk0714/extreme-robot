@@ -31,7 +31,8 @@ NO_ARG = (
 )
 
 #: 이름 인자가 **필수**인 명령.
-NAME_ARG = ('save', 'goto', 'reboot')
+#: 'delete' 는 2026-08-19 추가 — teleop_core._cmd_delete_pose 와 짝이다.
+NAME_ARG = ('save', 'goto', 'delete', 'reboot')
 
 #: on|off|<정수 임계값> 을 받는 명령.
 THRESHOLD_ARG = ('spike', 'trip')

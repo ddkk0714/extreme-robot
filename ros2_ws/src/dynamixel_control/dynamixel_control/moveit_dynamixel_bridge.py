@@ -122,7 +122,11 @@ DXL_TICKS_PER_REV = calib_math.DXL_TICKS_PER_REV  # Present Velocity 환산용
 #    (9:1, 4:1)은 역구동이 안 돼 손으로 세운 자세가 유지되지만 이 둘은 손을 떼면 처진다.
 #    영점 측정은 반드시 **팔을 붙잡은 상태에서** 할 것.
 #
-# 🔁 **2026-08-09 2차 재측정** (아래 값). 1차 측정 후 실기 구동 중 손목(arm_joint_5)
+# 🔁 **2026-08-19 3차 재측정 (현재 값).** 팔 전체 재조립 → 전 축 영점 무효.
+#    같은 회차에 arm_joint_1(ID 11, XM540-W270)이 새로 실장된 것도 확인됐다.
+#    ⚠️ extended 축(arm_joint_2/3)의 아래 center 는 **이 전원 세션 안에서만** 유효하다.
+#
+# 🔁 **2026-08-09 2차 재측정** (이력). 1차 측정 후 실기 구동 중 손목(arm_joint_5)
 #    결합이 물리적으로 빠져 재조립했고, 서보 전원도 내려갔다 — 둘 다 영점 무효 사유다.
 #    재조립 후 측정에서는 붙잡은 상태의 드리프트가 8초간 arm_joint_2/5 **정확히 0.000°**
 #    로 나왔다.
@@ -131,15 +135,22 @@ DXL_TICKS_PER_REV = calib_math.DXL_TICKS_PER_REV  # Present Velocity 환산용
 #       것으로 확인). 어떤 축이 "잡아도 계속 흐르면" 측정을 계속하지 말고 결합부터
 #       점검할 것 — 그대로 두면 구동 중 빠진다.
 JOINT_CONFIG = {
+    # 🆕 **2026-08-19 신설.** 이 축은 그동안 "모터가 물리적으로 없다"는 전제로
+    # STATIC_JOINTS 에 0.0 고정 발행돼 있었는데, 재조립 후 버스 스캔에서 ID 11
+    # (XM540-W270)이 정상 응답했다. 사용자 확인 결과 기구에도 물려 있다.
+    # gear_ratio 1.0 = **감속기 없는 직결**이다(2026-08-19 사용자 확인) — 측정으로
+    # 나온 값이 아니라 기구가 그렇다. center 는 같은 날 zero_offset 실측값.
+    "arm_joint_1": {"id": 11, "center": 2081, "direction": 1,
+                    "gear_ratio": 1.0, "extended": False},
     # 2026-08-07 실측: 9.034:1 (관절 90° 회전 기준)
-    "arm_joint_2": {"id": 14, "center": 641, "direction": -1,
+    "arm_joint_2": {"id": 14, "center": 506, "direction": -1,
                     "gear_ratio": 9.034, "extended": True},
     # 2026-08-07 실측: 4.040:1 — arm_joint_2 와 다른 감속기다(오타 아님)
-    "arm_joint_3": {"id": 13, "center": 207, "direction": 1,
+    "arm_joint_3": {"id": 13, "center": 1855, "direction": 1,
                     "gear_ratio": 4.040, "extended": True},
-    "arm_joint_4": {"id": 12, "center": 2510, "direction": 1,
+    "arm_joint_4": {"id": 12, "center": 1184, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
-    "arm_joint_5": {"id": 16, "center": 985, "direction": 1,
+    "arm_joint_5": {"id": 16, "center": 675, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
 }
 ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
@@ -178,9 +189,11 @@ ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
 #    상태라면 팔의 평면이 운용 중 돌아가고 이 값은 무의미해진다 — 그 경우 IK 목표가
 #    조용히 틀어지므로, 물리적으로 고정돼 있는지 반드시 확인할 것.
 #    팔을 재장착했다면 위 확인 절차를 다시 밟을 것.
-STATIC_JOINTS = {
-    "arm_joint_1": 0.0,
-}
+# 🔁 **2026-08-19 비움.** arm_joint_1 은 ID 11 서보가 실재하는 것이 확인돼
+#    JOINT_CONFIG 로 옮겨졌다(위 참고). 이제 실측값이 /joint_states 로 나가므로
+#    고정 발행이 필요 없다 — 고정값을 남겨두면 실제 서보각과 충돌한다.
+#    아래 dict 와 발행 경로는 다음에 모터 없는 축이 생길 때를 위해 남겨둔다.
+STATIC_JOINTS = {}
 
 # X 시리즈 Extended Position Control Mode 의 raw tick 한계(약 ±256회전).
 DXL_EXTENDED_MIN_TICK = calib_math.DXL_EXTENDED_MIN_TICK

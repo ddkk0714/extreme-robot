@@ -212,6 +212,30 @@
       <div>
         <div class="field-label">명령 <span class="muted">teleop_core 어휘</span></div>
         <div id="teleop-cmds" class="btn-row"></div>
+
+        <div class="field-label pose-head">자세 <span class="muted">저장·불러오기</span></div>
+        <div id="pose-list" class="btn-row"></div>
+        <div class="btn-row">
+          <input id="pose-name" class="pose-input" type="text" maxlength="32"
+                 autocomplete="off" spellcheck="false" placeholder="새 자세 이름">
+          <button id="pose-save" class="btn" type="button">자세 저장</button>
+        </div>
+        <!-- 저장은 2단계다: freedrive 로 토크를 푼 뒤 손으로 자세를 잡고 확정한다.
+             teleop_core 의 "프리드라이브 저장" 계약(save 전에 freedrive 선행)을
+             프론트엔드가 지켜야 한다 — 안 그러면 토크가 걸린 채라 자세를 못 잡는다. -->
+        <div id="pose-freedrive" class="pose-freedrive" hidden>
+          <div class="small">
+            <strong id="pose-pending-name">—</strong> 저장 대기 —
+            팔 토크를 풀었습니다. <b>손으로 자세를 잡은 뒤</b> 확정하세요.
+          </div>
+          <div class="btn-row">
+            <button id="pose-confirm" class="btn btn-primary" type="button">이 자세로 저장</button>
+            <button id="pose-cancel" class="btn" type="button">취소(토크 복귀)</button>
+          </div>
+        </div>
+        <div class="muted small">
+          그리퍼와 <code>arm_joint_5</code> 는 자세에 포함되지 않습니다(별도 조작).
+        </div>
         <details class="keymap">
           <summary>키맵 (기존 curses TUI 와 동일)</summary>
           <ul>

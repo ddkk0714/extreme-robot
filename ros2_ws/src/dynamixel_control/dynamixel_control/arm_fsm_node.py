@@ -293,7 +293,8 @@ class ArmFsmNode(Node):
         self.declare_parameter('locked_pos_tol', 0.005)   # [m] tip 위치 흔들림 허용치
         self.declare_parameter('locked_vel_tol', 0.05)    # [rad/s] 관절 속도(유한차분) 허용치
         self.declare_parameter('locked_dwell', 0.5)       # [s] 안정 유지 시간
-        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 = j1, j2, j3).
+        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 — 2026-08-19 기준 5축:
+        # arm_joint_1..5. ID 11 서보 실장으로 4축에서 5축이 됐다).
         # **팀이 주행 안정성 기준으로 all-zero 를 접힘 자세로 확정**(사용자 지시, 2026-07-29).
         # 2026-07-29 랙피니언 그리퍼 URDF 실측 지표:
         #   점유 bbox x 224mm × y 606mm   높이 285mm   최저점 +50mm

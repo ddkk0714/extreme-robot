@@ -113,6 +113,27 @@ code { font-size: 0.92em; color: var(--text-secondary); }
 .field-row .field { flex: 1 1 160px; }
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 6px; }
 
+/* ── 자세 저장/불러오기 ───────────────────────────────── */
+.pose-head { margin-top: 14px; }
+.pose-input {
+  font: inherit; font-size: 12px; padding: 4px 8px; border-radius: 6px;
+  background: var(--plane); color: var(--text-primary);
+  border: 1px solid var(--border); min-width: 0; flex: 1 1 120px;
+}
+.pose-input:focus { outline: none; border-color: var(--series-1); }
+.pose-freedrive {
+  border: 1px solid var(--warning, var(--series-1)); border-radius: 6px;
+  padding: 8px 10px; margin: 8px 0;
+}
+.pose-btn { display: inline-flex; align-items: center; gap: 0; padding: 0; }
+/* 이동/삭제가 한 칩처럼 붙어 보이게 — 자세 하나당 버튼이 둘이라 따로 떨어지면
+   어느 삭제가 어느 자세인지 눈으로 못 잇는다. */
+.pose-btn .btn { border-radius: 0; border-right-width: 0; }
+.pose-btn .btn:first-child { border-radius: 6px 0 0 6px; }
+.pose-btn .btn:last-child { border-radius: 0 6px 6px 0; border-right-width: 1px; }
+.pose-del { color: var(--text-secondary); padding-left: 7px; padding-right: 7px; }
+.pose-del:hover { color: var(--critical); border-color: var(--critical); }
+
 /* ── 배너 ─────────────────────────────────────────────── */
 .banner {
   padding: 10px 16px; font-weight: 600;
