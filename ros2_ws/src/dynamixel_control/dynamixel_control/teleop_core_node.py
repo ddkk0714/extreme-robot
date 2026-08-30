@@ -208,18 +208,27 @@ EXTENDED_POSITION_NAMES = {"arm_joint_2", "arm_joint_3", "gripper_left_pinion_jo
 # 다시 2모터 동시구동을 시도한다면 마스터-팔로워 방식(하나는 위치제어, 하나는
 # 그 위치를 실측 추종하는 토크/전류 제어)처럼 서로 안 겨루는 구조가 필요하다.
 DEFAULT_JOINT_NAMES = [
-    "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
+    "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5",
+    "gripper_left_pinion_joint",
 ]
 
 # 실기 버스 스캔값 (2026-08-01, 사용자 재확인). arm_joint_1(ID 11)은 현재 미연결.
 # 그리퍼는 ID 3 하나만 구동(위 주석 참고, ID 4는 미등록 → 자유회전).
-DEFAULT_MOTOR_IDS = [14, 13, 12, 16]
-DEFAULT_CENTERS = [1627, 4281, 2563, 949]
+DEFAULT_MOTOR_IDS = [11, 14, 13, 12, 16, 3]
+# ⚠️ **2048 을 실측 center 로 바꾸지 말 것** — 2026-08-19 에 시도했다가 되돌렸다.
+# 이 노드의 measured_rad 는 position_node 가 발행한 /joint_states 를 그대로 받는데,
+# position_node 는 `rad = (tick - 2048)*2π/4096` 으로 **2048 을 하드코딩**한다
+# (dynamixel_position_node.py 의 "2048을 중앙, 한 바퀴를 2pi로 가정" 참고).
+# 여기 center 만 실측값으로 바꾸면 **읽기는 2048 도메인, 쓰기(_rad_to_tick)는 실측
+# 도메인**이 되어 왕복이 깨진다 — goal 을 측정값으로 시드하는 _ensure_goal 이
+# 곧바로 1500 tick 넘게 어긋난 tick 을 내보낸다(arm_joint_2 기준 ≈19° 관절 점프).
+# 바꾸려면 position_node 의 환산까지 같이 고쳐야 한다.
+DEFAULT_CENTERS = [2048] * 6
 # arm_joint_2 는 2026-08-01 사용자 요청으로 방향 반전(-1). direction 은 tick 변환
 # (_rad_to_tick)에만 쓰이던 값이라, 읽기 쪽(on_joint_states/_publish_sim_joint_states)도
 # 같은 direction 을 곱해 goal_rad 와 같은 '명령 도메인'으로 맞춰줬다 — 안 그러면
 # stop/자세 저장·이동이 center(2048) 밖에서 순간적으로 튄다.
-DEFAULT_DIRECTIONS = [-1, 1, 1, 1]
+DEFAULT_DIRECTIONS = [1, -1, 1, 1, 1, 1]
 
 # 그리퍼(마지막 축)의 리밋은 gripper_presets 의 **실측 tick** 에서 유도한다 —
 # 숫자를 여기 따로 적어두면 캘리브를 다시 했을 때 조용히 어긋난다.
@@ -246,9 +255,37 @@ _GRIPPER_MIN_RAD, _GRIPPER_MAX_RAD = sorted(
 # CALIB_SANE_RAD_LIMIT_EXTENDED 로 재검증을 통과해 반영했다(같은 세션에 함께
 # 측정된 arm_joint_5 는 폭 0(하한/상한을 실제로 안 움직임)이라 여전히 반영 안 함
 # — CALIB_MIN_RANGE_RAD 주석 참고).
-DEFAULT_LIMIT_ENABLED = [True, True, True, False]
-DEFAULT_MIN_RADS = [2.195127, -2.055534, -0.613592, -math.pi]
-DEFAULT_MAX_RADS = [9.199283, 7.666836, 0.828350, math.pi]
+#
+# 🔁 **2026-08-19 재조립 후 전면 교체.** 위 DEFAULT_CENTERS 를 실측값으로 바꿨으므로
+# 이 값들도 같은 도메인으로 다시 표현해야 한다. 옛 값은 center=2048 가정 위에서
+# 2026-08-02 에 잰 것이라 그대로 두면 도메인이 어긋난다.
+#
+# ⚠️ joint_limits.py 에서 **복사한 게 아니라 환산**한 값이다(그쪽은 관절 도메인,
+#    여기는 center=2048 기준 서보축 도메인). 변환식:
+#        tick       = JOINT_CONFIG.center + direction_jc × 관절rad × TPR × gear_ratio
+#        서보축 rad = (tick - 2048) / (direction_tc × TPR)
+#    joint_limits.py 나 JOINT_CONFIG 의 center 가 바뀌면 **여기도 다시 환산**할 것.
+#    숫자를 그냥 옮겨 적으면 감속기 축에서 9배, 영점 차이만큼 또 한 번 틀린다.
+#
+# ⚠️ arm_joint_5 의 하한은 환산값 -3.6605 가 아니라 **-π 로 잘랐다.** 원래 값은
+#    tick -338 로 단일회전 범위(0~4095) 밖이고, CALIB_SANE_RAD_LIMIT(π·1.05)도
+#    넘어 _validate_calib_bounds 에 거부된다. -π = tick 0 이 이 축이 Position
+#    모드에서 실제로 갈 수 있는 끝이다 — 실측 범위의 아래쪽 일부(약 30%)는
+#    도달 불가다. 다 쓰려면 이 축도 Extended Position 으로 돌려야 한다.
+#
+# 🔁 **2026-08-19: 그리퍼 리밋을 켰다(구 False).** 끄면 안 움직인다 —
+# _publish_tick_limits 가 enabled=False 인 축을 빼는데, position_node 는
+# **다회전(Extended) 축에 tick_limits 가 없으면 그 목표를 통째로 거부**한다
+# ("ID 3 는 다회전 축인데 tick_limits 가 아직 없습니다 — 이 목표는 무시합니다").
+# 즉 리밋을 끄는 것이 곧 그리퍼를 못 쓰게 만드는 교착이었다. 실기에서 GUI 로
+# 그리퍼만 안 움직이는 증상으로 나타났다(2026-08-19).
+# 리밋 값은 gripper_presets 의 실측 tick 에서 유도하므로 캘리브와 항상 붙어 있다
+# — 덤으로 하드스톱을 밀어 과부하 트립 나는 것도 막는다.
+DEFAULT_LIMIT_ENABLED = [True, True, True, True, True, True]
+DEFAULT_MIN_RADS = [-0.199779, 2.365398, -0.593806, -1.893259, -math.pi,
+                    _GRIPPER_MIN_RAD]
+DEFAULT_MAX_RADS = [0.301021, 15.262337, 11.240970, 0.762741, -0.617856,
+                    _GRIPPER_MAX_RAD]
 
 # 팔 관절(arm_joint_1..5) 전부 "켰을 때 각도보다 아래(키보드 ↓/s 방향)로 안 가게"
 # 처리한다 — 처음엔 arm_joint_2/3만 예외 처리했다가(2026-08-02), 사용자 요청으로
@@ -272,7 +309,7 @@ DEFAULT_MAX_RADS = [9.199283, 7.666836, 0.828350, math.pi]
 # 실행되면 하한이 boot 값으로 덮어써져 실측 하한을 잃는다 — __init__ 의
 # floor_from_boot_names 처리 참고).
 # joint_names 파라미터와 병렬 배열.
-DEFAULT_FLOOR_FROM_BOOT = [False, False, False, True]
+DEFAULT_FLOOR_FROM_BOOT = [True, False, False, False, True, False]
 
 # 리미트 측정 모드(calib_*) 결과 안전성 검사 (2026-08-02 추가, 같은 날 기어비
 # 확인으로 갱신) — 실사용 중 arm_joint_2/3 가 ±π 를 훨씬 넘는 값(예: 9.2rad)으로,

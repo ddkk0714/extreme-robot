@@ -201,7 +201,11 @@ def main():
         print(f'        "lower": {safe_lower:+.4f},')
         print(f'        "upper": {safe_upper:+.4f},')
         print('        "confidence": "measured",')
-        print(f'        "source": "2026-08-07 하드스톱 실측 '
+        # 날짜는 **측정 시점**을 찍는다. 예전엔 "2026-08-07" 이 문자열에 박혀 있어서,
+        # 그 뒤 회차의 측정값도 전부 8/7 에 잰 것처럼 기록됐다(2026-08-19 재조립
+        # 회차에서 발견). 영점·기어비가 바뀌면 리밋도 무효라 "언제 잰 값인가"가
+        # 이 필드의 존재 이유인데, 고정 문자열이면 그걸 정확히 못 쓴다.
+        print(f'        "source": "{date.today().isoformat()} 하드스톱 실측 '
               f'(span {math.degrees(span):.1f}°, 마진 {args.margin:.1f}°)",')
         print("    },")
         return 0
