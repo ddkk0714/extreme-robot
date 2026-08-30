@@ -90,6 +90,7 @@ code { font-size: 0.92em; color: var(--text-secondary); }
 }
 .chip-muted { color: var(--muted); }
 .chip-good { color: var(--good); border-color: var(--good); }
+.chip-warn { color: var(--warning); border-color: var(--warning); }
 .chip-critical { color: var(--critical); border-color: var(--critical); }
 
 .btn {
@@ -98,6 +99,40 @@ code { font-size: 0.92em; color: var(--text-secondary); }
   border: 1px solid var(--border); cursor: pointer; text-decoration: none;
 }
 .btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); }
+.btn-primary { border-color: var(--series-1); color: var(--series-1); }
+
+/* ── 폼 (제어 모드) ────────────────────────────────────── */
+.field { display: block; margin: 8px 0; }
+.field-label {
+  display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 3px;
+}
+.field .btn { width: 100%; box-sizing: border-box; text-align: left; }
+.field-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.field-row .field { flex: 1 1 160px; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 6px; }
+
+/* ── 자세 저장/불러오기 ───────────────────────────────── */
+.pose-head { margin-top: 14px; }
+.pose-input {
+  font: inherit; font-size: 12px; padding: 4px 8px; border-radius: 6px;
+  background: var(--plane); color: var(--text-primary);
+  border: 1px solid var(--border); min-width: 0; flex: 1 1 120px;
+}
+.pose-input:focus { outline: none; border-color: var(--series-1); }
+.pose-freedrive {
+  border: 1px solid var(--warning, var(--series-1)); border-radius: 6px;
+  padding: 8px 10px; margin: 8px 0;
+}
+.pose-btn { display: inline-flex; align-items: center; gap: 0; padding: 0; }
+/* 이동/삭제가 한 칩처럼 붙어 보이게 — 자세 하나당 버튼이 둘이라 따로 떨어지면
+   어느 삭제가 어느 자세인지 눈으로 못 잇는다. */
+.pose-btn .btn { border-radius: 0; border-right-width: 0; }
+.pose-btn .btn:first-child { border-radius: 6px 0 0 6px; }
+.pose-btn .btn:last-child { border-radius: 0 6px 6px 0; border-right-width: 1px; }
+.pose-del { color: var(--text-secondary); padding-left: 7px; padding-right: 7px; }
+.pose-del:hover { color: var(--critical); border-color: var(--critical); }
 
 /* ── 배너 ─────────────────────────────────────────────── */
 .banner {
@@ -246,7 +281,58 @@ code { font-size: 0.92em; color: var(--text-secondary); }
 .events time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 .events .kind { color: var(--muted); font-size: 11px; min-width: 96px; }
 
+/* ── 조종(제어 모드) ──────────────────────────────────── */
+.btn-danger { border-color: var(--critical); color: var(--critical); }
+.num-in { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.teleop-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 8px; }
+
+/* 축별 속도 막대 — 지금 브라우저가 무엇을 밀고 있는지가 한눈에 보여야 한다.
+ * 부호를 색만으로 구분하지 않는다(값이 숫자로 같이 나간다). */
+.jog-bars { margin-top: 10px; }
+.jog-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
+.jog-row-sel .jog-name { color: var(--series-1); font-weight: 600; }
+.jog-name { flex: 0 0 168px; color: var(--text-secondary); }
+.jog-track { flex: 1 1 auto; height: 8px; background: var(--grid); border-radius: 4px; }
+.jog-fill { display: block; height: 100%; border-radius: 4px; }
+.jog-bar-plus { background: var(--series-1); }
+.jog-bar-minus { background: var(--track); }
+.jog-val { flex: 0 0 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.keymap { margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+.keymap summary { cursor: pointer; color: var(--muted); }
+.keymap ul { margin: 6px 0; padding-left: 18px; }
+kbd {
+  font-family: ui-monospace, monospace; font-size: 11px; padding: 1px 5px;
+  border: 1px solid var(--axis); border-radius: 4px; background: var(--plane);
+}
+
+.pad-live { margin: 6px 0; line-height: 2; }
+.pad-cell {
+  display: inline-block; margin: 0 4px 2px 0; padding: 1px 6px; border-radius: 4px;
+  border: 1px solid var(--border); font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.pad-cell-on { border-color: var(--good); color: var(--good); }
+
+/* ── 캘리브 마법사 ────────────────────────────────────── */
+.calib-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px; margin-top: 10px;
+}
+.calib-card {
+  padding: 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--plane);
+}
+.calib-result { margin-top: 12px; }
+.calib-block {
+  margin: 4px 0; padding: 8px 10px; overflow-x: auto; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--plane);
+  font-family: ui-monospace, monospace; font-size: 12px; white-space: pre;
+}
+
 @media (max-width: 640px) {
   .strip-card-wide { grid-column: span 1; }
   .tbl th, .tbl td { padding: 5px 6px; }
+  .teleop-grid { grid-template-columns: 1fr; }
 }

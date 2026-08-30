@@ -42,7 +42,6 @@ URDF CAD 리밋은 [-0.611, 0.698] 이다 — 영점 미캘리브의 증상이�
    브릿지를 다른 기어비로 띄웠어도 자동으로 맞춰진다.
 """
 import argparse
-import math
 import os
 import sys
 
@@ -52,14 +51,8 @@ from rcl_interfaces.srv import GetParameters
 from sensor_msgs.msg import JointState
 
 try:
-    from dynamixel_control.moveit_dynamixel_bridge import (
-        DXL_EXTENDED_MAX_TICK,
-        DXL_EXTENDED_MIN_TICK,
-        DXL_MAXIMUM_POSITION_VALUE,
-        DXL_MINIMUM_POSITION_VALUE,
-        JOINT_CONFIG,
-        TICKS_PER_RAD,
-    )
+    from dynamixel_control import calib_math
+    from dynamixel_control.moveit_dynamixel_bridge import JOINT_CONFIG
 except ImportError:
     # measure_gear_ratio.py 와 달리 이 스크립트는 JOINT_CONFIG(ID/방향/기어비)가 필요해서
     # 워크스페이스 오버레이가 소싱돼 있어야 한다 — 안 되어 있으면 raw traceback 대신
@@ -69,8 +62,6 @@ except ImportError:
         "dynamixel_control 패키지를 import 할 수 없습니다 — 워크스페이스 오버레이가\n"
         "소싱되지 않은 셸로 보입니다. 다음을 먼저 실행하세요:\n\n"
         "    source /root/ros2_ws/install/setup.bash\n\n"
-        "(measure_gear_ratio.py 는 이 패키지를 import 하지 않아서 오버레이 없이도\n"
-        " 돌아갑니다 — 그래서 그 스크립트만 되는 것처럼 보일 수 있습니다.)\n"
         "빌드를 안 했다면: colcon build --packages-select dynamixel_control\n"
     )
     sys.exit(1)
@@ -101,31 +92,38 @@ class ZeroOffsetMeasurer(Node):
                 return dict(self.latest) if self.latest else None
         return None
 
-    def fetch_bridge_gear_ratios(self, timeout_s=5.0):
-        """실행 중인 브릿지의 `gear_ratios` 파라미터를 조회.
+    def fetch_bridge_overrides(self, timeout_s=5.0):
+        """실행 중인 브릿지의 `gear_ratios`·`centers` 파라미터를 조회.
 
-        브릿지가 CLI 로 기어비를 덮어쓴 채 떠 있으면 JOINT_CONFIG 기본값과 달라지는데,
-        그걸 모르고 역산하면 tick 이 틀린다 — 그래서 추측하지 않고 직접 물어본다.
+        브릿지가 CLI 로 기어비나 영점을 덮어쓴 채 떠 있으면 JOINT_CONFIG 기본값과
+        달라지는데, 그걸 모르고 역산하면 tick 이 틀린다 — 그래서 추측하지 않고 직접
+        물어본다. **발행된 관절각은 브릿지가 지금 쓰는 center 로 환산된 값**이라
+        영점도 기어비와 똑같이 조회해야 한다.
         조회 실패 시 None(호출부가 기본값으로 폴백하고 경고한다).
         """
         client = self.create_client(GetParameters, f"/{BRIDGE_NODE}/get_parameters")
         if not client.wait_for_service(timeout_sec=timeout_s):
             return None
-        future = client.call_async(GetParameters.Request(names=["gear_ratios"]))
+        future = client.call_async(
+            GetParameters.Request(names=["gear_ratios", "centers"]))
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
         response = future.result()
-        if response is None or not response.values:
+        if response is None or len(response.values) < 2:
             return None
 
-        overrides = {}
-        for entry in response.values[0].string_array_value:
-            name, _, value = str(entry).partition(":")
-            if name in JOINT_CONFIG:
-                try:
-                    overrides[name] = float(value)
-                except ValueError:
-                    pass
-        return overrides
+        def parse(values, cast):
+            out = {}
+            for entry in values.string_array_value:
+                name, _, value = str(entry).partition(":")
+                if name in JOINT_CONFIG:
+                    try:
+                        out[name] = cast(value)
+                    except ValueError:
+                        pass
+            return out
+
+        return (parse(response.values[0], float),
+                parse(response.values[1], lambda v: int(round(float(v)))))
 
 
 def parse_reference(entries):
@@ -177,19 +175,26 @@ def main():
         if missing:
             print(f"⚠️ 이번 샘플에 없는 관절: {sorted(missing)} — 그 축은 건너뜁니다.")
 
-        # 브릿지가 실제로 쓰고 있는 기어비를 그대로 가져온다(추측 금지).
-        overrides = node.fetch_bridge_gear_ratios()
-        if overrides is None:
-            print("⚠️ 브릿지의 gear_ratios 파라미터를 조회하지 못했습니다 — "
-                  "JOINT_CONFIG 기본값으로 역산합니다. 브릿지를 CLI 로 다른 기어비로 "
+        # 브릿지가 실제로 쓰고 있는 기어비·영점을 그대로 가져온다(추측 금지).
+        fetched = node.fetch_bridge_overrides()
+        if fetched is None:
+            print("⚠️ 브릿지의 gear_ratios/centers 파라미터를 조회하지 못했습니다 — "
+                  "JOINT_CONFIG 기본값으로 역산합니다. 브릿지를 CLI 로 다른 값으로 "
                   "띄웠다면 결과가 틀립니다.")
-            overrides = {}
+            fetched = ({}, {})
+        ratio_overrides, center_overrides = fetched
 
         def ratio_of(name):
-            return overrides.get(name, JOINT_CONFIG[name]["gear_ratio"])
+            return ratio_overrides.get(name, JOINT_CONFIG[name]["gear_ratio"])
+
+        def center_of(name):
+            return center_overrides.get(name, JOINT_CONFIG[name]["center"])
 
         print("\n현재 기어비: "
               + ", ".join(f"{n}={ratio_of(n):.3f}:1" for n in JOINT_CONFIG))
+        if center_overrides:
+            print("현재 영점(파라미터로 덮어쓴 축): "
+                  + ", ".join(f"{n}={c}" for n, c in center_overrides.items()))
         print("기준 자세:   "
               + ", ".join(f"{n}={reference.get(n, 0.0):+.4f} rad" for n in JOINT_CONFIG))
 
@@ -205,33 +210,37 @@ def main():
             if name not in sample:
                 continue
             ratio = ratio_of(name)
-            ticks_per_joint_rad = TICKS_PER_RAD * ratio
+            center_old = center_of(name)
 
-            # 발행된 관절각 → 지금의 raw tick 으로 역산(브릿지의 rad_to_tick 과 동일식)
-            tick_now = (config["center"]
-                        + config["direction"] * sample[name] * ticks_per_joint_rad)
-            rad_ref = reference.get(name, 0.0)
-            center_new = tick_now - config["direction"] * rad_ref * ticks_per_joint_rad
+            # 식은 calib_math 한 곳에만 있다 — 관제 GUI 의 영점 마법사도 같은 함수를
+            # 부르므로 두 경로가 갈라질 수 없다.
+            center_new = calib_math.center_from_measurement(
+                center_old, config["direction"], ratio,
+                rad_measured=sample[name], rad_ref=reference.get(name, 0.0))
             results[name] = center_new
 
-            shift = center_new - config["center"]
-            print(f"  {name}: center {config['center']} → {round(center_new)} "
-                  f"({shift:+.0f} tick, {math.degrees(shift / ticks_per_joint_rad):+.2f}° 관절)")
+            shift = center_new - center_old
+            print(f"  {name}: center {center_old} → {round(center_new)} "
+                  f"({shift:+.0f} tick, "
+                  f"{calib_math.center_shift_deg(shift, ratio):+.2f}° 관절)")
 
-            lo, hi = ((DXL_EXTENDED_MIN_TICK, DXL_EXTENDED_MAX_TICK) if config["extended"]
-                      else (DXL_MINIMUM_POSITION_VALUE, DXL_MAXIMUM_POSITION_VALUE))
-            if not lo <= center_new <= hi:
-                print(f"      ⚠️ 새 center 가 이 축의 tick 범위({lo}~{hi})를 벗어납니다 — "
-                      "기준 자세나 기어비를 다시 확인하세요.")
+            reason = calib_math.center_out_of_range(center_new, config["extended"])
+            if reason is not None:
+                print(f"      ⚠️ {reason}")
         print("=" * 70)
 
         print("\nmoveit_dynamixel_bridge.py 의 JOINT_CONFIG 에 반영:\n")
         for name, center_new in results.items():
             config = JOINT_CONFIG[name]
-            print(f'    "{name}": {{"id": {config["id"]}, "center": {round(center_new)}, '
-                  f'"direction": {config["direction"]},')
-            print(f'                    "gear_ratio": {ratio_of(name)}, '
-                  f'"extended": {config["extended"]}}},')
+            print(calib_math.format_joint_config_entry(
+                name, config["id"], center_new, config["direction"],
+                ratio_of(name), config["extended"]))
+
+        # 재빌드 없이 그 자리에서 시험해 볼 수 있는 경로도 같이 알려준다.
+        # 항목 구분자는 **쉼표**다 — 공백으로 붙이면 ROS 가 배열로 파싱하지 못한다.
+        centers = ",".join(f"'{n}:{round(c)}'" for n, c in results.items())
+        print("\n재빌드 없이 브릿지에 바로 넣어 시험:\n")
+        print(f'    -p centers:="[{centers}]"')
 
         print("\n⚠️ 반영 후 반드시 read_only 로 다시 띄워 /joint_states 가 기준 자세에서")
         print("   기준각을 가리키는지 확인할 것. 구동은 그 확인 뒤에.")

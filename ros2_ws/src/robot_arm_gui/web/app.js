@@ -43,6 +43,20 @@ let contract = {};
 let staleAfter = {};
 let lastFull = null;
 
+/* ── 렌더 훅 ───────────────────────────────────────────── */
+/* 제어 계층(control.js)은 별도 파일이라 여기서 직접 부르지 않는다. 읽기 전용
+ * 모드에서는 control.js 가 스스로 아무것도 그리지 않으므로, 훅이 비어 있어도
+ * 이 파일의 동작은 예전과 완전히 같다. */
+const hotHooks = [];
+const fullHooks = [];
+window.onHot = (fn) => hotHooks.push(fn);
+window.onFull = (fn) => fullHooks.push(fn);
+function runHooks(hooks, snap) {
+  for (const fn of hooks) {
+    try { fn(snap); } catch (err) { console.error('render hook 실패', err); }
+  }
+}
+
 /* ── 미터 ──────────────────────────────────────────────── */
 /* 단일 값 대 한계 → 가로 미터. 트랙은 같은 램프의 어두운/밝은 단계이고,
  * 채움이 심각도를 운반하며, 임계값은 트랙 위 hairline tick 이다. */
@@ -271,6 +285,14 @@ video.addEventListener('error', () => {
 
 function drawOverlay(snap) {
   if (overlay.hidden || !video.naturalWidth) return;
+  // ⚠️ 이 캔버스가 그리는 박스는 **전방 캠**(/detected_objects) 것이다. 손목 캠 영상 위에
+  // 겹쳐 그리면 다른 카메라의 좌표를 남의 그림에 얹는 셈이라 조용히 거짓말이 된다
+  // (GUI 는 /wrist/detected_objects 를 구독하지 않는다). 손목 소스면 그리지 않는다 —
+  // wrist_debug 는 노드가 이미 마스크·ROI 를 그려서 보내므로 아쉬울 것도 없다.
+  if ($('video-source').value.startsWith('wrist')) {
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    return;
+  }
   const w = video.clientWidth, h = video.clientHeight;
   if (overlay.width !== w || overlay.height !== h) { overlay.width = w; overlay.height = h; }
   const ctx = overlay.getContext('2d');
@@ -426,6 +448,7 @@ function applyHot(snap) {
   renderStrip({ ...(lastFull || {}), ...snap });
   renderMotors(snap);
   renderHwBanner(snap);
+  runHooks(hotHooks, snap);
 }
 
 function applyFull(snap) {
@@ -445,6 +468,7 @@ function applyFull(snap) {
   renderTeleop(snap);
   renderEvents(snap);
   renderSystem(snap);
+  runHooks(fullHooks, snap);
 }
 
 /* ── SSE ───────────────────────────────────────────────── */

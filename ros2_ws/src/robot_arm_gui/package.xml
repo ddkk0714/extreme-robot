@@ -3,7 +3,7 @@
 <package format="3">
   <name>robot_arm_gui</name>
   <version>0.1.0</version>
-  <description>브라우저 관제 GUI — 서보 진단·FSM/계약 상태·YOLO 인식·텔레옵 현황 (읽기 전용)</description>
+  <description>브라우저 관제 GUI — 서보 진단·FSM/계약 상태·YOLO 인식·텔레옵 현황. 기본은 읽기 전용이고, control:=true 일 때만 모델 교체·텔레옵·캘리브 제어가 열린다</description>
   <maintainer email="koreanmcpe@gmail.com">ksp118</maintainer>
   <license>Apache-2.0</license>
 
@@ -24,6 +24,13 @@
     어긋나므로, 원본 모듈을 그대로 import 한다.
   -->
   <exec_depend>dynamixel_control</exec_depend>
+
+  <!--
+    모델 프리셋(model_presets.MODEL_PRESETS)의 단일 출처. 프리셋 목록을 GUI 에
+    복사해 두면 실제로 로드되는 것과 어긋나므로 원본을 그대로 import 한다
+    (contract.py 를 그렇게 쓰는 것과 같은 이유).
+  -->
+  <exec_depend>robot_arm_perception</exec_depend>
 
   <!--
     ament_pep257 은 일부러 빼 뒀다. 기본 규칙이 D213(요약을 두 번째 줄에서 시작)을

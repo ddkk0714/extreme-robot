@@ -95,6 +95,13 @@ class FakePublisher(Node):
         self.pub_jog = self.create_publisher(JointJog, '/arm/teleop_jog', 10)
         self.pub_cmd = self.create_publisher(String, '/arm/teleop_cmd', 10)
         self.pub_poses = self.create_publisher(String, '/arm/teleop_poses', LATCHED)
+        # 캘리브 패널을 하드웨어 없이 검증하려면 이 셋이 필요하다 — 실기에서는
+        # teleop_core(/arm/calib_status)와 position_node(임계 설정)가 낸다.
+        self.pub_calib = self.create_publisher(String, '/arm/calib_status', LATCHED)
+        self.pub_trip_cfg = self.create_publisher(
+            Int32MultiArray, '/dynamixel/current_trip_config', 10)
+        self.pub_spike_cfg = self.create_publisher(
+            Int32MultiArray, '/dynamixel/current_spike_config', 10)
         self.pub_joy = self.create_publisher(Joy, '/joy', 10)
         self.pub_debug_img = self.create_publisher(Image, '/perception/debug_image', 1)
         self.pub_raw_img = self.create_publisher(Image, '/perception/raw_image', 1)
@@ -200,6 +207,25 @@ class FakePublisher(Node):
         chassis.mode = 'MISSION_STOP' if int(elapsed) % 20 < 12 else 'DRIVING'
         self.pub_chassis.publish(chassis)
 
+    #: 리밋 측정 진행 시나리오. `teleop_core._publish_calib_status` 의 형식 그대로다.
+    #: (하드웨어 없이 캘리브 패널의 진행률·완료·거절 표시를 확인하려고 한 바퀴 돈다.)
+    CALIB_CYCLE = (
+        'idle',
+        'active,arm_joint_1,lower,1,4', 'active,arm_joint_1,upper,1,4',
+        'active,arm_joint_2,lower,2,4', 'active,arm_joint_2,upper,2,4',
+        'active,arm_joint_3,lower,3,4', 'active,arm_joint_3,upper,3,4',
+        'active,arm_joint_4,lower,4,4', 'active,arm_joint_4,upper,4,4',
+        'done,3,1',            # 거절 1축 — 화면이 "재측정 필요"를 띄워야 한다
+        'cancelled',
+    )
+
+    def _publish_calib_cycle(self, elapsed):
+        """8초마다 다음 단계로 — latched 라 GUI 를 나중에 띄워도 마지막 값을 받는다."""
+        index = int(elapsed // 8) % len(self.CALIB_CYCLE)
+        if index != getattr(self, '_calib_index', None):
+            self._calib_index = index
+            self.pub_calib.publish(String(data=self.CALIB_CYCLE[index]))
+
     # ------------------------------------------------------------ 5Hz
     def _on_5hz(self):
         elapsed = time.monotonic() - self.t0
@@ -237,6 +263,14 @@ class FakePublisher(Node):
         jog.joint_names = [name for _, name in MOTORS[:5]]
         jog.velocities = [0.3 * math.sin(elapsed + i) for i in range(5)]
         self.pub_jog.publish(jog)
+
+        self._publish_calib_cycle(elapsed)
+
+        # 임계 설정 — 실기에서는 position_node 가 변경 시에만 낸다. 화면의 '트립까지
+        # 남은 여유' 가 이 값 없이는 계산되지 않아 되풀이해 발행한다.
+        # (값은 dynamixel_position_node 의 기본 트립/급변 임계와 같은 자리수다.)
+        self.pub_trip_cfg.publish(Int32MultiArray(data=[1, 500]))
+        self.pub_spike_cfg.publish(Int32MultiArray(data=[1, 350]))
 
         joy = Joy()
         joy.header.stamp = det.header.stamp

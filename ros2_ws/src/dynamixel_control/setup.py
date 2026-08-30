@@ -40,6 +40,7 @@ setup(
             'yolo_bridge = dynamixel_control.yolo_to_dynamixel_bridge:main',
             'yolo_detection = dynamixel_control.yolo_detection_node:main',
             'arm_fsm = dynamixel_control.arm_fsm_node:main',
+            'mission_console = dynamixel_control.mission_console_node:main',
             'teleop_core = dynamixel_control.teleop_core_node:main',
             'keyboard_teleop = dynamixel_control.keyboard_teleop_node:main',
             'joystick_teleop = dynamixel_control.joystick_teleop_node:main',

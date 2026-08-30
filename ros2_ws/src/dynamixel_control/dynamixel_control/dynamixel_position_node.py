@@ -13,6 +13,8 @@ from dynamixel_sdk import (
     PortHandler, PacketHandler, GroupSyncRead, GroupSyncWrite,
 )
 
+from dynamixel_control import bus_lock
+
 
 #: teleop_core_node.POSES_LIST_QOS 와 동일 — tick_limits 는 transient_local 로 오므로
 #: (teleop_core 재기동 없이 이 노드만 늦게/다시 뜨는 경우에도) 놓치지 않고 받는다.
@@ -147,6 +149,9 @@ CURRENT_SPIKE_BIT = 7
 # current_trip_threshold(절대값 트립, 기본 400)보다는 낮게 유지해 최소한의
 # 구분은 남긴다. 실서보 정상 조그/기동 전류 로그를 모아 다시 좁혀야 한다.
 DEFAULT_CURRENT_SPIKE_DELTA = 350
+
+# 전류 가드(절대 트립 + 급변 감지)에서 제외할 서보 ID — 선언부 주석 참고.
+DEFAULT_CURRENT_GUARD_EXEMPT_IDS = [11]
 # read_rate_hz=30 기준 약 3초 — 짧으면(과거 10샘플/0.33초) 사람 손처럼
 # 300ms~1초 넘게 걸리는 힘을 놓친다(위 히스토리 1~2차). 길면 최솟값 기준선이
 # 더 오래된 값을 참조하게 되지만, 실측상 정상 조그의 델타 상한(160, 테스트
@@ -290,7 +295,29 @@ class DynamixelPositionNode(Node):
         # 은 이 스위치와 무관하게 항상 켜져 있다 — 이건 "급변(변화량)" 감지만
         # 끈다. 런타임에는 /dynamixel/current_spike_config 로 토글(아래
         # current_spike_config_callback 참고).
-        self.declare_parameter("current_spike_enabled", True)
+        # 🔁 **2026-08-19 기본값 True → False.** 실서보에서 오탐이 계속 났다 —
+        # baseline 이 min(window) 라 정지 중이면 0 이 되고, 거기서 조그를 시작하면
+        # **정상 기동 전류**가 그대로 Δ가 되어 문턱을 넘는다(ID 11 에서 Δ396 ≥ 350
+        # 으로 전 관절 비상정지). 문턱을 실측으로 다시 잡기 전까지는 꺼두는 쪽이
+        # 맞다 — 절대 트립(current_trip_threshold)이 백스톱으로 남는다.
+        self.declare_parameter("current_spike_enabled", False)
+
+        # 두 전류 가드(절대 트립 + 급변 감지)에서 **통째로 빼는 서보 ID 목록**.
+        #
+        # ⚠️ 문턱값이 모터 계열을 가리지 않는다는 게 근본 문제다. 주소 126 의 의미가
+        #    계열마다 다르다 — XL430(그리퍼 3·4, 손목 16)은 `Present Load`(0.1% 단위),
+        #    XM540(팔 11·12·13·14)은 `Present Current`(2.69mA 단위)다. 지금 문턱
+        #    (500/350)은 XL430 기준으로 잡힌 값이라 XM540 축에 그대로 적용하면
+        #    1A 남짓한 정상 구동 전류에도 걸린다(XM540-W270 정격 2A대, current_limit
+        #    레지스터 2047 ≈ 5.5A).
+        #
+        # 기본값 [11] = arm_joint_1(베이스 요축). 2026-08-19 재조립으로 새로 편입된
+        # XM540 축이고 실기에서 실제로 오탐 트립이 났다(사용자 요청으로 제외).
+        # ⚠️ **ID 12/13/14 도 같은 XM540 이라 같은 오탐 소지가 있다** — 아직 안 걸린
+        #    건 그 축들을 덜 움직여서일 가능성이 크다. 제대로 고치려면 계열별로
+        #    문턱을 나눠야 하고(XM540=mA 도메인, XL430=% 도메인), 그러려면 각 축의
+        #    정상 조그 전류 상한 실측이 필요하다. 그 전까지의 임시 조치다.
+        self.declare_parameter("current_guard_exempt_ids", DEFAULT_CURRENT_GUARD_EXEMPT_IDS)
 
         port = self.get_parameter("port").value
         baudrate = int(self.get_parameter("baudrate").value)
@@ -310,12 +337,20 @@ class DynamixelPositionNode(Node):
         self.current_spike_delta_threshold = int(
             self.get_parameter("current_spike_delta_threshold").value)
         self.current_spike_enabled = bool(self.get_parameter("current_spike_enabled").value)
+        self.current_guard_exempt_ids = set(
+            int(v) for v in self.get_parameter("current_guard_exempt_ids").value)
 
         if len(self.motor_ids) != len(self.joint_names):
             raise RuntimeError(
                 f"motor_ids({len(self.motor_ids)})와 "
                 f"joint_names({len(self.joint_names)}) 길이가 다릅니다"
             )
+
+        # ⚠️ 포트를 열기 **전에** 배타 잠금을 잡는다 — 이 노드와
+        # moveit_dynamixel_bridge 가 같은 버스를 동시에 쓰면 "축 하나만 조용히
+        # 빠지는" 형태로 망가진다(bus_lock 모듈 docstring 에 실기 사고 기록).
+        # fd 는 인스턴스가 들고 있어야 한다 — GC 되면 잠금도 풀린다.
+        self._bus_lock_fd = bus_lock.acquire(port, self.get_logger())
 
         latency = int(self.get_parameter("ftdi_latency_timer").value)
         if latency > 0:
@@ -502,9 +537,25 @@ class DynamixelPositionNode(Node):
             f"current_trip_threshold={self.current_trip_threshold}, "
             f"current_trip_enabled={self.current_trip_enabled}, "
             f"current_spike_delta_threshold={self.current_spike_delta_threshold}, "
-            f"current_spike_enabled={self.current_spike_enabled})")
+            f"current_spike_enabled={self.current_spike_enabled}, "
+            f"current_guard_exempt_ids={sorted(self.current_guard_exempt_ids)})")
 
     # ------------------------------------------------------------------ 기동
+    def _comm_detail(self, result, error):
+        """SDK 의 두 실패 축을 **구분해서** 문자열로 만든다.
+
+        `result`(통신 계층: 응답 없음·패킷 깨짐)와 `error`(서보가 보낸 패킷 에러:
+        Access Error 등)는 원인이 전혀 다르다 — 전자는 배선/버스 경합, 후자는
+        "토크가 켜진 채 EEPROM 을 쓰려 했다" 같은 절차 문제다. 뭉뚱그리면 어느 쪽을
+        고쳐야 하는지 알 수 없다.
+        """
+        parts = []
+        if result != 0:
+            parts.append(f"comm={self.packet_handler.getTxRxResult(result)}")
+        if error != 0:
+            parts.append(f"servo={self.packet_handler.getRxPacketError(error)}")
+        return ", ".join(parts) or "원인 불명"
+
     def _init_motor(self, dxl_id):
         """서보 하나를 위치제어 + 프로파일 가감속 상태로 만들고 토크를 켠다.
 
@@ -520,16 +571,35 @@ class DynamixelPositionNode(Node):
             return False
 
         # 모드 변경/EEPROM 쓰기를 위해 일단 토크를 내린다.
-        self.packet_handler.write1ByteTxRx(
+        # ⚠️ 결과를 반드시 확인한다 — 이 쓰기가 조용히 실패하면 토크가 켜진 채로
+        # 남아서 다음 EEPROM 쓰기가 Access Error 로 거절되는데, 로그만 봐서는
+        # "모드 변경 실패"로 보여 원인이 한 단계 가려진다.
+        result, error = self.packet_handler.write1ByteTxRx(
             self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        if result != 0 or error != 0:
+            self.get_logger().error(
+                f"ID {dxl_id} 토크 OFF 실패 — 건너뜁니다 "
+                f"({self._comm_detail(result, error)})")
+            return False
 
         if self.force_position_mode:
             target_mode = (
                 OP_MODE_EXTENDED_POSITION if dxl_id in self.extended_position_ids
                 else OP_MODE_POSITION
             )
-            mode, _, _ = self.packet_handler.read1ByteTxRx(
+            # ⚠️ 읽기의 result/error 를 반드시 본다. dynamixel_sdk 는 통신이 깨져도
+            # 데이터 자리에 **0 을 돌려준다** — 그걸 실제 모드로 믿고 로그에 찍으면
+            # "서보가 Current Control Mode(0) 에 있다"는 존재하지 않는 원인을
+            # 가리키게 된다(2026-08-12 실기에서 실제로 오진을 유발했다).
+            mode, result, error = self.packet_handler.read1ByteTxRx(
                 self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+            if result != 0 or error != 0:
+                self.get_logger().error(
+                    f"ID {dxl_id} operating mode 읽기 실패 — 건너뜁니다 "
+                    f"({self._comm_detail(result, error)}). "
+                    f"읽힌 값 {mode} 는 실제 모드가 아니라 통신 실패의 기본값입니다 "
+                    "— 버스를 두 프로세스가 나눠 쓰고 있지 않은지 먼저 확인하세요")
+                return False
             if mode != target_mode:
                 result, error = self.packet_handler.write1ByteTxRx(
                     self.port_handler, dxl_id,
@@ -537,7 +607,8 @@ class DynamixelPositionNode(Node):
                 if result != 0 or error != 0:
                     self.get_logger().error(
                         f"ID {dxl_id} operating mode 변경 실패 "
-                        f"({mode} → {target_mode}) — 건너뜁니다")
+                        f"({mode} → {target_mode}) — 건너뜁니다 "
+                        f"({self._comm_detail(result, error)})")
                     return False
                 mode_label = "다회전" if target_mode == OP_MODE_EXTENDED_POSITION else "위치제어"
                 self.get_logger().info(
@@ -955,6 +1026,7 @@ class DynamixelPositionNode(Node):
             # 끊기 위한 소프트 안전장치. read_state 는 매 주기(기본 30Hz) 이 검사를
             # 하므로 다음 SyncWrite 를 기다리지 않고 바로 여기서 torque 를 끈다.
             if (self.current_trip_enabled
+                    and dxl_id not in self.current_guard_exempt_ids
                     and self.current_trip_threshold > 0
                     and abs(current) >= self.current_trip_threshold
                     and not (self.error_latched.get(dxl_id, 0) & (1 << CURRENT_TRIP_BIT))):
@@ -988,7 +1060,8 @@ class DynamixelPositionNode(Node):
             # current_spike_enabled=False 면 창을 아예 안 쌓는다 — 다시 켰을 때
             # 옛(다른 상태에서 쌓인) 값이 기준선으로 섞이지 않게, torque on/off
             # 전환과 같은 방식으로 첫 샘플은 비교 없이 기록만 하고 시작한다.
-            if not self.current_spike_enabled:
+            if (not self.current_spike_enabled
+                    or dxl_id in self.current_guard_exempt_ids):
                 self.current_history.pop(dxl_id, None)
             else:
                 window = self.current_history.setdefault(
@@ -1081,7 +1154,16 @@ class DynamixelPositionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
 
-    node = DynamixelPositionNode()
+    # 버스 경합은 traceback 이 아니라 **읽히는 한 줄**로 죽어야 한다 — 이 실패는
+    # 사용자가 곧바로 조치할 수 있는 종류이고(다른 노드를 내린다), 파이썬 스택은
+    # 그 조치를 오히려 가린다.
+    try:
+        node = DynamixelPositionNode()
+    except bus_lock.BusInUseError as exc:
+        print(f"[dynamixel_position_node] 기동 거부: {exc}")
+        if rclpy.ok():
+            rclpy.shutdown()
+        raise SystemExit(1)
 
     try:
         rclpy.spin(node)

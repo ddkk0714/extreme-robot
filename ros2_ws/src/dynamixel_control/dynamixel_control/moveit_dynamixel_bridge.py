@@ -16,7 +16,11 @@ from control_msgs.action import FollowJointTrajectory
 from robot_arm_msgs.action import ArmRecordedPath, ArmTestMove, EndEffectorRotate
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
 
+from rcl_interfaces.msg import SetParametersResult
+
+from dynamixel_control import bus_lock
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+from dynamixel_control import calib_math
 from dynamixel_control import joint_limits
 
 
@@ -64,12 +68,15 @@ PROTOCOL_VERSION = 2.0
 BAUDRATE = 1000000
 DEVICENAME = "/dev/ttyUSB0"
 
-DXL_MINIMUM_POSITION_VALUE = 0
-DXL_MAXIMUM_POSITION_VALUE = 4095
-DXL_CENTER_POSITION = 2048
+# tick 상수와 캘리브 측정식의 단일 출처는 calib_math 다(ROS 비의존 → pytest 로 고정).
+# 여기서 재노출하는 이유는 `scripts/measure_*.py` 와 외부 코드가 예전부터 이 모듈에서
+# 가져다 쓰고 있어서다 — import 경로를 깨지 않으면서 정의는 한 곳으로 모은다.
+DXL_MINIMUM_POSITION_VALUE = calib_math.DXL_MINIMUM_POSITION_VALUE
+DXL_MAXIMUM_POSITION_VALUE = calib_math.DXL_MAXIMUM_POSITION_VALUE
+DXL_CENTER_POSITION = calib_math.DXL_CENTER_POSITION
 
-TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
-DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Present Velocity 환산용
+TICKS_PER_RAD = calib_math.TICKS_PER_RAD
+DXL_TICKS_PER_REV = calib_math.DXL_TICKS_PER_REV  # Present Velocity 환산용
 
 
 # 팔 관절 ↔ 다이나믹셀 ID 매핑.
@@ -94,6 +101,8 @@ DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Pr
 # ⚠️ 실측 정밀도는 관절각을 얼마나 정확히 쟀는지에 달려 있다(90° 를 ±9° 오차로 재면
 #    기어비도 약 ±10% 흔들린다). 파지 위치가 계통적으로 어긋나면 이 값부터 의심할 것.
 #    재측정 없이 시험할 땐 `gear_ratios` 파라미터로 덮어쓸 수 있다.
+#    `center`(영점)도 같은 방식으로 `centers` 파라미터가 덮어쓴다
+#    (`scripts/measure_zero_offset.py` 또는 관제 GUI 의 영점 마법사 결과를 바로 시험).
 #
 # 🔒 **모를 때는 낮은 값을 쓴다.** 기어비를 실제보다 낮게 잡으면 관절이 명령보다 덜
 #    움직여(언더슈트) 안전하지만, 높게 잡으면 그 배수만큼 과주행해 구조물을 때린다.
@@ -120,7 +129,11 @@ DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Pr
 #    (9:1, 4:1)은 역구동이 안 돼 손으로 세운 자세가 유지되지만 이 둘은 손을 떼면 처진다.
 #    영점 측정은 반드시 **팔을 붙잡은 상태에서** 할 것.
 #
-# 🔁 **2026-08-09 2차 재측정** (아래 값). 1차 측정 후 실기 구동 중 손목(arm_joint_5)
+# 🔁 **2026-08-19 3차 재측정 (현재 값).** 팔 전체 재조립 → 전 축 영점 무효.
+#    같은 회차에 arm_joint_1(ID 11, XM540-W270)이 새로 실장된 것도 확인됐다.
+#    ⚠️ extended 축(arm_joint_2/3)의 아래 center 는 **이 전원 세션 안에서만** 유효하다.
+#
+# 🔁 **2026-08-09 2차 재측정** (이력). 1차 측정 후 실기 구동 중 손목(arm_joint_5)
 #    결합이 물리적으로 빠져 재조립했고, 서보 전원도 내려갔다 — 둘 다 영점 무효 사유다.
 #    재조립 후 측정에서는 붙잡은 상태의 드리프트가 8초간 arm_joint_2/5 **정확히 0.000°**
 #    로 나왔다.
@@ -129,15 +142,22 @@ DXL_TICKS_PER_REV = 4096.0  # 물리 인코더 상수(=TICKS_PER_RAD*2π) — Pr
 #       것으로 확인). 어떤 축이 "잡아도 계속 흐르면" 측정을 계속하지 말고 결합부터
 #       점검할 것 — 그대로 두면 구동 중 빠진다.
 JOINT_CONFIG = {
+    # 🆕 **2026-08-19 신설.** 이 축은 그동안 "모터가 물리적으로 없다"는 전제로
+    # STATIC_JOINTS 에 0.0 고정 발행돼 있었는데, 재조립 후 버스 스캔에서 ID 11
+    # (XM540-W270)이 정상 응답했다. 사용자 확인 결과 기구에도 물려 있다.
+    # gear_ratio 1.0 = **감속기 없는 직결**이다(2026-08-19 사용자 확인) — 측정으로
+    # 나온 값이 아니라 기구가 그렇다. center 는 같은 날 zero_offset 실측값.
+    "arm_joint_1": {"id": 11, "center": 2081, "direction": 1,
+                    "gear_ratio": 1.0, "extended": False},
     # 2026-08-07 실측: 9.034:1 (관절 90° 회전 기준)
-    "arm_joint_2": {"id": 14, "center": 641, "direction": -1,
+    "arm_joint_2": {"id": 14, "center": 506, "direction": -1,
                     "gear_ratio": 9.034, "extended": True},
     # 2026-08-07 실측: 4.040:1 — arm_joint_2 와 다른 감속기다(오타 아님)
-    "arm_joint_3": {"id": 13, "center": 207, "direction": 1,
+    "arm_joint_3": {"id": 13, "center": 1855, "direction": 1,
                     "gear_ratio": 4.040, "extended": True},
-    "arm_joint_4": {"id": 12, "center": 2510, "direction": 1,
+    "arm_joint_4": {"id": 12, "center": 1184, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
-    "arm_joint_5": {"id": 16, "center": 985, "direction": 1,
+    "arm_joint_5": {"id": 16, "center": 675, "direction": 1,
                     "gear_ratio": 1.0, "extended": False},
 }
 ARM_IDS = {config["id"] for config in JOINT_CONFIG.values()}
@@ -157,26 +177,101 @@ RECORDED_PATH_MAX_WAYPOINT_STEP = 50
 # 안 만들어져서 arm_fsm 의 IK/carry pose 계산이 전부 실패한다. MoveIt 도 5축 전체
 # 관절값을 기대하므로 같은 이유로 필요하다.
 #
-# 값의 근거 (2026-08-07):
+# 값의 근거:
 #   arm_joint_2/3/4 는 축이 서로 평행해서 이 팔은 **평면 로봇**이고, 그 평면의 방위를
 #   정하는 유일한 관절이 arm_joint_1 이다(축 0 0 1, 회전중심은 base_link 원점 위
 #   z=0.0465). 즉 이 값이 틀리면 팔이 향하는 방향 전체가 틀린다.
 #
-#   처음엔 0.0 으로 뒀는데, 그 상태의 FK 는 그리퍼를 방위각 -80.5°(거의 정오른쪽,
-#   반경 12.8cm)에 놓았다 — 실기 확인 결과 팔은 **정면(+x)** 을 향하고 있어서
-#   가정이 틀렸다. 반경은 그대로 두고 방위각만 0 으로 돌리는 값이 +1.405 rad 다.
-#     회전 검산: (0.021, -0.126) 을 +80.5° 회전 → (0.128, 0.000)
+# 🔁 **2026-08-12 정정: 1.405 → 0.0.**
+#   이 값은 그동안 +1.405 rad 였다. 근거는 "0.0 이면 FK 가 그리퍼를 방위각 -80.5°
+#   (거의 정오른쪽)에 놓는데, 실기의 팔은 정면(+x)을 향하므로 방위각을 0 으로 돌려야
+#   한다" 는 것이었다 — 그 **전제가 틀렸다. 팔은 실제로 오른쪽으로 틀어져 있다**
+#   (2026-08-12 사용자 확인).
+#
+#   확인 방법(같은 방식으로 재확인 가능): 카메라 TF 캘리브를 마친 상태에서 박스를
+#   그리퍼 정면에 놓고 RViz 를 본다. joint_1=0 인 모델의 tip(link_043)은 방위각
+#   -80.7°/반경 15.5cm 에 서고, 카메라가 본 박스는 -90.7°/46.1cm 에 찍혔다 —
+#   **두 방향이 10° 안쪽으로 일치**했고 화면상으로도 박스가 그리퍼 앞이었다.
+#   1.405 를 쓰면 이 관계가 통째로 80° 어긋난다.
+#
+#   ⚠️ 그 오차는 조용하다: 브릿지가 떠 있는 동안에만 TF 가 80° 돌아가므로, RViz 만
+#      띄워 보면(jsp_gui 가 0 을 발행) 멀쩡해 보이고 arm_fsm 을 붙였을 때만 목표가
+#      틀어진다. "인식·캘리브는 맞는데 팔이 엉뚱한 데로 간다" 면 여기를 볼 것.
 #
 # ⚠️ 이 축은 모터가 없다. **기구적으로 고정돼 있다는 전제**이며, 만약 자유회전
 #    상태라면 팔의 평면이 운용 중 돌아가고 이 값은 무의미해진다 — 그 경우 IK 목표가
 #    조용히 틀어지므로, 물리적으로 고정돼 있는지 반드시 확인할 것.
-STATIC_JOINTS = {
-    "arm_joint_1": 1.405,
-}
+#    팔을 재장착했다면 위 확인 절차를 다시 밟을 것.
+# 🔁 **2026-08-19 비움.** arm_joint_1 은 ID 11 서보가 실재하는 것이 확인돼
+#    JOINT_CONFIG 로 옮겨졌다(위 참고). 이제 실측값이 /joint_states 로 나가므로
+#    고정 발행이 필요 없다 — 고정값을 남겨두면 실제 서보각과 충돌한다.
+#    아래 dict 와 발행 경로는 다음에 모터 없는 축이 생길 때를 위해 남겨둔다.
+STATIC_JOINTS = {}
 
 # X 시리즈 Extended Position Control Mode 의 raw tick 한계(약 ±256회전).
-DXL_EXTENDED_MIN_TICK = -1_048_575
-DXL_EXTENDED_MAX_TICK = 1_048_575
+DXL_EXTENDED_MIN_TICK = calib_math.DXL_EXTENDED_MIN_TICK
+DXL_EXTENDED_MAX_TICK = calib_math.DXL_EXTENDED_MAX_TICK
+
+
+#: 캘리브 파라미터의 "비어 있음" 기본값.
+#:
+#: ⚠️ **`[]` 을 쓰면 안 된다.** rclpy 는 빈 리스트에서 타입을 추론하지 못해
+#: `BYTE_ARRAY` 로 선언해 버리고, 그러면 런타임 `set_parameters` 가
+#: *"Wrong parameter type, expected 'Type.BYTE_ARRAY' got 'Type.STRING_ARRAY'"* 로
+#: **거절된다**(2026-08-12 실기 확인). CLI `-p gear_ratios:=` 는 선언 시점에 값을
+#: 덮어써서 멀쩡히 동작하므로, **런타임에 처음 바꿔 볼 때까지 드러나지 않는다.**
+#: `ParameterDescriptor(type=...)` 로도 추론을 못 바꾼다 — 빈 문자열 하나가 답이다.
+#: 파서가 이름 없는 항목을 건너뛰므로 의미상으로는 "없음" 그대로다.
+EMPTY_STR_ARRAY = [""]
+
+
+# 캘리브 파라미터(`gear_ratios`·`centers`)의 파서. rclpy 에 dict 타입 파라미터가 없어
+# "<joint>:<값>" 문자열 배열로 받는다. 기동 시와 런타임 변경(파라미터 콜백)이 **같은
+# 검증**을 쓰도록 함수로 뺐다 — 한쪽만 느슨하면 기동은 되는데 변경은 거절되는 식이 된다.
+def _parse_gear_ratios(entries):
+    """`["arm_joint_2:9.034", …]` → `({이름: 비}, [오류 사유])`."""
+    out, errors = {}, []
+    for entry in entries or []:
+        name, _, value = str(entry).partition(":")
+        if not name:
+            continue                       # 빈 문자열은 "없음" 으로 본다(기본값 [""])
+        if name not in JOINT_CONFIG:
+            errors.append(f"모르는 관절 '{name}'")
+            continue
+        try:
+            ratio = float(value)
+        except ValueError:
+            errors.append(f"'{entry}' 파싱 실패")
+            continue
+        if ratio <= 0.0:
+            errors.append(f"'{entry}' 은 양수여야 함")
+            continue
+        out[name] = ratio
+    return out, errors
+
+
+def _parse_centers(entries):
+    """`["arm_joint_2:1627", …]` → `({이름: tick}, [오류 사유])`."""
+    out, errors = {}, []
+    for entry in entries or []:
+        name, _, value = str(entry).partition(":")
+        if not name:
+            continue
+        if name not in JOINT_CONFIG:
+            errors.append(f"모르는 관절 '{name}'")
+            continue
+        try:
+            center = int(round(float(value)))
+        except ValueError:
+            errors.append(f"'{entry}' 파싱 실패")
+            continue
+        reason = calib_math.center_out_of_range(center, JOINT_CONFIG[name]["extended"])
+        if reason is not None:
+            errors.append(f"{name}: {reason}")
+            continue
+        out[name] = center
+    return out, errors
+
 
 # Profile Acceleration(108) / Velocity(112). 기본값 0 은 "최고속 즉시 이동" 이라
 # 그리퍼가 움직일 때마다 순간 과전류로 토크가 풀린다(HW-8 실기, 재현율 100%,
@@ -361,6 +456,12 @@ class MoveItDynamixelBridge(Node):
                 "Arm writes blocked: physical joint limits are not fully calibrated. "
                 "Use read_only:=true or the explicitly bounded integrated_test_mode.")
 
+        # ⚠️ 포트를 열기 **전에** 배타 잠금. 이 브릿지와 position_node 는 같은
+        # /dev/ttyUSB0 을 잡으므로 "동시에 띄우지 말 것"이 계약인데, 지금까지는
+        # 규율로만 지켜졌고 어기면 축 하나만 조용히 빠지는 형태로 망가졌다
+        # (bus_lock 모듈 docstring 참고). fd 는 살려둬야 잠금이 유지된다.
+        self._bus_lock_fd = bus_lock.acquire(DEVICENAME, self.get_logger())
+
         self.port_handler = PortHandler(DEVICENAME)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
 
@@ -396,11 +497,23 @@ class MoveItDynamixelBridge(Node):
             # tick→rad 환산을 /joint_states 로 눈으로 검증하는 게 이 모드의 목적이라,
             # 그리퍼만 읽으면 정작 검증할 대상이 안 보인다. gripper-only 는 이름대로
             # 그리퍼만 본다(팔은 다른 노드가 잡고 있을 수 있어 건드리지 않음).
+            #
+            # ⚠️ **응답하는 ID만 등록한다.** SyncRead 는 한 번의 브로드캐스트라, 등록해
+            #    둔 ID 하나가 무응답이면 그 자리에서 응답 수신이 어긋나 **나머지 서보의
+            #    데이터까지 못 쓰게 된다.** 2026-08-12 실기에서 ID 14 하나가 죽은 채로
+            #    이 모드를 띄웠더니 /joint_states 에 팔 관절이 **하나도** 안 실렸고,
+            #    로그에는 아무 경고도 없어서 "브릿지가 안 떴나?" 로 보였다.
+            #    구동 경로(else 절)는 토크 인가 성공 여부로 이미 같은 필터를 갖고 있는데,
+            #    정작 **캘리브에 쓰는 이 모드에만** 그게 없었다.
             if not self.gripper_only_mode:
                 for joint_name, config in JOINT_CONFIG.items():
+                    if not self._ping(config["id"], joint_name):
+                        continue
                     if self.group_sync_read.addParam(config["id"]):
                         self.active_ids.add(config["id"])
             for gid in self.gripper_ids:
+                if not self._ping(gid, f"gripper(id {gid})"):
+                    continue
                 if self.group_sync_read.addParam(gid):
                     self.active_ids.add(gid)
             if self.gripper_only_mode:
@@ -461,6 +574,17 @@ class MoveItDynamixelBridge(Node):
 
         # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
         # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
+        # 토크 on/off 요청 — `position_node` 와 **같은 토픽·같은 포맷**을 쓴다
+        # (`[enable, id...]`). 벤치 텔레옵 쪽에만 있던 인터페이스라 브릿지 경로에서는
+        # 팔을 손으로 만지려면 스택을 통째로 내리는 수밖에 없었다. 어휘를 새로 만들지
+        # 않고 기존 것을 그대로 받아, `teleop_core` 의 stop/freedrive 나 관제 GUI 버튼이
+        # 어느 런타임에서든 같은 뜻을 갖게 한다.
+        # 확장 한 가지: id 목록을 생략하면(`[enable]`) **등록된 전 축**에 적용한다 —
+        # 요청자가 서보 ID 를 몰라도 되게 하기 위함이다(mission_console 이 이걸 쓴다).
+        self.torque_request_sub = self.create_subscription(
+            Int32MultiArray, "/dynamixel/torque_request",
+            self.torque_request_callback, 10)
+
         self.teleop_goal_sub = self.create_subscription(
             Int32MultiArray,
             "/dynamixel/goal_position",
@@ -545,15 +669,27 @@ class MoveItDynamixelBridge(Node):
         )
 
     # ------------------------------------------------------------------ helpers
-    def _write_motion_profile(self, dxl_id, label):
+    def _write_motion_profile(self, dxl_id, label, velocity=None):
         """Profile Acceleration/Velocity 설정 — 토크 인가 **전에** 호출한다.
 
         기본값 0(=최고속 즉시 이동)이면 그리퍼가 움직일 때마다 순간 과전류로 토크가
         풀린다(HW-8 실기 검증, 재현율 100%). 팔 축도 같은 이유로 완만하게 둔다.
+
+        ⚠️ **여기가 팔의 실제 속도를 정하는 유일한 곳이다.** `trajectory_callback` 은
+        `time_from_start` 를 쓰지 않고 goal tick 만 SyncWrite 하므로, 궤적의 duration
+        (arm_fsm 의 `arm_move_speed`)은 FSM 내부 타임아웃 추정에만 쓰이고 서보 속도에는
+        영향이 없다. 속도를 바꾸려면 `arm_profile_velocity` 를 조정할 것.
+
+        ⚠️ 그리퍼는 팔과 **따로** 둔다(`gripper_profile_velocity`). 그리퍼 속도를 낮추면
+        완전 개폐 시간이 늘어나는데, `gripper_presets.gripper_action_time`(2.5s)은 그
+        시간을 넘겨야 파지 effort 를 제대로 읽는다 — 같이 낮추면 "닫히는 도중에 판정"
+        해서 grasp effort 가 0 으로 읽히는 알려진 실패로 돌아간다.
         """
+        if velocity is None:
+            velocity = self.arm_profile_velocity
         for addr, value, field in (
-            (ADDR_PROFILE_ACCELERATION, PROFILE_ACCELERATION, "Profile Acceleration"),
-            (ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY, "Profile Velocity"),
+            (ADDR_PROFILE_ACCELERATION, self.profile_acceleration, "Profile Acceleration"),
+            (ADDR_PROFILE_VELOCITY, velocity, "Profile Velocity"),
         ):
             result, error = self.packet_handler.write4ByteTxRx(
                 self.port_handler, dxl_id, addr, value
@@ -681,18 +817,18 @@ class MoveItDynamixelBridge(Node):
                 f"{joint_name}: 목표각이 안전 범위를 벗어나 clamp 됨 "
                 f"→ {rad:+.4f} rad (범위 [{lower:+.4f}, {upper:+.4f}])"
             )
-        ticks_per_joint_rad = TICKS_PER_RAD * self._joint_gear_ratio(joint_name)
-        tick = config["center"] + config["direction"] * rad * ticks_per_joint_rad
-        tick = int(round(tick))
+        tick = int(round(calib_math.rad_to_tick(
+            self._joint_center(joint_name), config["direction"],
+            self._joint_gear_ratio(joint_name), rad)))
         if config["extended"]:
             return max(DXL_EXTENDED_MIN_TICK, min(DXL_EXTENDED_MAX_TICK, tick))
         return max(DXL_MINIMUM_POSITION_VALUE, min(DXL_MAXIMUM_POSITION_VALUE, tick))
 
     def tick_to_rad(self, joint_name, tick):
         """서보 tick → 관절 rad. rad_to_tick 의 역변환."""
-        config = JOINT_CONFIG[joint_name]
-        ticks_per_joint_rad = TICKS_PER_RAD * self._joint_gear_ratio(joint_name)
-        return (tick - config["center"]) / (config["direction"] * ticks_per_joint_rad)
+        return calib_math.tick_to_rad(
+            self._joint_center(joint_name), JOINT_CONFIG[joint_name]["direction"],
+            self._joint_gear_ratio(joint_name), tick)
 
     def gripper_pos_to_tick(self, rad):
         self._require_gripper_command_mapping()
@@ -978,6 +1114,7 @@ class MoveItDynamixelBridge(Node):
             return
         if not msg.points:
             return
+        self._warn_if_torque_off()
 
         point = msg.points[-1]
 
@@ -2029,7 +2166,15 @@ class MoveItDynamixelBridge(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MoveItDynamixelBridge()
+
+    # position_node 와 같은 이유로 traceback 대신 한 줄로 죽는다(그쪽 main 참고).
+    try:
+        node = MoveItDynamixelBridge()
+    except bus_lock.BusInUseError as exc:
+        print(f"[moveit_dynamixel_bridge] 기동 거부: {exc}")
+        if rclpy.ok():
+            rclpy.shutdown()
+        raise SystemExit(1)
 
     executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)

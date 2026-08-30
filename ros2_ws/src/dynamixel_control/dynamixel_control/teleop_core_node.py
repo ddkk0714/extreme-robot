@@ -149,6 +149,8 @@ from std_msgs.msg import Int32MultiArray, String
 from sensor_msgs.msg import JointState
 from control_msgs.msg import JointJog
 
+from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+
 
 #: 저장된 자세 목록 — 늦게 붙는 구독자(키보드 TUI 재시작 등)도 마지막 값을 바로 받도록
 #: transient_local. 발행 빈도가 낮아(자세 변경 시에만) depth 1로 충분하다.
@@ -218,6 +220,16 @@ DEFAULT_CENTERS = [1627, 4281, 2563, 949]
 # 같은 direction 을 곱해 goal_rad 와 같은 '명령 도메인'으로 맞춰줬다 — 안 그러면
 # stop/자세 저장·이동이 center(2048) 밖에서 순간적으로 튄다.
 DEFAULT_DIRECTIONS = [-1, 1, 1, 1]
+
+# 그리퍼(마지막 축)의 리밋은 gripper_presets 의 **실측 tick** 에서 유도한다 —
+# 숫자를 여기 따로 적어두면 캘리브를 다시 했을 때 조용히 어긋난다.
+# 이 노드의 rad 도메인은 center=2048·direction=+1 기준이라 변환은 단순하다.
+_GRIPPER_PRESET = get_preset(DEFAULT_GRIPPER)
+_GRIPPER_MIN_RAD, _GRIPPER_MAX_RAD = sorted(
+    (tick - 2048) / TICKS_PER_RAD
+    for tick in (_GRIPPER_PRESET["gripper_open_tick"],
+                 _GRIPPER_PRESET["gripper_close_tick"])
+)
 
 # 소프트리밋 기본 OFF — 모터가 아직 본체에 장착되지 않았다(통신 파이프라인 점검용).
 # 장착 후에는 URDF(robot_arm.urdf)의 관절 리밋에 맞춰 반드시 다시 켤 것.
@@ -830,6 +842,8 @@ class TeleopCore(Node):
             self._cmd_save_pose(arg)
         elif action == "goto":
             self._cmd_goto_pose(arg)
+        elif action == "delete":
+            self._cmd_delete_pose(arg)
         elif action == "poses":
             self._publish_poses_list()
             self.get_logger().info(f"저장된 자세: {sorted(self.poses) or '(없음)'}")
@@ -1207,6 +1221,27 @@ class TeleopCore(Node):
         # 같은 값으로 맞춰준다(안 그러면 다음 조그가 낡은 목표 기준으로 튐).
         self._torque_request(self._pose_motor_ids(), enable=True)
         self._sync_goal_to_measured(available)
+
+    def _cmd_delete_pose(self, name):
+        """저장된 자세를 지운다 (2026-08-19 추가).
+
+        지우기 전에는 GUI 에서 잘못 저장된 이름을 없앨 방법이 없었다 — 실제로
+        붙여넣기 사고로 만들어진 이름(제어문자 포함)이 목록에 남아 있었다.
+        **모션을 만들지 않는다**(파일과 목록만 바꾼다).
+        """
+        name = self._norm_pose_name(name)
+        if not name:
+            self.get_logger().warn("지울 자세 이름이 없습니다 (예: 'delete home')")
+            return
+        if name not in self.poses:
+            self.get_logger().warn(
+                f"자세 '{name}' 이(가) 없습니다 — 저장된 자세: "
+                f"{sorted(self.poses) or '(없음)'}")
+            return
+        del self.poses[name]
+        self._save_poses_file()
+        self._publish_poses_list()
+        self.get_logger().info(f"자세 삭제: '{name}'")
 
     def _cmd_goto_pose(self, name):
         name = self._norm_pose_name(name)
