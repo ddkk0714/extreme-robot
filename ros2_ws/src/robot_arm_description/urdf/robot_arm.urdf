@@ -1,9 +1,22 @@
 <?xml version="1.0" ?>
-<!-- 2026-07-31: 2026_07_29_랙피니언_URDF_description.zip(신규 CAD export, base_link~5축 팔
-     ~그리퍼~손목카메라 통합) 전체를 이 저장소 관례(link_0XX 구조 링크, 시맨틱 조인트명
-     arm_joint_1..5/gripper_*_joint 유지)로 문자열 치환 없이 프로그램적으로 재생성함.
-     원본은 base_link/상단_1 등 한글 CAD 이름 + Rigid N/Revolute N 조인트명이었음.
-     자동 생성 스크립트: 대화 세션 스크래치 경로의 generate_urdf.py (커밋 대상 아님). -->
+<!-- URDF for robot_arm (extreme-robot 2025) - 2026-07-15 Isaac Sim 기반 재export
+     (urdf_and_usd/robotarm/robotarm_urdf_20260711.urdf + robotarm_urdf_20260711_closed_loop.usd,
+     사용자 제공, RViz에서 joint_2/3 축이 계속 이상하다는 문제로 기존 Fusion360 fusion2urdf 계열
+     (VerNOmiddle) export를 전면 폐기하고 이 export로 교체 — 사용자 요청, 2026-07-15).
+     원본 텍스트에 대한 순수 문자열 치환만 적용(링크/조인트 재조립 없음): (1) mesh 경로
+     meshes_ascii/*.stl -> package://robot_arm_description/meshes/*.stl, (2) <robot name> 속성만
+     robot_arm으로 변경. origin/axis/limit 등 수치는 100% 원본 그대로.
+     팔 조인트 이름과 base_link -> link_051 체인은 원본 그대로 유지한다. 2026-08-26
+     ee_description.zip은 base_link 하나만 URDF에 정의되어 이를 ee_base_link로 이름 충돌을
+     피하여 link_051에 fixed
+     장착했다. cleaning_link/revolute joint/axis/origin은 ZIP에 없으므로 추측하지 않는다.
+     mesh는 USD 안에 임베드된 원본 STL geometry(node_STL_BINARY_ prim)를 pxr(usd-core)로 직접
+     추출 — meshes_ascii 폴더가 실제로는 어디에도 없어서(Isaac Sim exporter가 USD에만 지오메트리를
+     남기고 별도 STL을 안 남김) USD 트랜스폼(로컬->월드)이 URDF의 <visual origin>과 정확히 일치함을
+     확인한 뒤 raw mesh point만 추출, 좌표 변환 없이 그대로 STL로 저장(원본 mm 단위 유지, URDF의
+     scale="0.001"과 조합되도록). ASCII로 추출 후 numpy-stl로 binary STL 변환.
+     주의: link/joint 개수/이름 체계가 이전(56 link)과 완전히 다름(58 link) — MoveIt SRDF의
+     disable_collisions는 옛 링크 이름 기준이라 이 교체만으로는 안 맞을 수 있음, 별도 확인 필요. -->
 <robot name="robot_arm">
   <link name="base_link">
     <inertial>
@@ -803,177 +816,6 @@
       </geometry>
     </collision>
   </link>
-  <link name="link_042">
-    <inertial>
-      <origin xyz="-2.706168622523819e-16 0.0017989076439300367 -2.235177043452552e-10" rpy="0 0 0" />
-      <mass value="0.07583994930008672" />
-      <inertia ixx="3.7e-05" iyy="7e-05" izz="3.7e-05" ixy="-0.0" iyz="0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_042_visual">
-      <origin xyz="-0.01095 0.147544 -0.2395" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_042.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_042_collision">
-      <origin xyz="-0.01095 0.147544 -0.2395" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_042.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_043">
-    <inertial>
-      <origin xyz="-0.013962332176623496 -0.033093677069342076 -0.01800002557624822" rpy="0 0 0" />
-      <mass value="0.5057750603466008" />
-      <inertia ixx="0.000387" iyy="0.001612" izz="0.001423" ixy="-0.0" iyz="-0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_043_visual">
-      <origin xyz="-0.02495 0.152544 -0.2575" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_043.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_043_collision">
-      <origin xyz="-0.02495 0.152544 -0.2575" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_043.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_044">
-    <inertial>
-      <origin xyz="0.019795045573097202 0.016687451173800688 -0.010985739295108099" rpy="0 0 0" />
-      <mass value="0.08821021033890362" />
-      <inertia ixx="1.5e-05" iyy="2.1e-05" izz="2.4e-05" ixy="-0.0" iyz="0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_044_visual">
-      <origin xyz="-0.02295 0.186544 -0.2505" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_044.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_044_collision">
-      <origin xyz="-0.02295 0.186544 -0.2505" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_044.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_045">
-    <inertial>
-      <origin xyz="-0.01979377269361699 0.0166874511738008 -0.0110137903216313" rpy="0 0 0" />
-      <mass value="0.08821021033890375" />
-      <inertia ixx="1.5e-05" iyy="2.1e-05" izz="2.4e-05" ixy="0.0" iyz="-0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_045_visual">
-      <origin xyz="0.00105 0.186544 -0.2505" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_045.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_045_collision">
-      <origin xyz="0.00105 0.186544 -0.2505" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_045.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_046">
-    <inertial>
-      <origin xyz="0.05863553668535298 0.1869651056555874 -0.17216686187237853" rpy="0 0 0" />
-      <mass value="0.14107452059972816" />
-      <inertia ixx="0.000142" iyy="0.000285" izz="0.000296" ixy="-7.2e-05" iyz="-2.6e-05" ixz="-4.9e-05" />
-    </inertial>
-    <visual name="link_046_visual">
-      <origin xyz="0.073837 0.411955 -0.418636" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_046.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_046_collision">
-      <origin xyz="0.073837 0.411955 -0.418636" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_046.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_047">
-    <inertial>
-      <origin xyz="0.12159432213198385 -0.025445894344412245 0.027527764948415162" rpy="0 0 0" />
-      <mass value="0.14107452059972586" />
-      <inertia ixx="0.000142" iyy="0.000285" izz="0.000296" ixy="7.2e-05" iyz="2.6e-05" ixz="-4.9e-05" />
-    </inertial>
-    <visual name="link_047_visual">
-      <origin xyz="0.084787 0.199544 -0.205003" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_047.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_047_collision">
-      <origin xyz="0.084787 0.199544 -0.205003" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_047.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_048">
-    <inertial>
-      <origin xyz="-3.9921257633315776e-07 -0.0030528320297818767 -1.4898792979889386e-07" rpy="0 0 0" />
-      <mass value="0.0034506939547765065" />
-      <inertia ixx="0.0" iyy="0.0" izz="0.0" ixy="-0.0" iyz="0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_048_visual">
-      <origin xyz="-0.030951 0.188544 -0.240251" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_048.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_048_collision">
-      <origin xyz="-0.030951 0.188544 -0.240251" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_048.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_049">
-    <inertial>
-      <origin xyz="-3.279079105501792e-07 -0.0010528320297818472 -3.8062886428824605e-07" rpy="0 0 0" />
-      <mass value="0.0034506939547765073" />
-      <inertia ixx="0.0" iyy="0.0" izz="0.0" ixy="-0.0" iyz="0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_049_visual">
-      <origin xyz="0.009049 0.190444 -0.23875" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_049.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_049_collision">
-      <origin xyz="0.009049 0.190444 -0.23875" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_049.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
-  <link name="link_050">
-    <inertial>
-      <origin xyz="-3.995791430858042e-07 -0.004999940980061707 -1.490217829691609e-07" rpy="0 0 0" />
-      <mass value="0.009342051864502975" />
-      <inertia ixx="1e-06" iyy="2e-06" izz="1e-06" ixy="0.0" iyz="-0.0" ixz="0.0" />
-    </inertial>
-    <visual name="link_050_visual">
-      <origin xyz="-0.030951 0.194544 -0.240251" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_050.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </visual>
-    <collision name="link_050_collision">
-      <origin xyz="-0.030951 0.194544 -0.240251" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="package://robot_arm_description/meshes/link_050.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-  </link>
   <link name="link_051">
     <inertial>
       <origin xyz="-3.264096990838322e-07 -0.004999940655558255 -3.80753206130624e-07" rpy="0 0 0" />
@@ -993,7 +835,41 @@
       </geometry>
     </collision>
   </link>
-
+  <joint name="arm_joint_1" type="continuous">
+    <origin xyz="0.0 0.0 0.04649999999999999" rpy="0.0 -0.0 0.0" />
+    <parent link="link_031" />
+    <child link="link_028" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="10.6" velocity="3.14159265358979" />
+  </joint>
+  <joint name="arm_joint_2" type="revolute">
+    <origin xyz="0.0 0.0 -0.04650000000000001" rpy="0.0 -0.0 0.0" />
+    <parent link="link_013" />
+    <child link="link_015" />
+    <axis xyz="0.0 -0.0 -1.0" />
+    <limit effort="106" velocity="0.314159265358979" lower="0" upper="3.14159265358979" />
+  </joint>
+  <joint name="arm_joint_3" type="revolute">
+    <origin xyz="0.0 0.0 -0.07550000000000001" rpy="0.0 -0.0 0.0" />
+    <parent link="link_017" />
+    <child link="link_021" />
+    <axis xyz="0.0 0.0 -1.0" />
+    <limit effort="106" velocity="0.314159265358979" lower="0" upper="3.14159265358979" />
+  </joint>
+  <joint name="arm_joint_4" type="revolute">
+    <origin xyz="0.0 0.06337296 0.0" rpy="3.141592653589793 -0.0 3.141592653589793" />
+    <parent link="link_006" />
+    <child link="link_038" />
+    <axis xyz="0.0 2.6716461825402365e-33 -1.0" />
+    <limit effort="10.6" velocity="3.14159265358979" lower="-0.610865238198015" upper="0.872664625997165" />
+  </joint>
+  <joint name="arm_joint_5" type="continuous">
+    <origin xyz="-0.030999999999999996 0.0007499999999999929 0.003899999999999997" rpy="-1.3358230912699144e-33 -4.09841728479371e-34 0.0" />
+    <parent link="link_040" />
+    <child link="link_033" />
+    <axis xyz="0.0 -1.3358230912699144e-33 1.0" />
+    <limit effort="1.5" velocity="6.38790506229925" />
+  </joint>
   <joint name="fixed_joint_001" type="fixed">
     <origin xyz="0.0 0.0 0.004" rpy="0 0 0" />
     <parent link="base_link" />
@@ -1207,30 +1083,29 @@
     <parent link="link_041" />
     <child link="link_042" />
   </joint>
-  <joint name="fixed_joint_038" type="fixed">
-    <origin xyz="0.014 -0.005 0.018" rpy="0 0 0" />
-    <parent link="link_042" />
-    <child link="link_043" />
-  </joint>
-  <joint name="fixed_joint_039" type="fixed">
-    <origin xyz="-0.002 -0.034 -0.007" rpy="0 0 0" />
-    <parent link="link_043" />
-    <child link="link_044" />
-  </joint>
-  <joint name="fixed_joint_040" type="fixed">
-    <origin xyz="-0.026 -0.034 -0.007" rpy="0 0 0" />
-    <parent link="link_043" />
-    <child link="link_045" />
-  </joint>
-  <joint name="fixed_joint_041" type="fixed">
-    <origin xyz="0.008001 -0.002 -0.010249" rpy="0 0 0" />
-    <parent link="link_044" />
-    <child link="link_048" />
-  </joint>
-  <joint name="fixed_joint_042" type="fixed">
-    <origin xyz="-0.007999 -0.0039 -0.01175" rpy="0 0 0" />
-    <parent link="link_045" />
-    <child link="link_049" />
+  <link name="ee_base_link">
+    <inertial>
+      <origin xyz="0.03408736703414403 -0.06697726813792948 0.008478684890740218" rpy="0 0 0" />
+      <mass value="0.3359541709234757" />
+      <inertia ixx="0.000197" iyy="0.000386" izz="0.0002" ixy="0" iyz="0" ixz="0" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://robot_arm_description/meshes/ee_description/base_link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://robot_arm_description/meshes/ee_description/base_link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <!-- TODO(ee_description CAD): ZIP에 장착 transform/TCP가 없다. xyz/rpy를 실측 또는
+       mating-coordinate 포함 CAD 재export 값으로 교체할 때까지 실제 모션에 사용하지 않는다. -->
+  <joint name="wrist_to_ee" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="link_051" />
+    <child link="ee_base_link" />
   </joint>
   <!-- 그리퍼는 1 DOF다. 서보 2개(id 3·4)를 항상 같은 방향·같은 값으로 돌리므로
        gripper_left_pinion_joint 하나만 구동 조인트로 두고 나머지 3개는 전부 여기에 mimic 시킨다.

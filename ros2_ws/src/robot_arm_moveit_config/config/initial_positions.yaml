@@ -6,5 +6,3 @@ initial_positions:
   arm_joint_3: 0
   arm_joint_4: 0
   arm_joint_5: 0
-  gripper_left_pinion_joint: 0
-  gripper_drive_joint: 0

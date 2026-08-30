@@ -17,6 +17,7 @@ install(DIRECTORY
   rviz
   config
   meshes
+  vendor
   DESTINATION share/${PROJECT_NAME}/
 )
 

@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml', 'MASTER_SLAVE_BENCH.md']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
@@ -37,6 +38,7 @@ setup(
             'recorded_path_replay = '
             'dynamixel_control.recorded_path_replay:main',
             'gripper_load_calibration = dynamixel_control.gripper_load_calibration:main',
+            'spur_gripper_calibration = dynamixel_control.spur_gripper_calibration:main',
             'yolo_bridge = dynamixel_control.yolo_to_dynamixel_bridge:main',
             'yolo_detection = dynamixel_control.yolo_detection_node:main',
             'arm_fsm = dynamixel_control.arm_fsm_node:main',

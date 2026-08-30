@@ -13,6 +13,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArrivalStatus.msg"
   "msg/ChassisMode.msg"
   "msg/ArmStatus.msg"
+  "msg/TaskCommand.msg"
+  "msg/TaskResult.msg"
   "action/EndEffectorRotate.action"
   "action/ArmTestMove.action"
   "action/ArmRecordedPath.action"

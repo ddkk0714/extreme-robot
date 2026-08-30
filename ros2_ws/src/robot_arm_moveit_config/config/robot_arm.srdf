@@ -4,22 +4,13 @@
     A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
 -->
 <robot name="robot_arm">
-    <!-- 2026-07-31: 2026_07_29_랙피니언_URDF_description.zip(base_link~5축 팔~그리퍼~손목카메라
-         통합 CAD export) 전체로 robot_arm.urdf를 재생성하면서 이 SRDF도 같이 갱신함. 링크 번호가
-         전부 새로 매겨졌으므로(link_0XX BFS 순서 재부여) 이전 SRDF의 링크 번호는 전부 무효.
-         조인트 시맨틱 이름(arm_joint_1..5, gripper_left_pinion_joint 등)은 그대로 유지돼 바뀌지
-         않음 — group/group_state 정의는 그래서 그대로 둠.
-         arm 체인 tip_link는 이제 link_043(그리퍼 하우징, 구 "본체22_1") — 이전 SRDF는 link_039
-         ("5축 모듈 연결부")를 썼는데, 그건 예전 그리퍼 이식이 중간 고정 링크 2개(5축 모듈 연결부
-         -> 본체40_1 -> 본체22_1)를 생략한 축약판이었기 때문. 이번 전체 재생성은 zip 원본 체인을
-         그대로 보존해 더 길어졌고, 실제 그리퍼가 물리적으로 붙는 link_043을 tip_link/end_effector
-         parent_link로 잡는 게 더 정확함. arm_fsm_node.py의 tip_link 기본값도 이 커밋에서 같이
-         'link_043'으로 갱신함(반드시 동기화 유지). -->
+    <!-- 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf)로 robot_arm.urdf 전면 교체
+         (RViz에서 joint_2/3 축이 계속 이상해 기존 Fusion360/VerNOmiddle 계열을 폐기 — robot_arm.urdf
+         헤더 주석 참고). base_link -> link_051 체인(arm_joint_1~5)은 유지한다.
+         ee_description에는 joint 정보가 없어 MoveIt planning group에서 제외하고
+         별도 Dynamixel actuator로 제어한다. -->
     <group name="arm">
         <chain base_link="base_link" tip_link="link_043"/>
-    </group>
-    <group name="gripper">
-        <joint name="gripper_left_pinion_joint"/>
     </group>
     <group_state name="home" group="arm">
         <joint name="arm_joint_1" value="0"/>
@@ -28,646 +19,85 @@
         <joint name="arm_joint_4" value="0"/>
         <joint name="arm_joint_5" value="0"/>
     </group_state>
-    <!-- 주행 중 접힘 자세. 팀이 주행 안정성(CG 160mm — 도달 가능한 자세 중 최저) 기준으로
-         all-zero 를 선택했다(2026-07-29). 즉 위 home 과 값이 같다 — 의도된 중복이고,
-         "여기가 stow 다"를 명시하려고 따로 둔다.
-         점유 bbox 224×606mm / 높이 285mm / 중력토크 13.13N·m / 자기충돌 0.
-         ⚠️ 파워트레인 문서 §6 은 all-zero home 을 production 에서 금지한다 — 양 팀 합의 전까지
-         실차 연동 금지. 근거·회피책은 arm_fsm_node.py 의 stow_joint_positions 주석 참고. -->
-    <group_state name="stow" group="arm">
-        <joint name="arm_joint_1" value="0"/>
-        <joint name="arm_joint_2" value="0"/>
-        <joint name="arm_joint_3" value="0"/>
-        <joint name="arm_joint_4" value="0"/>
-        <joint name="arm_joint_5" value="0"/>
-    </group_state>
-    <!-- URDF 리미트 기준: 0 = 완전 닫힘, 1.9444 = 완전 열림.
-         실제 파지 폭은 서보 tick 캘리브레이션(gripper_presets.py) 후 재조정 필요. -->
-    <group_state name="gripper_open" group="gripper">
-        <joint name="gripper_left_pinion_joint" value="1.9444444444444444"/>
-    </group_state>
-    <group_state name="gripper_closed" group="gripper">
-        <joint name="gripper_left_pinion_joint" value="0"/>
-    </group_state>
-    <end_effector name="gripper_a" parent_link="link_043" group="gripper" parent_group="arm"/>
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_link"/>
-    <!-- 아래 disable_collisions는 현재 URDF(52 link / 51 joint, 2026-07-31 전체 재생성)의 모든
-         joint(fixed 포함)로부터 자동 도출한 "Adjacent"(부모-자식) 쌍만 포함 — 프로그램적으로
-         100% 기계적 도출, 값 조작 없음. -->
-    <disable_collisions link1="base_link" link2="link_001" reason="Adjacent"/>
-    <disable_collisions link1="base_link" link2="link_002" reason="Adjacent"/>
-    <disable_collisions link1="link_002" link2="link_003" reason="Adjacent"/>
-    <disable_collisions link1="link_002" link2="link_004" reason="Adjacent"/>
-    <disable_collisions link1="link_004" link2="link_005" reason="Adjacent"/>
-    <disable_collisions link1="link_004" link2="link_006" reason="Adjacent"/>
-    <disable_collisions link1="link_005" link2="link_007" reason="Adjacent"/>
-    <disable_collisions link1="link_007" link2="link_008" reason="Adjacent"/>
-    <disable_collisions link1="link_008" link2="link_009" reason="Adjacent"/>
-    <disable_collisions link1="link_009" link2="link_010" reason="Adjacent"/>
-    <disable_collisions link1="link_010" link2="link_011" reason="Adjacent"/>
-    <disable_collisions link1="link_011" link2="link_012" reason="Adjacent"/>
-    <disable_collisions link1="link_012" link2="link_014" reason="Adjacent"/>
-    <disable_collisions link1="link_012" link2="link_015" reason="Adjacent"/>
-    <disable_collisions link1="link_011" link2="link_013" reason="Adjacent"/>
-    <disable_collisions link1="link_013" link2="link_016" reason="Adjacent"/>
-    <disable_collisions link1="link_013" link2="link_017" reason="Adjacent"/>
-    <disable_collisions link1="link_017" link2="link_019" reason="Adjacent"/>
-    <disable_collisions link1="link_014" link2="link_018" reason="Adjacent"/>
-    <disable_collisions link1="link_018" link2="link_020" reason="Adjacent"/>
-    <disable_collisions link1="link_020" link2="link_021" reason="Adjacent"/>
-    <disable_collisions link1="link_021" link2="link_022" reason="Adjacent"/>
-    <disable_collisions link1="link_022" link2="link_023" reason="Adjacent"/>
-    <disable_collisions link1="link_023" link2="link_024" reason="Adjacent"/>
-    <disable_collisions link1="link_023" link2="link_025" reason="Adjacent"/>
-    <disable_collisions link1="link_023" link2="link_026" reason="Adjacent"/>
-    <disable_collisions link1="link_026" link2="link_028" reason="Adjacent"/>
-    <disable_collisions link1="link_028" link2="link_030" reason="Adjacent"/>
-    <disable_collisions link1="link_030" link2="link_032" reason="Adjacent"/>
-    <disable_collisions link1="link_030" link2="link_033" reason="Adjacent"/>
-    <disable_collisions link1="link_033" link2="link_035" reason="Adjacent"/>
-    <disable_collisions link1="link_033" link2="link_036" reason="Adjacent"/>
-    <disable_collisions link1="link_024" link2="link_027" reason="Adjacent"/>
-    <disable_collisions link1="link_027" link2="link_029" reason="Adjacent"/>
-    <disable_collisions link1="link_029" link2="link_031" reason="Adjacent"/>
-    <disable_collisions link1="link_031" link2="link_034" reason="Adjacent"/>
-    <disable_collisions link1="link_035" link2="link_038" reason="Adjacent"/>
-    <disable_collisions link1="link_033" link2="link_037" reason="Adjacent"/>
-    <disable_collisions link1="link_037" link2="link_040" reason="Adjacent"/>
-    <disable_collisions link1="link_040" link2="link_041" reason="Adjacent"/>
-    <disable_collisions link1="link_041" link2="link_042" reason="Adjacent"/>
-    <disable_collisions link1="link_042" link2="link_043" reason="Adjacent"/>
-    <disable_collisions link1="link_043" link2="link_044" reason="Adjacent"/>
-    <disable_collisions link1="link_043" link2="link_045" reason="Adjacent"/>
-    <disable_collisions link1="link_044" link2="link_048" reason="Adjacent"/>
-    <disable_collisions link1="link_045" link2="link_049" reason="Adjacent"/>
-    <disable_collisions link1="link_048" link2="link_050" reason="Adjacent"/>
-    <disable_collisions link1="link_049" link2="link_051" reason="Adjacent"/>
-    <disable_collisions link1="link_043" link2="link_046" reason="Adjacent"/>
-    <disable_collisions link1="link_043" link2="link_047" reason="Adjacent"/>
-    <disable_collisions link1="link_035" link2="wrist_camera_link" reason="Adjacent"/>
+    <!-- 아래 disable_collisions는 새 URDF(58 link)의 모든 joint(fixed 포함)로부터 자동 도출한
+         "Adjacent"(부모-자식) 쌍만 포함 — 프로그램적으로 100% 기계적 도출, 값 조작 없음. -->
+    <disable_collisions link1="link_031" link2="link_028" reason="Adjacent"/>
+    <disable_collisions link1="link_013" link2="link_015" reason="Adjacent"/>
+    <disable_collisions link1="link_017" link2="link_021" reason="Adjacent"/>
+    <disable_collisions link1="link_006" link2="link_038" reason="Adjacent"/>
+    <disable_collisions link1="link_040" link2="link_033" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="link_029" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="link_031" reason="Adjacent"/>
+    <disable_collisions link1="link_031" link2="link_030" reason="Adjacent"/>
+    <disable_collisions link1="link_028" link2="link_003" reason="Adjacent"/>
+    <disable_collisions link1="link_028" link2="link_001" reason="Adjacent"/>
+    <disable_collisions link1="link_003" link2="link_016" reason="Adjacent"/>
+    <disable_collisions link1="link_016" link2="link_014" reason="Adjacent"/>
+    <disable_collisions link1="link_014" link2="link_013" reason="Adjacent"/>
+    <disable_collisions link1="link_015" link2="link_012" reason="Adjacent"/>
+    <disable_collisions link1="link_012" link2="link_002" reason="Adjacent"/>
+    <disable_collisions link1="link_002" link2="link_022" reason="Adjacent"/>
+    <disable_collisions link1="link_002" link2="link_025" reason="Adjacent"/>
+    <disable_collisions link1="link_012" link2="link_026" reason="Adjacent"/>
+    <disable_collisions link1="link_026" link2="link_010" reason="Adjacent"/>
+    <disable_collisions link1="link_026" link2="link_011" reason="Adjacent"/>
+    <disable_collisions link1="link_011" link2="link_020" reason="Adjacent"/>
+    <disable_collisions link1="link_022" link2="link_019" reason="Adjacent"/>
+    <disable_collisions link1="link_019" link2="link_018" reason="Adjacent"/>
+    <disable_collisions link1="link_018" link2="link_017" reason="Adjacent"/>
+    <disable_collisions link1="link_021" link2="link_004" reason="Adjacent"/>
+    <disable_collisions link1="link_004" link2="link_032" reason="Adjacent"/>
+    <disable_collisions link1="link_004" link2="link_024" reason="Adjacent"/>
+    <disable_collisions link1="link_004" link2="link_008" reason="Adjacent"/>
+    <disable_collisions link1="link_008" link2="link_006" reason="Adjacent"/>
+    <disable_collisions link1="link_038" link2="link_023" reason="Adjacent"/>
+    <disable_collisions link1="link_038" link2="link_036" reason="Adjacent"/>
+    <disable_collisions link1="link_036" link2="link_035" reason="Adjacent"/>
+    <disable_collisions link1="link_036" link2="link_034" reason="Adjacent"/>
+    <disable_collisions link1="link_032" link2="link_005" reason="Adjacent"/>
+    <disable_collisions link1="link_005" link2="link_009" reason="Adjacent"/>
+    <disable_collisions link1="link_009" link2="link_007" reason="Adjacent"/>
+    <disable_collisions link1="link_007" link2="link_027" reason="Adjacent"/>
+    <disable_collisions link1="link_035" link2="link_037" reason="Adjacent"/>
+    <disable_collisions link1="link_036" link2="link_040" reason="Adjacent"/>
+    <disable_collisions link1="link_033" link2="link_039" reason="Adjacent"/>
+    <disable_collisions link1="link_039" link2="link_041" reason="Adjacent"/>
+    <disable_collisions link1="link_041" link2="link_051" reason="Adjacent"/>
+    <disable_collisions link1="link_051" link2="ee_base_link" reason="Adjacent"/>
 
-    <!-- 2026-07-31 재산출: /check_state_validity 서비스로 관절 리밋 안쪽 무작위 200샘플
-         (arm_joint_1~5 + gripper_left_pinion_joint, seed=42) 실행 — 이전 SRDF의 40~3000샘플과
-         같은 방법론(scripts/sample_collision_matrix.py 계승, 스크립트는 세션 스크래치에만 있고
-         커밋 대상 아님). 아래는 200/200(100%) 즉 자세와 무관하게 항상 충돌한 쌍만 Default로
-         등록 — 이전 관례와 동일하게 99% 이하는(예: link_012/013 99%, link_036/038 92%,
-         link_011/015 90%, link_016/017 88%) "자세에 따라 변하는 진짜 self-collision"으로 보고
-         disable 하지 않음(교체 전 SRDF의 2839/3000=94.6% 케이스를 disable 금지로 판단한 것과
-         같은 기준). 홈 자세 최초 재현 시 잡았던 link_047/link_051·link_046/link_050 추정은
-         샘플링 결과 실제로는 link_047/link_050·link_043/link_051·link_046/link_051 조합이었음
-         (심볼릭 좌우대칭 추정이 아니라 실측으로 교체). -->
-    <disable_collisions link1="link_047" link2="link_050" reason="Default"/>
-    <disable_collisions link1="link_043" link2="link_051" reason="Default"/>
-    <disable_collisions link1="link_016" link2="link_021" reason="Default"/>
-    <disable_collisions link1="link_034" link2="link_038" reason="Default"/>
-    <disable_collisions link1="link_035" link2="link_037" reason="Default"/>
-    <disable_collisions link1="link_007" link2="link_017" reason="Default"/>
-    <disable_collisions link1="link_025" link2="link_027" reason="Default"/>
-    <disable_collisions link1="link_006" link2="link_009" reason="Default"/>
-    <disable_collisions link1="link_001" link2="link_004" reason="Default"/>
-    <disable_collisions link1="link_003" link2="link_004" reason="Default"/>
-    <disable_collisions link1="link_043" link2="link_049" reason="Default"/>
-    <disable_collisions link1="link_043" link2="link_048" reason="Default"/>
-    <disable_collisions link1="link_035" link2="link_036" reason="Default"/>
-    <disable_collisions link1="link_021" link2="link_023" reason="Default"/>
-    <disable_collisions link1="link_014" link2="link_027" reason="Default"/>
-    <disable_collisions link1="link_006" link2="link_010" reason="Default"/>
-    <disable_collisions link1="link_015" link2="link_016" reason="Default"/>
-    <disable_collisions link1="link_032" link2="link_034" reason="Default"/>
-    <disable_collisions link1="link_046" link2="link_051" reason="Default"/>
-    <disable_collisions link1="link_007" link2="link_019" reason="Default"/>
-
-    <!-- 2026-07-31 추가: 위 200샘플(연속 관절 무작위)이 gripper_left_pinion_joint=0(완전 닫힘,
-         SRDF home/stow group_state 값)이라는 경계값을 확률상 거의 뽑지 못해 놓친 쌍. 그리퍼
-         완전 닫힘 + 팔 무작위 30샘플로 별도 재검증: 팔 자세와 무관하게 30/30 항상 충돌 —
-         랙-피니언이 완전히 맞물리는 경계 상태의 기하 아티팩트로 판단, disable 안전함.
-         **home/stow(all-zero) 자세가 실제로 이 두 쌍 없이는 collision-valid하지 않았던 상태라
-         중요** — STOWED_LOCKED 계약과 직결되므로 반드시 포함할 것. -->
-    <disable_collisions link1="link_046" link2="link_050" reason="Default"/>
-    <disable_collisions link1="link_047" link2="link_051" reason="Default"/>
-
-    <!-- ⚠️ TODO: 200샘플도 Setup Assistant 기본값(수천)보다는 적어 근거가 여전히 약함 —
-         디스플레이 있는 환경에서 기회 되면 GUI "Regenerate Default Collision Matrix"로 이 블록을
-         정식 결과로 덮어쓸 것. 특히 71~99% 구간 쌍들(link_012/013, link_036/038, link_011/015,
-         link_016/017, link_015/017, link_036/037)은 실기 조립 시 실제로 닿는지 별도 확인 권장. -->
-
-    <!-- 2026-08-09 추가: 강체 클러스터 기준 Adjacent 보정 (scripts/fix_adjacent_collisions.py).
-         CAD 자동 export 라 하나의 물리 강체가 fixed 로 이어진 link_0XX 여러 개로
-         쪼개져 있는데, Setup Assistant 의 Adjacent 판정은 URDF 직계 parent/child 만
-         봐서 (a) 같은 강체 안의 형제 링크, (b) 가동 조인트 하나를 사이에 둔 강체 쌍이
-         통째로 빠졌다. 그 결과 home(전 관절 0) 자세조차 6쌍이 충돌로 떠 MoveIt 이
-         모든 계획을 거부했다. 가동 조인트 2개 이상 떨어진 쌍(진짜 self-collision)은
-         건드리지 않았다. -->
-    <disable_collisions link1="base_link" link2="link_003" reason="same-cluster" />
-    <disable_collisions link1="base_link" link2="link_004" reason="adjacent-cluster" />
-    <disable_collisions link1="base_link" link2="link_005" reason="adjacent-cluster" />
-    <disable_collisions link1="base_link" link2="link_006" reason="adjacent-cluster" />
-    <disable_collisions link1="base_link" link2="link_007" reason="adjacent-cluster" />
-    <disable_collisions link1="base_link" link2="link_008" reason="adjacent-cluster" />
-    <disable_collisions link1="base_link" link2="link_009" reason="adjacent-cluster" />
-    <disable_collisions link1="link_001" link2="link_002" reason="same-cluster" />
-    <disable_collisions link1="link_001" link2="link_003" reason="same-cluster" />
-    <disable_collisions link1="link_001" link2="link_005" reason="adjacent-cluster" />
-    <disable_collisions link1="link_001" link2="link_006" reason="adjacent-cluster" />
-    <disable_collisions link1="link_001" link2="link_007" reason="adjacent-cluster" />
-    <disable_collisions link1="link_001" link2="link_008" reason="adjacent-cluster" />
-    <disable_collisions link1="link_001" link2="link_009" reason="adjacent-cluster" />
-    <disable_collisions link1="link_002" link2="link_005" reason="adjacent-cluster" />
-    <disable_collisions link1="link_002" link2="link_006" reason="adjacent-cluster" />
-    <disable_collisions link1="link_002" link2="link_007" reason="adjacent-cluster" />
-    <disable_collisions link1="link_002" link2="link_008" reason="adjacent-cluster" />
-    <disable_collisions link1="link_002" link2="link_009" reason="adjacent-cluster" />
-    <disable_collisions link1="link_003" link2="link_005" reason="adjacent-cluster" />
-    <disable_collisions link1="link_003" link2="link_006" reason="adjacent-cluster" />
-    <disable_collisions link1="link_003" link2="link_007" reason="adjacent-cluster" />
-    <disable_collisions link1="link_003" link2="link_008" reason="adjacent-cluster" />
-    <disable_collisions link1="link_003" link2="link_009" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_007" reason="same-cluster" />
-    <disable_collisions link1="link_004" link2="link_008" reason="same-cluster" />
-    <disable_collisions link1="link_004" link2="link_009" reason="same-cluster" />
-    <disable_collisions link1="link_004" link2="link_010" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_017" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_019" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_004" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_006" reason="same-cluster" />
-    <disable_collisions link1="link_005" link2="link_008" reason="same-cluster" />
-    <disable_collisions link1="link_005" link2="link_009" reason="same-cluster" />
-    <disable_collisions link1="link_005" link2="link_010" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_017" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_019" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_005" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_007" reason="same-cluster" />
-    <disable_collisions link1="link_006" link2="link_008" reason="same-cluster" />
-    <disable_collisions link1="link_006" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_017" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_019" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_006" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_009" reason="same-cluster" />
-    <disable_collisions link1="link_007" link2="link_010" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_007" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_010" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_017" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_019" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_008" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_011" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_012" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_013" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_014" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_015" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_016" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_017" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_018" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_019" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_020" reason="adjacent-cluster" />
-    <disable_collisions link1="link_009" link2="link_021" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_012" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_013" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_014" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_015" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_016" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_010" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_010" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_014" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_015" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_016" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_011" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_011" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_013" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_016" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_012" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_012" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_014" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_015" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_013" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_013" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_015" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_016" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_014" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_014" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_015" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_015" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_015" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_015" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_015" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_015" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_017" reason="same-cluster" />
-    <disable_collisions link1="link_016" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_016" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_016" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_016" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_016" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_018" reason="same-cluster" />
-    <disable_collisions link1="link_017" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_017" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_017" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_017" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_019" reason="same-cluster" />
-    <disable_collisions link1="link_018" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_018" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_018" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_020" reason="same-cluster" />
-    <disable_collisions link1="link_019" link2="link_021" reason="same-cluster" />
-    <disable_collisions link1="link_019" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_019" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_022" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_023" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_020" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_024" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_025" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_026" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_027" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_028" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_029" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_021" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_024" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_025" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_026" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_027" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_028" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_022" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_022" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_027" reason="same-cluster" />
-    <disable_collisions link1="link_023" link2="link_028" reason="same-cluster" />
-    <disable_collisions link1="link_023" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_023" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_023" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_023" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_023" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_025" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_026" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_028" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_024" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_024" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_026" reason="same-cluster" />
-    <disable_collisions link1="link_025" link2="link_028" reason="same-cluster" />
-    <disable_collisions link1="link_025" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_025" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_025" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_025" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_025" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_027" reason="same-cluster" />
-    <disable_collisions link1="link_026" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_026" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_026" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_026" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_026" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_028" reason="same-cluster" />
-    <disable_collisions link1="link_027" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_027" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_027" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_027" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_029" reason="same-cluster" />
-    <disable_collisions link1="link_028" link2="link_031" reason="same-cluster" />
-    <disable_collisions link1="link_028" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_028" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_028" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_030" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_034" reason="same-cluster" />
-    <disable_collisions link1="link_029" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_029" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_031" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_035" reason="same-cluster" />
-    <disable_collisions link1="link_030" link2="link_036" reason="same-cluster" />
-    <disable_collisions link1="link_030" link2="link_037" reason="same-cluster" />
-    <disable_collisions link1="link_030" link2="link_038" reason="same-cluster" />
-    <disable_collisions link1="link_030" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_030" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_031" link2="link_032" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="link_033" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="link_038" reason="adjacent-cluster" />
-    <disable_collisions link1="link_031" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_033" reason="same-cluster" />
-    <disable_collisions link1="link_032" link2="link_035" reason="same-cluster" />
-    <disable_collisions link1="link_032" link2="link_036" reason="same-cluster" />
-    <disable_collisions link1="link_032" link2="link_037" reason="same-cluster" />
-    <disable_collisions link1="link_032" link2="link_038" reason="same-cluster" />
-    <disable_collisions link1="link_032" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_032" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_033" link2="link_034" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_038" reason="same-cluster" />
-    <disable_collisions link1="link_033" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_033" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_034" link2="link_035" reason="adjacent-cluster" />
-    <disable_collisions link1="link_034" link2="link_036" reason="adjacent-cluster" />
-    <disable_collisions link1="link_034" link2="link_037" reason="adjacent-cluster" />
-    <disable_collisions link1="link_034" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_035" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_037" reason="same-cluster" />
-    <disable_collisions link1="link_036" link2="link_038" reason="same-cluster" />
-    <disable_collisions link1="link_036" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_036" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_037" link2="link_038" reason="same-cluster" />
-    <disable_collisions link1="link_037" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_037" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_038" link2="link_040" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_041" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_042" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_043" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_044" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_045" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_038" link2="wrist_camera_link" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_042" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_043" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_044" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_045" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_046" reason="adjacent-cluster" />
-    <disable_collisions link1="link_040" link2="link_047" reason="adjacent-cluster" />
-    <disable_collisions link1="link_040" link2="link_048" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_049" reason="same-cluster" />
-    <disable_collisions link1="link_040" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_040" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_040" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_041" link2="link_043" reason="same-cluster" />
-    <disable_collisions link1="link_041" link2="link_044" reason="same-cluster" />
-    <disable_collisions link1="link_041" link2="link_045" reason="same-cluster" />
-    <disable_collisions link1="link_041" link2="link_046" reason="adjacent-cluster" />
-    <disable_collisions link1="link_041" link2="link_047" reason="adjacent-cluster" />
-    <disable_collisions link1="link_041" link2="link_048" reason="same-cluster" />
-    <disable_collisions link1="link_041" link2="link_049" reason="same-cluster" />
-    <disable_collisions link1="link_041" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_041" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_041" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_042" link2="link_044" reason="same-cluster" />
-    <disable_collisions link1="link_042" link2="link_045" reason="same-cluster" />
-    <disable_collisions link1="link_042" link2="link_046" reason="adjacent-cluster" />
-    <disable_collisions link1="link_042" link2="link_047" reason="adjacent-cluster" />
-    <disable_collisions link1="link_042" link2="link_048" reason="same-cluster" />
-    <disable_collisions link1="link_042" link2="link_049" reason="same-cluster" />
-    <disable_collisions link1="link_042" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_042" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_042" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_043" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_043" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_044" link2="link_045" reason="same-cluster" />
-    <disable_collisions link1="link_044" link2="link_046" reason="adjacent-cluster" />
-    <disable_collisions link1="link_044" link2="link_047" reason="adjacent-cluster" />
-    <disable_collisions link1="link_044" link2="link_049" reason="same-cluster" />
-    <disable_collisions link1="link_044" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_044" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_044" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_045" link2="link_046" reason="adjacent-cluster" />
-    <disable_collisions link1="link_045" link2="link_047" reason="adjacent-cluster" />
-    <disable_collisions link1="link_045" link2="link_048" reason="same-cluster" />
-    <disable_collisions link1="link_045" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_045" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_045" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_046" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_046" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_047" link2="link_048" reason="adjacent-cluster" />
-    <disable_collisions link1="link_047" link2="link_049" reason="adjacent-cluster" />
-    <disable_collisions link1="link_048" link2="link_049" reason="same-cluster" />
-    <disable_collisions link1="link_048" link2="link_051" reason="adjacent-cluster" />
-    <disable_collisions link1="link_048" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_049" link2="link_050" reason="adjacent-cluster" />
-    <disable_collisions link1="link_049" link2="wrist_camera_link" reason="adjacent-cluster" />
-    <disable_collisions link1="link_046" link2="link_047" reason="TemporaryTest"/>
+    <!-- 2026-07-16: 위 Adjacent만으로는 기어 치합 등 항상-접촉 쌍이 self-collision 오탐으로
+         남아 mock 플래닝이 홈(all-zero) 자세부터 막혔음(RRTConnect: "Motion planning start
+         tree could not be initialized" / "Start state appears to be in collision") — 실측
+         확인 완료. 정식 MoveIt Setup Assistant GUI("Regenerate Default Collision Matrix")
+         대신, `/check_state_validity` 서비스로 arm_joint_1~5 리밋 안쪽 무작위 자세 40개를
+         샘플링해 매 자세 100% 항상 충돌하는 쌍만 아래에 "Default"로 등록(Setup Assistant가
+         내부적으로 하는 것과 동일한 원리, 샘플 수만 적음 — 디스플레이 없는 환경이라 GUI
+         재실행은 불가했음). 아래 쌍들은 관절각과 무관하게 항상 접촉 → 기어 치합/메쉬 중첩
+         등 기하 아티팩트로 판단, 안전하게 disable.
+         ⚠️ 같은 샘플링에서 자세에 따라 충돌하다 안하다 한 쌍(진짜 self-collision 위험, 절대
+         disable 금지)도 발견됨 — link_002/link_026(39/40), link_034/link_037(36/40),
+         link_041/link_052(36/40), link_045/link_047(33/40), link_034/link_040(31/40),
+         link_044/link_046(14/40), link_043/link_045(10/40), link_041/link_049(3/40).
+         이 쌍들은 그대로 collision-checked 상태로 둠 — 플래닝 중 이 쌍이 원인으로 실패하면
+         실제 충돌 회피가 필요한 자세라는 뜻이니 URDF/메쉬를 먼저 의심할 것.
+         샘플 수(40)가 Setup Assistant 기본값(수천)보다 훨씬 적어 근거가 약함 — 디스플레이
+         있는 환경에서 기회가 되면 GUI로 "Regenerate Default Collision Matrix" 재실행해서
+         이 블록을 정식 결과로 덮어쓸 것. -->
+    <disable_collisions link1="link_001" link2="link_013" reason="Default"/>
+    <disable_collisions link1="link_001" link2="link_015" reason="Default"/>
+    <disable_collisions link1="link_004" link2="link_017" reason="Default"/>
+    <disable_collisions link1="link_005" link2="link_022" reason="Default"/>
+    <disable_collisions link1="link_005" link2="link_024" reason="Default"/>
+    <disable_collisions link1="link_010" link2="link_011" reason="Default"/>
+    <disable_collisions link1="link_010" link2="link_017" reason="Default"/>
+    <disable_collisions link1="link_010" link2="link_025" reason="Default"/>
+    <disable_collisions link1="link_011" link2="link_016" reason="Default"/>
+    <disable_collisions link1="link_011" link2="link_025" reason="Default"/>
+    <disable_collisions link1="link_016" link2="link_020" reason="Default"/>
+    <disable_collisions link1="link_027" link2="link_037" reason="Default"/>
+    <disable_collisions link1="link_028" link2="link_029" reason="Default"/>
+    <disable_collisions link1="link_028" link2="link_030" reason="Default"/>
+    <disable_collisions link1="link_034" link2="link_035" reason="Default"/>
+    <disable_collisions link1="link_035" link2="link_040" reason="Default"/>
 </robot>
